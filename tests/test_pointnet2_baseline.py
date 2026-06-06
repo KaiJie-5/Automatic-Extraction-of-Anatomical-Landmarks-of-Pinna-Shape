@@ -13,6 +13,7 @@ from src.preprocessing import (
     sample_mesh_surface,
     split_landmark_prediction,
 )
+from train_pointnet2 import compute_training_loss
 
 
 def test_surface_sampler_shape_and_normal_lengths():
@@ -109,6 +110,30 @@ def test_split_metric_matches_left_right_average():
     combined_score = compute_mean_landmark_distance(prediction, target)
 
     assert np.isclose(split_score, combined_score)
+
+
+def test_mean_distance_loss_matches_official_metric_after_denormalization():
+    pred_normalized = torch.tensor(
+        [[[0.0, 0.0, 0.0], [0.5, -0.5, 1.0]]], dtype=torch.float32
+    )
+    target_normalized = torch.tensor(
+        [[[0.0, 1.0, 0.0], [0.25, -0.25, 0.5]]], dtype=torch.float32
+    )
+    centroid = torch.tensor([[10.0, 20.0, 30.0]], dtype=torch.float32)
+    scale = torch.tensor([2.0], dtype=torch.float32)
+
+    loss = compute_training_loss(
+        None,
+        "mean_distance",
+        pred_normalized,
+        target_normalized,
+        centroid,
+        scale,
+    )
+    pred = pred_normalized.numpy().reshape(2, 3) * 2.0 + np.array([10.0, 20.0, 30.0])
+    target = target_normalized.numpy().reshape(2, 3) * 2.0 + np.array([10.0, 20.0, 30.0])
+
+    assert np.isclose(loss.item(), compute_mean_landmark_distance(pred, target))
 
 
 def test_normalize_point_features_keeps_normals_unit_length():

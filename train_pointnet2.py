@@ -106,8 +106,10 @@ def make_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer):
     raise ValueError(f"Unsupported scheduler: {args.scheduler}")
 
 
-def make_criterion(args: argparse.Namespace) -> torch.nn.Module:
+def make_criterion(args: argparse.Namespace) -> Optional[torch.nn.Module]:
     name = args.loss.lower()
+    if name == "mean_distance":
+        return None
     if name == "smooth_l1":
         try:
             return torch.nn.SmoothL1Loss(beta=args.smooth_l1_beta)
@@ -133,10 +135,31 @@ def mean_landmark_distance(
     return torch.linalg.norm(pred - target, dim=-1).mean()
 
 
+def compute_training_loss(
+    criterion: Optional[torch.nn.Module],
+    loss_name: str,
+    pred_normalized: torch.Tensor,
+    target_normalized: torch.Tensor,
+    centroid: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the selected training loss.
+
+    The "mean_distance" option matches the official metric in torch form by
+    de-normalizing predictions and targets before computing Euclidean distance.
+    """
+    if loss_name == "mean_distance":
+        return mean_landmark_distance(pred_normalized, target_normalized, centroid, scale)
+    if criterion is None:
+        raise ValueError(f"criterion cannot be None for loss '{loss_name}'")
+    return criterion(pred_normalized, target_normalized)
+
+
 def run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
-    criterion: torch.nn.Module,
+    criterion: Optional[torch.nn.Module],
+    loss_name: str,
     device: torch.device,
     optimizer: Optional[torch.optim.Optimizer] = None,
     amp: bool = False,
@@ -162,7 +185,9 @@ def run_epoch(
         with torch.set_grad_enabled(training):
             with torch.cuda.amp.autocast(enabled=training and amp):
                 pred = model(points)
-                loss = criterion(pred, target)
+                loss = compute_training_loss(
+                    criterion, loss_name, pred, target, centroid, scale
+                )
 
             if training:
                 scaler.scale(loss).backward()
@@ -241,7 +266,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--optimizer", choices=["adam", "adamw", "sgd"], default="adamw")
-    parser.add_argument("--loss", choices=["smooth_l1", "mse", "l1"], default="smooth_l1")
+    parser.add_argument(
+        "--loss",
+        choices=["smooth_l1", "mse", "l1", "mean_distance"],
+        default="smooth_l1",
+    )
     parser.add_argument("--smooth-l1-beta", type=float, default=1.0)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--scheduler", choices=["none", "cosine", "step"], default="cosine")
@@ -320,13 +349,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             model,
             train_loader,
             criterion,
+            args.loss,
             device,
             optimizer=optimizer,
             amp=amp_enabled,
             grad_clip_norm=args.grad_clip_norm,
         )
         val_metrics = (
-            run_epoch(model, val_loader, criterion, device, amp=amp_enabled)
+            run_epoch(model, val_loader, criterion, args.loss, device, amp=amp_enabled)
             if val_loader is not None
             else None
         )
