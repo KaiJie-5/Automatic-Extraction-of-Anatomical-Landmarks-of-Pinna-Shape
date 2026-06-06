@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Iterable, Optional, Tuple
 import numpy as np
 import trimesh
 from trimesh import Trimesh
@@ -6,11 +6,24 @@ import csv
 from pathlib import Path
 
 
+DEFAULT_EXCLUDED_SUBJECT_IDS = {"P0027"}
+
+
 class Dataset:
-    def __init__(self, mesh_dir: str, landmarks_dir: str):
+    def __init__(
+        self,
+        mesh_dir: str,
+        landmarks_dir: str,
+        exclude_subject_ids: Optional[Iterable[str]] = None,
+    ):
         self.mesh_dir = Path(mesh_dir)
         self.landmarks_dir = Path(landmarks_dir)
-        self.subject_ids = sorted([f.stem for f in self.mesh_dir.glob("*.ply")])
+        excluded_subject_ids = set(DEFAULT_EXCLUDED_SUBJECT_IDS)
+        if exclude_subject_ids is not None:
+            excluded_subject_ids.update(exclude_subject_ids)
+        self.subject_ids = sorted(
+            f.stem for f in self.mesh_dir.glob("*.ply") if f.stem not in excluded_subject_ids
+        )
 
     def __len__(self) -> int:
         return len(self.subject_ids)

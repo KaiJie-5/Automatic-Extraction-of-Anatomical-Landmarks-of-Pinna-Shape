@@ -3,6 +3,7 @@ import pytest
 import torch
 import trimesh
 
+from src.dataset import Dataset
 from src.estimator import LandmarkExtractor
 from src.metrics import compute_mean_landmark_distance
 from src.pointnet2_model import PointNet2LandmarkRegressor
@@ -21,6 +22,20 @@ def test_surface_sampler_shape_and_normal_lengths():
     assert points.shape == (128, 6)
     normal_lengths = np.linalg.norm(points[:, 3:6], axis=1)
     assert np.allclose(normal_lengths, 1.0, atol=1e-5)
+
+
+def test_dataset_excludes_malformed_subject_by_default(tmp_path):
+    mesh_dir = tmp_path / "mesh"
+    landmarks_dir = tmp_path / "landmarks"
+    mesh_dir.mkdir()
+    landmarks_dir.mkdir()
+    (mesh_dir / "P0026.ply").touch()
+    (mesh_dir / "P0027.ply").touch()
+    (mesh_dir / "P0028.ply").touch()
+
+    dataset = Dataset(mesh_dir=str(mesh_dir), landmarks_dir=str(landmarks_dir))
+
+    assert dataset.subject_ids == ["P0026", "P0028"]
 
 
 def test_normalization_round_trip():
