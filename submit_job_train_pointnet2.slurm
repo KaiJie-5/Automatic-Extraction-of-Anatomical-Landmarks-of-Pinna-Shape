@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=2-00:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --output=pointnet2_train_%j.out
 #SBATCH --error=pointnet2_train_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
