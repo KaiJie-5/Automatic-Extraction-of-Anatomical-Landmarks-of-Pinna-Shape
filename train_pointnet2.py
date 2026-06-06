@@ -1,6 +1,7 @@
 """Train a PointNet++ regressor for pinna landmark extraction."""
 
 import argparse
+import json
 import random
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
@@ -230,6 +231,45 @@ def save_checkpoint(
     )
 
 
+def build_run_config(
+    args: argparse.Namespace,
+    model_config: dict,
+    train_ids: Sequence[str],
+    val_ids: Sequence[str],
+    device: torch.device,
+    amp_enabled: bool,
+) -> dict:
+    """Collect run configuration for stdout and checkpoint-folder records."""
+    return {
+        "args": vars(args),
+        "model_config": model_config,
+        "data_split": {
+            "train_count": len(train_ids),
+            "val_count": len(val_ids),
+            "train_ids": list(train_ids),
+            "val_ids": list(val_ids),
+        },
+        "runtime": {
+            "device": str(device),
+            "amp_enabled": amp_enabled,
+            "torch_version": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_version": torch.version.cuda,
+            "cuda_device_count": torch.cuda.device_count(),
+            "cuda_device_name": torch.cuda.get_device_name(0)
+            if torch.cuda.is_available()
+            else None,
+        },
+    }
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
 
@@ -337,12 +377,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
 
     model_config = make_model_config(args)
+    checkpoint_dir = Path(args.checkpoint_dir)
+    run_config = build_run_config(
+        args=args,
+        model_config=model_config,
+        train_ids=train_ids,
+        val_ids=val_ids,
+        device=device,
+        amp_enabled=amp_enabled,
+    )
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    write_json(checkpoint_dir / "run_config.json", run_config)
+    print("RUN_CONFIG_START")
+    print(json.dumps(run_config, indent=2, sort_keys=True))
+    print("RUN_CONFIG_END")
+
     model = PointNet2LandmarkRegressor(**model_config).to(device)
     criterion = make_criterion(args)
     optimizer = make_optimizer(args, model.parameters())
     scheduler = make_scheduler(args, optimizer)
 
-    checkpoint_dir = Path(args.checkpoint_dir)
     best_score = float("inf")
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
