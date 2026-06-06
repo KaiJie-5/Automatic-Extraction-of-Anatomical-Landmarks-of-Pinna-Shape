@@ -13,8 +13,6 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=kjl1a21@soton.ac.uk
 
-set -euo pipefail
-
 # =========================
 # Easy hyperparameter block
 # =========================
