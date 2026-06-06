@@ -4,3 +4,5 @@ numpy
 trimesh
 k3d
 scipy
+torch
+pytest

@@ -35,6 +35,28 @@ pip install -r requirements.txt
 
 For details on how to use the provided code resources, see the [Jupyter notebook](getting_started.ipynb).
 
+## PointNet++ baseline
+
+This repository includes a first PointNet++ regression baseline for the landmark extraction task. It samples a full
+mesh into point features `[x, y, z, normal_x, normal_y, normal_z]`, normalizes coordinates per mesh, regresses
+`170 x 3` landmarks, and returns the first 85 landmarks as the left ear and the remaining 85 as the right ear.
+
+Train the default SSG baseline with:
+
+```bash
+python train_pointnet2.py --mesh-dir data/mesh --landmarks-dir data/landmarks
+```
+
+For a small environment smoke test, use:
+
+```bash
+python train_pointnet2.py --epochs 1 --batch-size 1 --num-points 128
+```
+
+The challenge entry point `src.estimator.LandmarkExtractor()` expects a trained checkpoint at
+`checkpoints/best_model.pt`. Most data, model, and optimizer settings are exposed as command-line arguments; run
+`python train_pointnet2.py --help` to inspect them.
+
 
 # Evaluation
 
