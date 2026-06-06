@@ -21,7 +21,7 @@ PROJECT_DIR="/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks
 MESH_DIR="${PROJECT_DIR}/data/mesh"
 LANDMARKS_DIR="${PROJECT_DIR}/data/landmarks"
 RUN_ROOT="${PROJECT_DIR}/runs"
-RUN_NAME="pointnet2_ssg_baseline"
+
 
 SEED=42
 VAL_RATIO=0.2
@@ -55,6 +55,8 @@ STEP_SIZE=50
 STEP_GAMMA=0.5
 GRAD_CLIP_NORM=0.0
 AMP=1
+
+RUN_NAME="pointnet2_${VARIANT}_np${NUM_POINTS}_${LOSS}"
 
 # =========================
 # Run folder and environment
