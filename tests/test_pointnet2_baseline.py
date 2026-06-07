@@ -14,6 +14,7 @@ from src.preprocessing import (
     split_landmark_prediction,
 )
 from train_pointnet2 import compute_training_loss
+from visualize_point_importance import colorize_importance, normalize_importance
 
 
 def test_surface_sampler_shape_and_normal_lengths():
@@ -145,3 +146,19 @@ def test_normalize_point_features_keeps_normals_unit_length():
     normalized = normalize_point_features(points, transform)
 
     assert np.allclose(np.linalg.norm(normalized[:, 3:6], axis=1), 1.0, atol=1e-5)
+
+
+def test_importance_normalization_handles_constant_and_finite_values():
+    constant = normalize_importance(np.array([5.0, 5.0, 5.0], dtype=np.float32))
+    varied = normalize_importance(np.array([2.0, 4.0, 6.0], dtype=np.float32))
+
+    assert np.allclose(constant, 0.0)
+    assert np.allclose(varied, np.array([0.0, 0.5, 1.0], dtype=np.float32))
+
+
+def test_importance_colorize_outputs_rgba_uint8():
+    colors = colorize_importance(np.array([0.0, 0.5, 1.0], dtype=np.float32))
+
+    assert colors.shape == (3, 4)
+    assert colors.dtype == np.uint8
+    assert np.all(colors[:, 3] == 255)
