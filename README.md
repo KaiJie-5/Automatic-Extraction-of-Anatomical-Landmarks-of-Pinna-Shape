@@ -53,8 +53,12 @@ The default input mode uses the full head mesh. To train the optional two-branch
 python train_pointnet2.py --input-mode ear_crop --ear-points 8192 --crop-margin 0.40
 ```
 
-Ear-crop mode fits left/right crop boxes from training landmarks only, saves `crop_config.json` and
-`crop_coverage.json`, and writes visual crop PLYs under `checkpoints/crops/{train,val}`.
+Ear-crop mode fits left/right crop boxes from training landmarks only, saves `crop_config.json`,
+`crop_coverage.json`, and `crop_sampling_stats.json`, and writes visual crop PLYs under
+`checkpoints/crops/{train,val}`. Files ending in `_mesh.ply` are loose contextual crop meshes;
+files ending in `_points.ply` are the sampled crop point clouds before optional right-ear mirroring.
+Use `--crop-oversample-factor`, `--crop-max-resample-attempts`, and
+`--crop-min-inside-ratio` to tune or diagnose point-level crop sampling.
 
 For a small environment smoke test, use:
 

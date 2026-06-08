@@ -51,6 +51,19 @@ class LandmarkExtractor:
         if isinstance(checkpoint, dict) and "num_points" in checkpoint:
             self.num_points = int(checkpoint["num_points"])
         self.ear_points = int(checkpoint.get("ear_points", 8192)) if isinstance(checkpoint, dict) else 8192
+        self.crop_oversample_factor = (
+            int(checkpoint.get("crop_oversample_factor", 8)) if isinstance(checkpoint, dict) else 8
+        )
+        self.crop_max_resample_attempts = (
+            int(checkpoint.get("crop_max_resample_attempts", 5))
+            if isinstance(checkpoint, dict)
+            else 5
+        )
+        self.crop_min_inside_ratio = (
+            float(checkpoint.get("crop_min_inside_ratio", 0.0))
+            if isinstance(checkpoint, dict)
+            else 0.0
+        )
         self.mirror_right_ear = (
             bool(checkpoint.get("mirror_right_ear", True)) if isinstance(checkpoint, dict) else True
         )
@@ -99,6 +112,9 @@ class LandmarkExtractor:
                 num_points=self.ear_points,
                 seed=self.seed,
                 mirror_y=False,
+                oversample_factor=self.crop_oversample_factor,
+                max_attempts=self.crop_max_resample_attempts,
+                min_inside_ratio=self.crop_min_inside_ratio,
             )
             right_points = sample_crop_point_features(
                 mesh=mesh,
@@ -107,6 +123,9 @@ class LandmarkExtractor:
                 num_points=self.ear_points,
                 seed=self.seed + 1,
                 mirror_y=self.mirror_right_ear,
+                oversample_factor=self.crop_oversample_factor,
+                max_attempts=self.crop_max_resample_attempts,
+                min_inside_ratio=self.crop_min_inside_ratio,
             )
             left_tensor = torch.from_numpy(left_points).unsqueeze(0).to(self.device)
             right_tensor = torch.from_numpy(right_points).unsqueeze(0).to(self.device)

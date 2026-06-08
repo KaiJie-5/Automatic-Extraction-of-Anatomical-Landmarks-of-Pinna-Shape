@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import trimesh
@@ -167,16 +167,95 @@ def sample_crop_point_features(
     num_points: int,
     seed: int,
     mirror_y: bool = False,
-) -> np.ndarray:
-    """Sample normalized point features from one crop box."""
-    crop_mesh = filter_mesh_by_normalized_box(mesh, transform, crop_box)
-    point_features = sample_mesh_surface(crop_mesh, num_points=num_points, seed=seed)
-    point_features = normalize_point_features(point_features, transform)
+    oversample_factor: int = 8,
+    max_attempts: int = 5,
+    min_inside_ratio: float = 0.0,
+    return_stats: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, dict]]:
+    """Sample normalized point features whose XYZ channels are inside one crop box.
+
+    Sampling happens on the full mesh first, then the sampled points are filtered
+    in normalized coordinates. This makes the returned tensor match the crop box
+    more tightly than sampling from a loose face-based submesh.
+    """
+    if num_points <= 0:
+        raise ValueError("num_points must be positive")
+    if oversample_factor <= 0:
+        raise ValueError("oversample_factor must be positive")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+
+    rng = np.random.default_rng(seed)
+    inside_features = None
+    best_inside_features = None
+    best_inside_count = 0
+    inside_count = 0
+    inside_ratio = 0.0
+    best_inside_ratio = 0.0
+    candidate_count = 0
+    best_candidate_count = 0
+    attempts_used = 0
+
+    for attempt in range(max_attempts):
+        attempts_used = attempt + 1
+        candidate_count = int(num_points * oversample_factor * (2**attempt))
+        candidate_count = max(candidate_count, num_points)
+        candidates = sample_mesh_surface(mesh, num_points=candidate_count, seed=seed + attempt)
+        candidates = normalize_point_features(candidates, transform)
+        inside_mask = points_inside_box(candidates[:, :3], crop_box)
+        inside_features = candidates[inside_mask]
+        inside_count = int(inside_features.shape[0])
+        inside_ratio = inside_count / max(candidate_count, 1)
+        if inside_count > best_inside_count:
+            best_inside_features = inside_features
+            best_inside_count = inside_count
+            best_inside_ratio = inside_ratio
+            best_candidate_count = candidate_count
+        if inside_count >= num_points:
+            break
+
+    if best_inside_features is None or best_inside_count == 0:
+        raise ValueError(
+            "No sampled mesh points fell inside the crop box. "
+            "Increase --crop-margin or --crop-oversample-factor."
+        )
+
+    replace = best_inside_count < num_points
+    selected_indices = rng.choice(best_inside_count, size=num_points, replace=replace)
+    point_features = best_inside_features[selected_indices].astype(np.float32)
     if mirror_y:
         point_features[:, 1] *= -1.0
         if point_features.shape[1] >= 5:
             point_features[:, 4] *= -1.0
+
+    stats = {
+        "requested_points": int(num_points),
+        "candidate_count": int(best_candidate_count),
+        "inside_count": int(best_inside_count),
+        "inside_ratio": float(best_inside_ratio),
+        "attempts": int(attempts_used),
+        "final_sampled_count": int(point_features.shape[0]),
+        "used_replacement": bool(replace),
+        "mirrored": bool(mirror_y),
+        "low_inside_ratio": bool(best_inside_ratio < float(min_inside_ratio)),
+    }
+    if return_stats:
+        return point_features.astype(np.float32), stats
     return point_features.astype(np.float32)
+
+
+def export_point_features_ply(
+    point_features: np.ndarray,
+    transform: MeshNormalization,
+    path: Path,
+) -> None:
+    """Export sampled normalized point features as an original-coordinate point cloud."""
+    points = np.asarray(point_features, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError("point_features must have shape (N, C>=3)")
+    vertices = transform.denormalize_xyz(points[:, :3])
+    point_cloud = trimesh.points.PointCloud(vertices=vertices)
+    point_cloud.export(path)
 
 
 def export_subject_crop_plys(
@@ -185,20 +264,51 @@ def export_subject_crop_plys(
     crop_config: Mapping[str, CropBox],
     output_dir: str,
     split_name: str,
-) -> None:
-    """Save all left/right crop meshes for visual inspection."""
+    ear_points: int = 8192,
+    seed: int = 0,
+    oversample_factor: int = 8,
+    max_attempts: int = 5,
+    min_inside_ratio: float = 0.0,
+    save_mesh: bool = True,
+    save_points: bool = True,
+) -> dict:
+    """Save crop meshes plus exact sampled point clouds for visual inspection."""
     id_to_index = {dataset.get_identifier(idx): idx for idx in range(len(dataset))}
     split_dir = Path(output_dir) / "crops" / split_name
     split_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics = {}
 
     for subject_id in subject_ids:
         if subject_id not in id_to_index:
             raise ValueError(f"Unknown subject id: {subject_id}")
         mesh, _, _ = dataset[id_to_index[subject_id]]
         transform = compute_mesh_normalization(mesh)
+        diagnostics[subject_id] = {}
         for ear in EAR_NAMES:
-            crop_mesh = filter_mesh_by_normalized_box(mesh, transform, crop_config[ear])
-            crop_mesh.export(split_dir / f"{subject_id}_{ear}.ply")
+            if save_mesh:
+                crop_mesh = filter_mesh_by_normalized_box(mesh, transform, crop_config[ear])
+                crop_mesh.export(split_dir / f"{subject_id}_{ear}_mesh.ply")
+            if save_points:
+                point_features, stats = sample_crop_point_features(
+                    mesh=mesh,
+                    transform=transform,
+                    crop_box=crop_config[ear],
+                    num_points=ear_points,
+                    seed=seed + id_to_index[subject_id] * 2 + (0 if ear == "left" else 1),
+                    mirror_y=False,
+                    oversample_factor=oversample_factor,
+                    max_attempts=max_attempts,
+                    min_inside_ratio=min_inside_ratio,
+                    return_stats=True,
+                )
+                export_point_features_ply(
+                    point_features,
+                    transform,
+                    split_dir / f"{subject_id}_{ear}_points.ply",
+                )
+                diagnostics[subject_id][ear] = stats
+
+    return diagnostics
 
 
 def make_crop_target(

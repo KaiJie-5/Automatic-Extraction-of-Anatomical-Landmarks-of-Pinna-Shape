@@ -77,12 +77,18 @@ class PinnaEarCropDataset(TorchDataset):
         seed: int = 0,
         subject_ids: Optional[Sequence[str]] = None,
         mirror_right_ear: bool = True,
+        crop_oversample_factor: int = 8,
+        crop_max_resample_attempts: int = 5,
+        crop_min_inside_ratio: float = 0.0,
     ):
         self.base_dataset = MeshLandmarkDataset(mesh_dir=mesh_dir, landmarks_dir=landmarks_dir)
         self.crop_config = crop_config
         self.ear_points = int(ear_points)
         self.seed = int(seed)
         self.mirror_right_ear = bool(mirror_right_ear)
+        self.crop_oversample_factor = int(crop_oversample_factor)
+        self.crop_max_resample_attempts = int(crop_max_resample_attempts)
+        self.crop_min_inside_ratio = float(crop_min_inside_ratio)
 
         if subject_ids is None:
             self.indices = list(range(len(self.base_dataset)))
@@ -110,6 +116,9 @@ class PinnaEarCropDataset(TorchDataset):
             num_points=self.ear_points,
             seed=self.seed + base_idx * 2,
             mirror_y=False,
+            oversample_factor=self.crop_oversample_factor,
+            max_attempts=self.crop_max_resample_attempts,
+            min_inside_ratio=self.crop_min_inside_ratio,
         )
         right_points = sample_crop_point_features(
             mesh=mesh,
@@ -118,6 +127,9 @@ class PinnaEarCropDataset(TorchDataset):
             num_points=self.ear_points,
             seed=self.seed + base_idx * 2 + 1,
             mirror_y=self.mirror_right_ear,
+            oversample_factor=self.crop_oversample_factor,
+            max_attempts=self.crop_max_resample_attempts,
+            min_inside_ratio=self.crop_min_inside_ratio,
         )
         target = make_landmark_target(landmarks_left, landmarks_right, transform)
 

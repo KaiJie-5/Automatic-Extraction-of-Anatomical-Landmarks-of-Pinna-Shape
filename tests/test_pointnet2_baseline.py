@@ -7,7 +7,9 @@ from src.dataset import Dataset
 from src.ear_crop import (
     CropBox,
     compute_crop_coverage,
+    export_subject_crop_plys,
     fit_crop_config_from_training_landmarks,
+    points_inside_box,
     sample_crop_point_features,
 )
 from src.estimator import LandmarkExtractor
@@ -239,7 +241,16 @@ def test_crop_sampling_returns_balanced_left_right_shapes(tmp_path):
 
     dataset = Dataset(str(mesh_dir), str(landmarks_dir))
     subject_ids = [dataset.get_identifier(i) for i in range(len(dataset))]
-    crop_config = fit_crop_config_from_training_landmarks(dataset, subject_ids, margin=0.4)
+    crop_config = {
+        "left": CropBox(
+            minimum=np.array([-1.0, 0.0, -1.0], dtype=np.float32),
+            maximum=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        ),
+        "right": CropBox(
+            minimum=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
+            maximum=np.array([1.0, 0.0, 1.0], dtype=np.float32),
+        ),
+    }
     crop_dataset = PinnaEarCropDataset(
         str(mesh_dir),
         str(landmarks_dir),
@@ -253,6 +264,65 @@ def test_crop_sampling_returns_balanced_left_right_shapes(tmp_path):
     assert item["left_points"].shape == (32, 6)
     assert item["right_points"].shape == (32, 6)
     assert item["landmarks"].shape == (170, 3)
+
+
+def test_crop_sampler_keeps_points_inside_box():
+    mesh = trimesh.creation.box(extents=(2.0, 6.0, 2.0))
+    transform = compute_mesh_normalization(mesh)
+    crop_box = CropBox(
+        minimum=np.array([-0.35, 0.25, -0.35], dtype=np.float32),
+        maximum=np.array([0.35, 0.75, 0.35], dtype=np.float32),
+    )
+
+    sampled = sample_crop_point_features(
+        mesh,
+        transform,
+        crop_box,
+        32,
+        seed=13,
+        oversample_factor=64,
+        max_attempts=3,
+    )
+
+    assert sampled.shape == (32, 6)
+    assert np.all(points_inside_box(sampled[:, :3], crop_box))
+
+
+def test_crop_export_writes_exact_sampled_point_cloud(tmp_path):
+    mesh_dir, landmarks_dir = _make_tiny_dataset(tmp_path, subject_ids=("S001",))
+    dataset = Dataset(str(mesh_dir), str(landmarks_dir))
+    subject_ids = [dataset.get_identifier(i) for i in range(len(dataset))]
+    crop_config = {
+        "left": CropBox(
+            minimum=np.array([-1.0, 0.0, -1.0], dtype=np.float32),
+            maximum=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        ),
+        "right": CropBox(
+            minimum=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
+            maximum=np.array([1.0, 0.0, 1.0], dtype=np.float32),
+        ),
+    }
+    output_dir = tmp_path / "outputs"
+
+    stats = export_subject_crop_plys(
+        dataset,
+        subject_ids,
+        crop_config,
+        str(output_dir),
+        "train",
+        ear_points=16,
+        oversample_factor=32,
+        max_attempts=3,
+    )
+
+    mesh_path = output_dir / "crops" / "train" / "S001_left_mesh.ply"
+    points_path = output_dir / "crops" / "train" / "S001_left_points.ply"
+    point_cloud = trimesh.load(points_path, process=False)
+
+    assert mesh_path.exists()
+    assert points_path.exists()
+    assert point_cloud.vertices.shape[0] == 16
+    assert stats["S001"]["left"]["final_sampled_count"] == 16
 
 
 def test_right_ear_mirroring_flips_y_and_normal_y():

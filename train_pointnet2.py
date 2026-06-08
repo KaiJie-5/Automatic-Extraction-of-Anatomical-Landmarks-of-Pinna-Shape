@@ -258,6 +258,9 @@ def save_checkpoint(
             "crop_config": crop_config,
             "num_points": args.num_points,
             "ear_points": args.ear_points,
+            "crop_oversample_factor": args.crop_oversample_factor,
+            "crop_max_resample_attempts": args.crop_max_resample_attempts,
+            "crop_min_inside_ratio": args.crop_min_inside_ratio,
             "mirror_right_ear": args.mirror_right_ear,
             "seed": args.seed,
             "epoch": epoch,
@@ -276,6 +279,7 @@ def build_run_config(
     amp_enabled: bool,
     crop_config: Optional[dict] = None,
     crop_coverage: Optional[dict] = None,
+    crop_sampling_stats: Optional[dict] = None,
 ) -> dict:
     """Collect run configuration for stdout and checkpoint-folder records."""
     return {
@@ -300,6 +304,7 @@ def build_run_config(
         },
         "crop_config": crop_config,
         "crop_coverage": crop_coverage,
+        "crop_sampling_stats": crop_sampling_stats,
     }
 
 
@@ -308,6 +313,24 @@ def write_json(path: Path, data: dict) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+def print_low_yield_crop_warnings(crop_sampling_stats: Optional[dict]) -> None:
+    if not crop_sampling_stats:
+        return
+    for split_name, split_stats in crop_sampling_stats.items():
+        if split_stats is None:
+            continue
+        for subject_id, subject_stats in split_stats.items():
+            for ear, stats in subject_stats.items():
+                if stats.get("low_inside_ratio", False):
+                    print(
+                        "WARNING: low crop inside-point yield "
+                        f"split={split_name} subject={subject_id} ear={ear} "
+                        f"inside_ratio={stats.get('inside_ratio', 0.0):.6f} "
+                        f"inside_count={stats.get('inside_count', 0)} "
+                        f"requested={stats.get('requested_points', 0)}"
+                    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -323,6 +346,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-points", type=int, default=16384)
     parser.add_argument("--ear-points", type=int, default=8192)
     parser.add_argument("--crop-margin", type=float, default=0.4)
+    parser.add_argument("--crop-oversample-factor", type=int, default=8)
+    parser.add_argument("--crop-max-resample-attempts", type=int, default=5)
+    parser.add_argument("--crop-min-inside-ratio", type=float, default=0.0)
     parser.add_argument("--save-crop-ply", action="store_true", default=True)
     parser.add_argument("--no-save-crop-ply", dest="save_crop_ply", action="store_false")
     parser.add_argument("--mirror-right-ear", action="store_true", default=True)
@@ -389,6 +415,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     crop_config = None
     crop_config_json = None
     crop_coverage = None
+    crop_sampling_stats = None
 
     if args.input_mode == "full":
         train_dataset = PinnaPointCloudDataset(
@@ -422,13 +449,36 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         write_json(checkpoint_dir / "crop_config.json", crop_config_json)
         write_json(checkpoint_dir / "crop_coverage.json", crop_coverage)
         if args.save_crop_ply:
-            export_subject_crop_plys(
-                base_dataset, train_ids, crop_config, str(checkpoint_dir), "train"
-            )
+            crop_sampling_stats = {
+                "train": export_subject_crop_plys(
+                    base_dataset,
+                    train_ids,
+                    crop_config,
+                    str(checkpoint_dir),
+                    "train",
+                    ear_points=args.ear_points,
+                    seed=args.seed,
+                    oversample_factor=args.crop_oversample_factor,
+                    max_attempts=args.crop_max_resample_attempts,
+                    min_inside_ratio=args.crop_min_inside_ratio,
+                ),
+                "val": None,
+            }
             if val_ids:
-                export_subject_crop_plys(
-                    base_dataset, val_ids, crop_config, str(checkpoint_dir), "val"
+                crop_sampling_stats["val"] = export_subject_crop_plys(
+                    base_dataset,
+                    val_ids,
+                    crop_config,
+                    str(checkpoint_dir),
+                    "val",
+                    ear_points=args.ear_points,
+                    seed=args.seed + 100000,
+                    oversample_factor=args.crop_oversample_factor,
+                    max_attempts=args.crop_max_resample_attempts,
+                    min_inside_ratio=args.crop_min_inside_ratio,
                 )
+            write_json(checkpoint_dir / "crop_sampling_stats.json", crop_sampling_stats)
+            print_low_yield_crop_warnings(crop_sampling_stats)
 
         train_dataset = PinnaEarCropDataset(
             args.mesh_dir,
@@ -438,6 +488,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             seed=args.seed,
             subject_ids=train_ids,
             mirror_right_ear=args.mirror_right_ear,
+            crop_oversample_factor=args.crop_oversample_factor,
+            crop_max_resample_attempts=args.crop_max_resample_attempts,
+            crop_min_inside_ratio=args.crop_min_inside_ratio,
         )
         val_dataset = (
             PinnaEarCropDataset(
@@ -448,6 +501,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 seed=args.seed + 100000,
                 subject_ids=val_ids,
                 mirror_right_ear=args.mirror_right_ear,
+                crop_oversample_factor=args.crop_oversample_factor,
+                crop_max_resample_attempts=args.crop_max_resample_attempts,
+                crop_min_inside_ratio=args.crop_min_inside_ratio,
             )
             if val_ids
             else None
@@ -482,6 +538,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         amp_enabled=amp_enabled,
         crop_config=crop_config_json,
         crop_coverage=crop_coverage,
+        crop_sampling_stats=crop_sampling_stats,
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     write_json(checkpoint_dir / "run_config.json", run_config)
