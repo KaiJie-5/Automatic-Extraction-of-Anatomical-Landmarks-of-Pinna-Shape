@@ -1,149 +1,481 @@
-# Tech Arena 2026
+# Pinna Landmark Extraction with PointNet++
 
-The goal of this challenge is to extract landmarks for the pinna shape from the 3D head scans of a human subject. The submitted models are expected to accept a 3D mesh as the input and output precise landmarks of the pinna shape as illustrated in Figure below.
+This repository contains a PyTorch baseline for the Tech Arena 2026 pinna landmark extraction task. The task is to take a 3D head mesh as input and predict 85 landmarks for the left pinna and 85 landmarks for the right pinna.
+
+The current code supports two input modes:
+
+- `full`: sample points from the full head mesh and use one PointNet++ encoder.
+- `ear_crop`: sample left and right ear crops separately, use the same PointNet++ encoder for both ears, join the two outputs, and predict all landmarks.
+
+The model input is sampled point features:
+
+```text
+[x, y, z, normal_x, normal_y, normal_z]
+```
+
+The model output is:
+
+```text
+left_landmarks:  (85, 3)
+right_landmarks: (85, 3)
+```
 
 ![system_overview](img/Overview.png)
 
+## Installation
 
-For this task, the 3D meshes provided are aligned along the interaural axis as
-- The Y-axis runs along the left ear canal to the right ear canal entrance. 
-- The X-axis is from the back of the head to the front of the head, passing the tip of the nose. 
-- The Z-axis runs vertically towards the top of the head.
-- The center of the head is defined by the intersection of the above-defined X, Y, and Z axes. 
+The recommended setup for the HPC environment is a conda environment with PyTorch installed from the official CUDA wheel index.
 
+```bash
+conda create -n anthropometric_env python=3.10 -y
+conda activate anthropometric_env
+```
 
-This anatomical alignment ensures that all annotations are made consistently across subjects.
+For NVIDIA L4 or L40 GPUs, install the CUDA 12.8 PyTorch wheels:
 
-# Preparation
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
 
-## Dataset
+If your cluster driver requires a different CUDA build, choose the matching command from the official PyTorch install page:
 
-A dataset consisting of 3D meshes of the head and torso for 200 subjects along with 85 landmarks of the left and right pinna is provided.
+https://pytorch.org/get-started/locally/
 
-**To obtain access to the dataset, a *data sharing permission form* needs to be signed by all team members. The form can be obtained by navigating to the *submission section* of your team. Please download the form, fill in the names of *all* team members as well as their signatures, and upload the signed document on the same page. Please also provide a single email address of one of the team members to which the download information will be sent.**
-
-**After submission of the signed form, you will receive an email giving you access to the datasets. We try to keep the time between submission and access as short as possible, but since there is manual work involved, it might take several days before you can access the data.**
-
-
-## Code
-
-Set up your python environment and install all required packages.
+Install the remaining packages:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For details on how to use the provided code resources, see the [Jupyter notebook](getting_started.ipynb).
+The requirements file also lists `torch` for simple local setup. If your HPC has strict CUDA package rules, install the CUDA PyTorch wheel first as shown above, then install the remaining packages.
 
-## PointNet++ baseline
+Check that PyTorch can see the GPU:
 
-This repository includes a first PointNet++ regression baseline for the landmark extraction task. It samples a full
-mesh into point features `[x, y, z, normal_x, normal_y, normal_z]`, normalizes coordinates per mesh, regresses
-`170 x 3` landmarks, and returns the first 85 landmarks as the left ear and the remaining 85 as the right ear.
+```bash
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("cuda version:", torch.version.cuda)
+if torch.cuda.is_available():
+    print("gpu:", torch.cuda.get_device_name(0))
+PY
+```
 
-Train the default SSG baseline with:
+## Dataset Layout
+
+Place the data in this layout:
+
+```text
+data/
+  mesh/
+    <subject_id>.ply
+  landmarks/
+    <subject_id>_left_ear_landmarks.csv
+    <subject_id>_right_ear_landmarks.csv
+```
+
+Example:
+
+```text
+data/mesh/P0001.ply
+data/landmarks/P0001_left_ear_landmarks.csv
+data/landmarks/P0001_right_ear_landmarks.csv
+```
+
+Subject `P0027` is excluded by default because it has a malformed landmark count in the current dataset copy.
+
+## Quick Start
+
+Train the default full-head baseline:
 
 ```bash
 python train_pointnet2.py --mesh-dir data/mesh --landmarks-dir data/landmarks
 ```
 
-The default input mode uses the full head mesh. To train the optional two-branch ear-crop model, use:
+Train the ear-crop baseline:
 
 ```bash
-python train_pointnet2.py --input-mode ear_crop --ear-points 8192 --crop-margin 0.40
+python train_pointnet2.py \
+  --mesh-dir data/mesh \
+  --landmarks-dir data/landmarks \
+  --input-mode ear_crop \
+  --ear-points 8192 \
+  --crop-margin 0.40
 ```
 
-Ear-crop mode fits left/right crop boxes from training landmarks only, saves `crop_config.json`,
-`crop_coverage.json`, and `crop_sampling_stats.json`, and writes visual crop PLYs under
-`checkpoints/crops/{train,val}`. Files ending in `_mesh.ply` are loose contextual crop meshes;
-files ending in `_points.ply` are the sampled crop point clouds before optional right-ear mirroring.
-Use `--crop-oversample-factor`, `--crop-max-resample-attempts`, and
-`--crop-min-inside-ratio` to tune or diagnose point-level crop sampling.
-
-For a small environment smoke test, use:
+Run a small smoke test:
 
 ```bash
 python train_pointnet2.py --epochs 1 --batch-size 1 --num-points 128
 python train_pointnet2.py --epochs 1 --batch-size 1 --input-mode ear_crop --ear-points 128
 ```
 
-The challenge entry point `src.estimator.LandmarkExtractor()` expects a trained checkpoint at
-`checkpoints/best_model.pt`. Most data, model, and optimizer settings are exposed as command-line arguments; run
-`python train_pointnet2.py --help` to inspect them.
+Submit an HPC job:
 
+```bash
+sbatch submit_job_train_pointnet2.slurm
+```
 
-# Evaluation
+The sbatch file keeps the main tuning values near the top of the file, including input mode, model type, point count, loss, learning rate, and batch size.
 
-All submitted models will be evaluated on an undisclosed set of subjects. The performance of this task is evaluated by comparing the predicted landmarks with the ground truth landmarks.
+## Outputs
 
-Given a set of $N$ ground truth landmarks for one ear of subject $j$, $$L^{j, ear}_{gt} = \{ l^{j, ear}_{gt, 1}, l^{j, ear}_{gt, 2},\ldots l^{j, ear}_{gt, N} \},$$ and a set of $N$ predicted landmarks, $$L^{j,ear}_{out} = \{ l^{j, ear}_{out, 1}, l^{j, ear}_{out, 2},\ldots,l^{j, ear}_{out, N} \},$$ where and $l^{j, ear}_{gt, i}, l^{j, ear}_{out, i} \in \mathbb{R}^3$ represent the coordinates of the $i^{th}$ landmark in each set.
+Training writes files under `--checkpoint-dir`.
 
-The mean Euclidean distance for a single set of landmarks is computed by
-$$ d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right) =\frac{1}{N} \sum_{i=1}^{N} \left\lVert l^{j, ear}_{out, i} - l^{j, ear}_{gt, i} \right\rVert $$
+Common files:
 
-The overall performance is then computed by averaging those distances across all $M$ subjects and all ears of the hidden test set: $$ MD =\frac{1}{2M} \sum_{j=1}^{M} \sum_{ear}  d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right), $$ with $ear \in \{ \text{left}, \text{right} \}$.
+- `best_model.pt`: checkpoint with the best validation mean distance.
+- `last_model.pt`: checkpoint from the latest epoch.
+- `run_config.json`: full run configuration.
+- `crop_config.json`: fitted crop boxes for `ear_crop` mode.
+- `crop_coverage.json`: landmark coverage for the crop boxes.
+- `crop_sampling_stats.json`: point sampling counts for crop mode.
 
-This metric is implemented in the [`metrics.py`](src/metrics.py) module.
+In `ear_crop` mode, crop visual files are saved under:
 
+```text
+checkpoints/crops/{train,val}/
+```
 
-# Submission
+Crop file meanings:
 
-Systems need to be submitted through the challenge platform, and can be updated at any time before the end of the challenge. Only the latest submission will be considered for each team and will be displayed on the leaderboard of the challenge.
+- `{subject}_{left/right}_mesh.ply`: loose crop mesh for context.
+- `{subject}_{left/right}_points.ply`: sampled crop point cloud before optional right-ear mirroring.
 
-Each submitted model needs to implement the `LandmarkExtractor` class in the [`estimator.py`](src/estimator.py) module. This class will be used for automatic evaluation on a hidden test data set, and the score will be reported on the leaderboard.
+Use `_points.ply` when checking what the model receives.
 
-The final submission at the end of the challenge must include:
-1. the source code to extract pinna landmarks for left and right pinna.
-2. a brief documentation of the algorithm
-3. for AI-based solutions: the training code as well as a reference to any additional datasets used.
+## Model Modes
 
+### Full Mesh
 
-# Background
+`--input-mode full` samples `--num-points` points from the full mesh. The default is `16384`.
 
-*Binaural audio rendering* is the process of simulating sound sources in 3D space around a listener. It is not only used for virtual reality and augmented reality applications, but has made its way into mobile devices to provide immersive user experiences when listening to audio content (music, movies, radio play, etc.). 
+Flow:
 
-In order to provide the illusion of sounds coming from various directions, sound source signals are convolved with so-called *head-related transfer functions (HRTFs)*. Those HRTFs encode the relevant binaural cues that let the listener perceive the sound from a certain direction.
+```text
+full mesh -> 16384 points -> PointNet++ encoder -> prediction layers -> 170 x 3 landmarks
+```
 
-However, HRTFs are influenced by the human anatomy. The pinna for example causes direction-dependent sound reflections and the head causes frequency-dependent sound attenuation due to shadowing effects. Therefore, HRTFs of individuals differ due to anatomic differences. Listening to rendered audio content using HRTFs of a different individual can have a detrimental effect on the perceived sound quality, and can lead to inaccurate localization and an undesired sound color. Hence there is a demand for obtaining *individual HRTFs* to provide personalized audio rendering.
+### Ear Crop
 
-Obtaining accurate individual HRTFs usually requires time-consuming acoustic measurements and does not scale to a large user group. A cost-effective alternative would be to individualize the HRTFs based on anthropometric shapes which can be extracted from the 3D scans. 
+`--input-mode ear_crop` fits left and right crop boxes from the training landmarks only. It then samples `--ear-points` points inside each crop box. The default is `8192` points per ear.
 
-The goal of this challenge is to extract the landmarks for the pinna shape from the 3D scans of a human subject.
+Flow:
 
-# Pinna Landmarks
+```text
+left crop  -> 8192 points -> shared PointNet++ encoder -> left output
+right crop -> 8192 points -> shared PointNet++ encoder -> right output
+left output + right output -> prediction layers -> 170 x 3 landmarks
+```
 
-The pinna (or auricle) is the outer ear that captures sound waves and directs them into the ear canal. Pinna plays a key role in the perception of sound, and its effect is unique to each individual. 
+Right-ear mirroring changes the right-ear input points only. The target landmarks and final predictions stay in the original mesh coordinates.
 
-The pinna is comprised of following primary components: the helix $\rightarrow$ which forms the ear's overall shape, the antihelix $\rightarrow$ an inner, curved ridge that runs parallel to the helix, and the concha $\rightarrow$ a deep, bowl-shaped hollow adjacent to the ear canal entrance, as illustrated in below Figure.
+## Training Arguments
 
-<img align = "center" src="img/KEMAR_pinna_parts.png" width="300" />  
-<br />
-<br />
+Run this command for the live argument list:
 
-The provided pinna anthropometric landmarks can be divided into four distinct pinna contours: the *outer helix*, *outer concha*, *inner helix*, and *superior antihelix*. Each contour consists of two or more *anchor* landmarks that have clearly defined locations on the pinna surface. In between those anchor landmarks, the remaining landmarks are equally distributed, i.e. consecutive landmarks between anchor landmarks all have the same distance. The following section details the positions of the anchor landmarks on each contour.
+```bash
+python train_pointnet2.py --help
+```
 
+### Data and Split Arguments
 
-## Anchor points
+| Argument | Default | Meaning |
+| :--- | :--- | :--- |
+| `--mesh-dir` | `data/mesh` | Folder containing subject `.ply` meshes. |
+| `--landmarks-dir` | `data/landmarks` | Folder containing left and right landmark CSV files. |
+| `--checkpoint-dir` | `checkpoints` | Folder where checkpoints, configs, and crop files are saved. |
+| `--train-split-file` | `None` | Optional text file with one training subject ID per line. |
+| `--val-split-file` | `None` | Optional text file with one validation subject ID per line. |
+| `--val-ratio` | `0.2` | Validation fraction when split files are not provided. |
+| `--seed` | `0` | Random seed for splitting, sampling, and training setup. |
+| `--workers` | `0` | Number of PyTorch data loader workers. |
 
-| (i) Outer helix contours with 4 fixed point landmarks  | Visualization (25 landmarks) |
+If split files are used, provide both `--train-split-file` and `--val-split-file`.
+
+### Input and Sampling Arguments
+
+| Argument | Default | Meaning |
+| :--- | :--- | :--- |
+| `--input-mode` | `full` | Choose `full` or `ear_crop`. |
+| `--num-points` | `16384` | Number of sampled full-mesh points for `full` mode. |
+| `--ear-points` | `8192` | Number of sampled points per ear for `ear_crop` mode. |
+| `--num-landmarks` | `170` | Number of output landmarks. Keep this at `170` for the challenge. |
+| `--no-normals` | `False` | Disable normal channels in the PointNet++ input. |
+
+### Crop Arguments
+
+| Argument | Default | Meaning |
+| :--- | :--- | :--- |
+| `--crop-margin` | `0.4` | Expands fitted crop boxes around the training landmarks. |
+| `--crop-oversample-factor` | `8` | Initial multiplier used before filtering points inside the crop box. |
+| `--crop-max-resample-attempts` | `5` | Maximum number of crop sampling retries. |
+| `--crop-min-inside-ratio` | `0.0` | Diagnostic threshold for low inside-box point yield. |
+| `--save-crop-ply` | `True` | Save crop mesh and sampled crop point PLY files. |
+| `--no-save-crop-ply` | `False` | Disable crop PLY export. |
+| `--mirror-right-ear` | `True` | Mirror right-ear input points into left-ear orientation. |
+| `--no-mirror-right-ear` | `False` | Keep right-ear input points in original orientation. |
+
+### Model Arguments
+
+| Argument | Default | Meaning |
+| :--- | :--- | :--- |
+| `--variant` | `ssg` | PointNet++ type. Choose `ssg` or `msg`. |
+| `--head-channels` | `512,256` | Hidden layer sizes for the final prediction layers. |
+| `--dropout` | `0` | Dropout probability in the final prediction layers. |
+| `--ssg-npoints` | `512,128` | Number of center points kept in each SSG layer. |
+| `--ssg-radii` | `0.2,0.4` | Search radii for SSG layers. |
+| `--ssg-nsamples` | `32,64` | Neighbor counts for SSG layers. |
+| `--ssg-mlps` | `64,64,128;128,128,256;256,512,1024` | SSG layer sizes. Separate layers with `;`. |
+| `--msg-npoints` | `512,128` | Number of center points kept in each MSG layer. |
+| `--msg-radii` | `0.1,0.2,0.4;0.2,0.4,0.8` | MSG radii. Separate layers with `;` and scales with `,`. |
+| `--msg-nsamples` | `16,32,128;32,64,128` | MSG neighbor counts. Separate layers with `;`. |
+| `--msg-mlps` | `32,32,64|64,64,128|64,96,128;64,64,128|128,128,256|128,128,256` | MSG layer sizes. Separate scales with `|` and layers with `;`. |
+| `--msg-global-mlp` | `256,512,1024` | Final MSG feature sizes. |
+
+### Optimizer, Loss, and Runtime Arguments
+
+| Argument | Default | Meaning |
+| :--- | :--- | :--- |
+| `--epochs` | `200` | Number of training epochs. |
+| `--batch-size` | `4` | Batch size. |
+| `--learning-rate` | `1e-3` | Optimizer learning rate. |
+| `--weight-decay` | `1e-4` | Weight decay. |
+| `--optimizer` | `adamw` | Choose `adam`, `adamw`, or `sgd`. |
+| `--loss` | `smooth_l1` | Choose `smooth_l1`, `mse`, `l1`, or `mean_distance`. |
+| `--smooth-l1-beta` | `1.0` | Beta value for Smooth L1 loss. |
+| `--momentum` | `0.9` | Momentum for SGD. |
+| `--scheduler` | `cosine` | Choose `none`, `cosine`, or `step`. |
+| `--step-size` | `50` | Step size for the step scheduler. |
+| `--step-gamma` | `0.5` | Decay factor for the step scheduler. |
+| `--grad-clip-norm` | `0.0` | Gradient clipping value. `0.0` disables clipping. |
+| `--amp` | `False` | Enable mixed precision training on CUDA. |
+| `--device` | `auto` | Choose `auto`, `cpu`, or a CUDA device such as `cuda:0`. |
+
+## Evaluation
+
+The official score is the mean Euclidean distance between predicted and ground-truth landmarks.
+
+For one ear of subject `j`, with `N` landmarks:
+
+$$
+d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right)
+=\frac{1}{N} \sum_{i=1}^{N}
+\left\lVert l^{j, ear}_{out, i} - l^{j, ear}_{gt, i} \right\rVert
+$$
+
+The final score averages this distance across all hidden test subjects and both ears:
+
+$$
+MD =\frac{1}{2M} \sum_{j=1}^{M} \sum_{ear}
+d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right),
+\quad ear \in \{left, right\}
+$$
+
+This metric is implemented in [`src/metrics.py`](src/metrics.py).
+
+During training:
+
+- `train_loss` is the selected training loss.
+- `val_loss` is the selected validation loss.
+- `train_md` is the mean landmark distance on the training split.
+- `val_md` is the mean landmark distance on the validation split.
+
+If the mesh coordinates are in millimetres, `train_md` and `val_md` are also in millimetres.
+
+Use this loss if you want the training objective to match the official metric:
+
+```bash
+python train_pointnet2.py --loss mean_distance
+```
+
+The default loss is:
+
+```text
+smooth_l1
+```
+
+## Inference and Submission
+
+The challenge entry point is:
+
+```text
+src.estimator.LandmarkExtractor
+```
+
+By default, it loads:
+
+```text
+checkpoints/best_model.pt
+```
+
+If the checkpoint is missing, `LandmarkExtractor` raises a clear error. Before submitting, place the trained checkpoint at this path or change the default path in a controlled way.
+
+The extractor returns:
+
+```python
+left, right = extractor.extract(mesh)
+```
+
+where:
+
+```text
+left.shape  == (85, 3)
+right.shape == (85, 3)
+```
+
+Challenge submissions must include:
+
+1. Source code that extracts left and right pinna landmarks.
+2. A brief description of the method.
+3. Training code and references to any extra datasets used.
+
+## Visualization and Debugging
+
+Point importance can be exported with:
+
+```bash
+python visualize_point_importance.py \
+  --checkpoint-path checkpoints/best_model.pt \
+  --mesh-path data/mesh/P0001.ply \
+  --method occlusion \
+  --output-dir importance_outputs
+```
+
+The tool writes colored PLY files and NumPy data files for inspection. The heatmap is a debugging aid, not an official evaluation output.
+
+For ear-crop runs, inspect the crop PLY files under:
+
+```text
+checkpoints/crops/{train,val}/
+```
+
+Use `_points.ply` files to see the sampled crop points. Use `_mesh.ply` files only as context.
+
+## HPC Training
+
+Edit the hyperparameter block near the top of:
+
+```text
+submit_job_train_pointnet2.slurm
+```
+
+Then submit:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm
+```
+
+Each run creates a separate folder under `runs/`. The run folder stores:
+
+- checkpoint files
+- logs
+- the exact training command
+- the sbatch configuration
+- `run_config.json`
+
+This makes it easier to compare full-head, ear-crop, SSG, MSG, and loss-function experiments.
+
+## Project Structure
+
+```text
+.
+|-- train_pointnet2.py               # Training entry point
+|-- visualize_point_importance.py    # Point importance visualization
+|-- submit_job_train_pointnet2.slurm # HPC training script
+|-- src/
+|   |-- dataset.py                   # Mesh and landmark file loading
+|   |-- torch_dataset.py             # PyTorch datasets
+|   |-- preprocessing.py             # Sampling and normalization
+|   |-- ear_crop.py                  # Ear crop fitting and sampling
+|   |-- pointnet2_model.py           # PointNet++ models
+|   |-- pointnet2_utils.py           # PointNet++ utility code
+|   |-- estimator.py                 # Challenge inference entry point
+|   `-- metrics.py                   # Official mean distance metric
+|-- tests/
+|   `-- test_pointnet2_baseline.py
+|-- img/
+|-- requirements.txt
+`-- THIRD_PARTY_NOTICES.md
+```
+
+## Competition Data and Rules
+
+The challenge provides 3D meshes of the head and torso for 200 subjects, with 85 landmarks for the left pinna and 85 landmarks for the right pinna.
+
+To obtain access to the dataset, a data sharing permission form must be signed by all team members. The form is available from the submission section of the team page. After submission, the dataset access details are sent by email.
+
+All submitted models are evaluated on a hidden test set. Only the latest submission before the challenge deadline is considered for each team and shown on the leaderboard.
+
+## Mesh Alignment
+
+The provided meshes are aligned as follows:
+
+- The Y-axis runs from the left ear canal entrance to the right ear canal entrance.
+- The X-axis runs from the back of the head to the front of the head, passing the nose tip.
+- The Z-axis runs upward toward the top of the head.
+- The head center is defined by the intersection of these axes.
+
+This alignment keeps the annotations consistent across subjects.
+
+## Background
+
+Binaural audio rendering simulates sound sources in 3D space around a listener. It is used in virtual reality, augmented reality, and consumer audio.
+
+To create the effect of sound coming from a specific direction, sound signals are filtered by head-related transfer functions, also called HRTFs. HRTFs depend on the shape of the head and pinna. Because each person has different anatomy, using another person's HRTFs can reduce sound quality and localization accuracy.
+
+Accurate individual HRTFs usually require acoustic measurements. A more scalable option is to estimate useful anthropometric information from 3D scans. This challenge focuses on extracting pinna landmarks from those scans.
+
+## Pinna Landmarks
+
+The pinna, also called the auricle, is the outer ear. It captures sound waves and directs them into the ear canal.
+
+The pinna contains several important parts:
+
+- helix
+- antihelix
+- concha
+
+<img align="center" src="img/KEMAR_pinna_parts.png" width="300" />
+
+The provided landmarks are grouped into four contours:
+
+- outer helix
+- outer concha
+- inner helix
+- superior antihelix
+
+Each contour has fixed anchor landmarks. The remaining landmarks are placed between anchor points.
+
+### Anchor Points
+
+| Outer helix contour | Visualization |
 | :--- | :--- |
-| <ul><li>Index 0: *upper connection of helix with head, at the center of the ridge.*</li><li>Index 6: *upper point of the largest extent of the outer helix, annotated on the top of the ridge.*</li><li>Index 22: *lower point of the largest extent of the outer helix, annotated on the top of the ridge.*</li><li>Index 24: *lower connection of helix with head, at the center of the ridge.*</li></ul> | <img align = "center" src="img/outerhelix.png" width="200" /> |
+| Index 0: upper connection of helix with head, at the center of the ridge.<br>Index 6: upper point of the largest extent of the outer helix, on the top of the ridge.<br>Index 22: lower point of the largest extent of the outer helix, on the top of the ridge.<br>Index 24: lower connection of helix with head, at the center of the ridge. | <img align="center" src="img/outerhelix.png" width="200" /> |
 
-
-| (ii) Concha outline with 6 fixed point landmarks | Visualization (30 landmarks) |
+| Concha outline | Visualization |
 | :--- | :--- |
-| <ul><li> Index 25: *connection of concha with helix at 90º view*  </li><li> Index 33: *junction of fossa (actually: crura of antihelix) and outer concha contour*.</li><li> Index 42: *antitragus (at highest curvature)*.</li><li> Index 46: *saddle point below tragus* .</li><li> Index 50: *tragus (at highest curvature)*.</li><li> Index 54 *saddle point above tragus*.</li></ul> | <img align = "center" src="img/conchaoutline.png" width="200" /> |
+| Index 25: connection of concha with helix at 90 degrees view.<br>Index 33: junction of fossa and outer concha contour.<br>Index 42: antitragus at highest curvature.<br>Index 46: saddle point below tragus.<br>Index 50: tragus at highest curvature.<br>Index 54: saddle point above tragus. | <img align="center" src="img/conchaoutline.png" width="200" /> |
 
-| (iii) Inner helix with 3 fixed point landmarks | Visualization (20 landmarks) |
+| Inner helix | Visualization |
 | :--- | :--- |
-| <ul><li> Index 55: *inner helix ridge at height of concha start*.</li><li> Index 64: *point opposite the highest point of the outer helix*.</li><li>Index 74: *end point of the continuation of the contour line for another 10 points with the same neighbor distance*.</li></ul> | <img align = "center" src="img/innerhelix.png" width="200" /> |
+| Index 55: inner helix ridge at height of concha start.<br>Index 64: point opposite the highest point of the outer helix.<br>Index 74: end point of the continuation of the contour line for another 10 points with the same neighbor distance. | <img align="center" src="img/innerhelix.png" width="200" /> |
 
-| (iv) Superior Antihelix with 2 fixed point landmarks| Visualization (10 landmarks) |
+| Superior antihelix | Visualization |
 | :--- | :--- |
-| <ul><li> Index 75: *junction of fossa (actually: crura of antihelix) and outer concha contour*.</li><li> Index 84: *connection of fossa (actually: crura of antihelix) with helix*.</li></ul> | <img align = "center" src="img/superiorantihelix.png" width="200" /> |
+| Index 75: junction of fossa and outer concha contour.<br>Index 84: connection of fossa with helix. | <img align="center" src="img/superiorantihelix.png" width="200" /> |
 
+A full set of landmarks for one ear has shape:
 
-<br />
-<br />
+```text
+85 x 3
+```
 
-Since each landmark is a point in 3D space, a full set of landmarks for a single ear can be represented by a matrix of size 85 x 3.
+## Third-Party Code
+
+`src/pointnet2_utils.py` adapts PointNet++ utilities from:
+
+https://github.com/yanx27/Pointnet_Pointnet2_pytorch
+
+The upstream project is distributed under the MIT License. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
