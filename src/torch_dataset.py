@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 
 from .dataset import Dataset as MeshLandmarkDataset
+from .ear_crop import sample_crop_point_features
 from .preprocessing import (
     compute_mesh_normalization,
     make_landmark_target,
@@ -57,6 +58,72 @@ class PinnaPointCloudDataset(TorchDataset):
 
         return {
             "points": torch.from_numpy(point_features),
+            "landmarks": torch.from_numpy(target),
+            "centroid": torch.from_numpy(transform.centroid),
+            "scale": torch.tensor(transform.scale, dtype=torch.float32),
+            "identifier": self.base_dataset.get_identifier(base_idx),
+        }
+
+
+class PinnaEarCropDataset(TorchDataset):
+    """Return balanced left/right crop point clouds and global-normalized targets."""
+
+    def __init__(
+        self,
+        mesh_dir: str,
+        landmarks_dir: str,
+        crop_config: dict,
+        ear_points: int = 8192,
+        seed: int = 0,
+        subject_ids: Optional[Sequence[str]] = None,
+        mirror_right_ear: bool = True,
+    ):
+        self.base_dataset = MeshLandmarkDataset(mesh_dir=mesh_dir, landmarks_dir=landmarks_dir)
+        self.crop_config = crop_config
+        self.ear_points = int(ear_points)
+        self.seed = int(seed)
+        self.mirror_right_ear = bool(mirror_right_ear)
+
+        if subject_ids is None:
+            self.indices = list(range(len(self.base_dataset)))
+        else:
+            wanted = {subject_id for subject_id in subject_ids}
+            id_to_index = {
+                self.base_dataset.get_identifier(idx): idx for idx in range(len(self.base_dataset))
+            }
+            missing = sorted(wanted - set(id_to_index))
+            if missing:
+                raise ValueError(f"Unknown subject ids: {missing}")
+            self.indices = [id_to_index[subject_id] for subject_id in subject_ids]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> dict:
+        base_idx = self.indices[idx]
+        mesh, landmarks_left, landmarks_right = self.base_dataset[base_idx]
+        transform = compute_mesh_normalization(mesh)
+        left_points = sample_crop_point_features(
+            mesh=mesh,
+            transform=transform,
+            crop_box=self.crop_config["left"],
+            num_points=self.ear_points,
+            seed=self.seed + base_idx * 2,
+            mirror_y=False,
+        )
+        right_points = sample_crop_point_features(
+            mesh=mesh,
+            transform=transform,
+            crop_box=self.crop_config["right"],
+            num_points=self.ear_points,
+            seed=self.seed + base_idx * 2 + 1,
+            mirror_y=self.mirror_right_ear,
+        )
+        target = make_landmark_target(landmarks_left, landmarks_right, transform)
+
+        return {
+            "left_points": torch.from_numpy(left_points),
+            "right_points": torch.from_numpy(right_points),
             "landmarks": torch.from_numpy(target),
             "centroid": torch.from_numpy(transform.centroid),
             "scale": torch.tensor(transform.scale, dtype=torch.float32),

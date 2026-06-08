@@ -25,7 +25,12 @@ RUN_ROOT="${PROJECT_DIR}/runs"
 
 SEED=42
 VAL_RATIO=0.2
+INPUT_MODE="full"
 NUM_POINTS=16384
+EAR_POINTS=8192
+CROP_MARGIN=0.40
+MIRROR_RIGHT_EAR=1
+SAVE_CROP_PLY=1
 WORKERS=8
 
 VARIANT="ssg"
@@ -56,7 +61,7 @@ STEP_GAMMA=0.5
 GRAD_CLIP_NORM=0.0
 AMP=1
 
-RUN_NAME="pointnet2_${VARIANT}_np${NUM_POINTS}_${LOSS}"
+RUN_NAME="pointnet2_${INPUT_MODE}_${VARIANT}_np${NUM_POINTS}_ep${EAR_POINTS}_${LOSS}"
 
 # =========================
 # Run folder and environment
@@ -85,7 +90,12 @@ RUN_ROOT=${RUN_ROOT}
 RUN_NAME=${RUN_NAME}
 SEED=${SEED}
 VAL_RATIO=${VAL_RATIO}
+INPUT_MODE=${INPUT_MODE}
 NUM_POINTS=${NUM_POINTS}
+EAR_POINTS=${EAR_POINTS}
+CROP_MARGIN=${CROP_MARGIN}
+MIRROR_RIGHT_EAR=${MIRROR_RIGHT_EAR}
+SAVE_CROP_PLY=${SAVE_CROP_PLY}
 WORKERS=${WORKERS}
 VARIANT=${VARIANT}
 HEAD_CHANNELS=${HEAD_CHANNELS}
@@ -134,7 +144,10 @@ TRAIN_ARGS=(
     --landmarks-dir "${LANDMARKS_DIR}"
     --checkpoint-dir "${CHECKPOINT_DIR}"
     --val-ratio "${VAL_RATIO}"
+    --input-mode "${INPUT_MODE}"
     --num-points "${NUM_POINTS}"
+    --ear-points "${EAR_POINTS}"
+    --crop-margin "${CROP_MARGIN}"
     --seed "${SEED}"
     --workers "${WORKERS}"
     --variant "${VARIANT}"
@@ -165,6 +178,18 @@ TRAIN_ARGS=(
 
 if [[ "${AMP}" == "1" ]]; then
     TRAIN_ARGS+=(--amp)
+fi
+
+if [[ "${MIRROR_RIGHT_EAR}" == "1" ]]; then
+    TRAIN_ARGS+=(--mirror-right-ear)
+else
+    TRAIN_ARGS+=(--no-mirror-right-ear)
+fi
+
+if [[ "${SAVE_CROP_PLY}" == "1" ]]; then
+    TRAIN_ARGS+=(--save-crop-ply)
+else
+    TRAIN_ARGS+=(--no-save-crop-ply)
 fi
 
 printf '%q ' python train_pointnet2.py "${TRAIN_ARGS[@]}" > "${RUN_DIR}/command.txt"

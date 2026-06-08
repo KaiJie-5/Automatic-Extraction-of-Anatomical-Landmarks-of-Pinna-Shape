@@ -4,9 +4,15 @@ import torch
 import trimesh
 
 from src.dataset import Dataset
+from src.ear_crop import (
+    CropBox,
+    compute_crop_coverage,
+    fit_crop_config_from_training_landmarks,
+    sample_crop_point_features,
+)
 from src.estimator import LandmarkExtractor
 from src.metrics import compute_mean_landmark_distance
-from src.pointnet2_model import PointNet2LandmarkRegressor
+from src.pointnet2_model import PointNet2LandmarkRegressor, TwoBranchEarCropRegressor
 from src.preprocessing import (
     compute_mesh_normalization,
     normalize_point_features,
@@ -15,6 +21,36 @@ from src.preprocessing import (
 )
 from train_pointnet2 import compute_training_loss
 from visualize_point_importance import colorize_importance, normalize_importance
+
+
+def _write_landmarks(path, coords):
+    with path.open("w", encoding="utf-8") as handle:
+        for idx, coord in enumerate(coords):
+            handle.write(f"{idx},[{coord[0]} {coord[1]} {coord[2]}]\n")
+
+
+def _make_landmarks(y_value):
+    x = np.linspace(-0.2, 0.2, 85, dtype=np.float32)
+    z = np.linspace(-0.1, 0.3, 85, dtype=np.float32)
+    y = np.full(85, y_value, dtype=np.float32)
+    return np.stack([x, y, z], axis=1)
+
+
+def _make_tiny_dataset(tmp_path, subject_ids=("S001", "S002")):
+    mesh_dir = tmp_path / "mesh"
+    landmarks_dir = tmp_path / "landmarks"
+    mesh_dir.mkdir()
+    landmarks_dir.mkdir()
+    mesh = trimesh.creation.box(extents=(2.0, 6.0, 2.0))
+
+    for subject_id in subject_ids:
+        mesh.export(mesh_dir / f"{subject_id}.ply")
+        _write_landmarks(landmarks_dir / f"{subject_id}_left_ear_landmarks.csv", _make_landmarks(2.0))
+        _write_landmarks(
+            landmarks_dir / f"{subject_id}_right_ear_landmarks.csv", _make_landmarks(-2.0)
+        )
+
+    return mesh_dir, landmarks_dir
 
 
 def test_surface_sampler_shape_and_normal_lengths():
@@ -91,6 +127,27 @@ def test_pointnet2_msg_forward_shape():
     assert output.shape == (2, 170, 3)
 
 
+def test_two_branch_crop_model_forward_shape():
+    model = TwoBranchEarCropRegressor(
+        num_landmarks=170,
+        variant="ssg",
+        dropout=0.0,
+        head_channels=[32],
+        ssg_npoints=[16, 4],
+        ssg_radii=[0.4, 0.8],
+        ssg_nsamples=[8, 8],
+        ssg_mlps=[[8, 8, 16], [16, 16, 32], [32, 64]],
+    )
+    model.eval()
+    left_points = torch.randn(2, 64, 6)
+    right_points = torch.randn(2, 64, 6)
+
+    with torch.no_grad():
+        output = model(left_points, right_points)
+
+    assert output.shape == (2, 170, 3)
+
+
 def test_estimator_missing_checkpoint_raises(tmp_path):
     missing_path = tmp_path / "missing.pt"
 
@@ -146,6 +203,74 @@ def test_normalize_point_features_keeps_normals_unit_length():
     normalized = normalize_point_features(points, transform)
 
     assert np.allclose(np.linalg.norm(normalized[:, 3:6], axis=1), 1.0, atol=1e-5)
+
+
+def test_crop_boxes_are_fit_from_training_subjects_only(tmp_path):
+    mesh_dir, landmarks_dir = _make_tiny_dataset(tmp_path, subject_ids=("TRAIN", "VAL"))
+    dataset = Dataset(str(mesh_dir), str(landmarks_dir))
+
+    crop_config = fit_crop_config_from_training_landmarks(dataset, ["TRAIN"], margin=0.0)
+    left_box = crop_config["left"]
+    outside_training_range = np.array([[0.0, 20.0, 0.0]], dtype=np.float32)
+
+    assert "left" in crop_config
+    assert left_box.minimum.shape == (3,)
+    assert not np.all(
+        (outside_training_range[0] >= left_box.minimum)
+        & (outside_training_range[0] <= left_box.maximum)
+    )
+
+
+def test_crop_coverage_reports_all_landmarks_inside(tmp_path):
+    mesh_dir, landmarks_dir = _make_tiny_dataset(tmp_path)
+    dataset = Dataset(str(mesh_dir), str(landmarks_dir))
+    subject_ids = [dataset.get_identifier(i) for i in range(len(dataset))]
+    crop_config = fit_crop_config_from_training_landmarks(dataset, subject_ids, margin=0.4)
+
+    coverage = compute_crop_coverage(dataset, subject_ids, crop_config)
+
+    assert coverage["summary"]["left"]["coverage"] == 1.0
+    assert coverage["summary"]["right"]["coverage"] == 1.0
+
+
+def test_crop_sampling_returns_balanced_left_right_shapes(tmp_path):
+    mesh_dir, landmarks_dir = _make_tiny_dataset(tmp_path)
+    from src.torch_dataset import PinnaEarCropDataset
+
+    dataset = Dataset(str(mesh_dir), str(landmarks_dir))
+    subject_ids = [dataset.get_identifier(i) for i in range(len(dataset))]
+    crop_config = fit_crop_config_from_training_landmarks(dataset, subject_ids, margin=0.4)
+    crop_dataset = PinnaEarCropDataset(
+        str(mesh_dir),
+        str(landmarks_dir),
+        crop_config=crop_config,
+        ear_points=32,
+        subject_ids=subject_ids,
+    )
+
+    item = crop_dataset[0]
+
+    assert item["left_points"].shape == (32, 6)
+    assert item["right_points"].shape == (32, 6)
+    assert item["landmarks"].shape == (170, 3)
+
+
+def test_right_ear_mirroring_flips_y_and_normal_y():
+    mesh = trimesh.creation.box(extents=(2.0, 6.0, 2.0))
+    transform = compute_mesh_normalization(mesh)
+    crop_box = CropBox(
+        minimum=np.array([-2.0, -2.0, -2.0], dtype=np.float32),
+        maximum=np.array([2.0, 2.0, 2.0], dtype=np.float32),
+    )
+
+    original = sample_crop_point_features(mesh, transform, crop_box, 32, seed=11, mirror_y=False)
+    mirrored = sample_crop_point_features(mesh, transform, crop_box, 32, seed=11, mirror_y=True)
+
+    assert np.allclose(mirrored[:, 0], original[:, 0])
+    assert np.allclose(mirrored[:, 1], -original[:, 1])
+    assert np.allclose(mirrored[:, 2:4], original[:, 2:4])
+    assert np.allclose(mirrored[:, 4], -original[:, 4])
+    assert np.allclose(mirrored[:, 5], original[:, 5])
 
 
 def test_importance_normalization_handles_constant_and_finite_values():

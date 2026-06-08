@@ -47,10 +47,20 @@ Train the default SSG baseline with:
 python train_pointnet2.py --mesh-dir data/mesh --landmarks-dir data/landmarks
 ```
 
+The default input mode uses the full head mesh. To train the optional two-branch ear-crop model, use:
+
+```bash
+python train_pointnet2.py --input-mode ear_crop --ear-points 8192 --crop-margin 0.40
+```
+
+Ear-crop mode fits left/right crop boxes from training landmarks only, saves `crop_config.json` and
+`crop_coverage.json`, and writes visual crop PLYs under `checkpoints/crops/{train,val}`.
+
 For a small environment smoke test, use:
 
 ```bash
 python train_pointnet2.py --epochs 1 --batch-size 1 --num-points 128
+python train_pointnet2.py --epochs 1 --batch-size 1 --input-mode ear_crop --ear-points 128
 ```
 
 The challenge entry point `src.estimator.LandmarkExtractor()` expects a trained checkpoint at
