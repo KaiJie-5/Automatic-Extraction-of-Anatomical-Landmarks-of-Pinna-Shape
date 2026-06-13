@@ -14,14 +14,14 @@ from src.ear_crop import (
 )
 from src.estimator import LandmarkExtractor
 from src.metrics import compute_mean_landmark_distance
-from src.pointnet2_model import PointNet2LandmarkRegressor, TwoBranchEarCropRegressor
+from src.pointnet2_model import PointNet2LandmarkRegressor, default_model_config
 from src.preprocessing import (
     compute_mesh_normalization,
     normalize_point_features,
     sample_mesh_surface,
     split_landmark_prediction,
 )
-from train_pointnet2 import compute_training_loss
+from train_pointnet2 import build_arg_parser, compute_training_loss, resolve_num_landmarks
 from visualize_point_importance import colorize_importance, normalize_importance
 
 
@@ -129,9 +129,9 @@ def test_pointnet2_msg_forward_shape():
     assert output.shape == (2, 170, 3)
 
 
-def test_two_branch_crop_model_forward_shape():
-    model = TwoBranchEarCropRegressor(
-        num_landmarks=170,
+def test_single_ear_crop_model_forward_shape():
+    model = PointNet2LandmarkRegressor(
+        num_landmarks=85,
         variant="ssg",
         dropout=0.0,
         head_channels=[32],
@@ -141,13 +141,12 @@ def test_two_branch_crop_model_forward_shape():
         ssg_mlps=[[8, 8, 16], [16, 16, 32], [32, 64]],
     )
     model.eval()
-    left_points = torch.randn(2, 64, 6)
-    right_points = torch.randn(2, 64, 6)
+    points = torch.randn(2, 64, 6)
 
     with torch.no_grad():
-        output = model(left_points, right_points)
+        output = model(points)
 
-    assert output.shape == (2, 170, 3)
+    assert output.shape == (2, 85, 3)
 
 
 def test_estimator_missing_checkpoint_raises(tmp_path):
@@ -235,7 +234,7 @@ def test_crop_coverage_reports_all_landmarks_inside(tmp_path):
     assert coverage["summary"]["right"]["coverage"] == 1.0
 
 
-def test_crop_sampling_returns_balanced_left_right_shapes(tmp_path):
+def test_crop_dataset_returns_single_ear_samples(tmp_path):
     mesh_dir, landmarks_dir = _make_tiny_dataset(tmp_path)
     from src.torch_dataset import PinnaEarCropDataset
 
@@ -261,9 +260,10 @@ def test_crop_sampling_returns_balanced_left_right_shapes(tmp_path):
 
     item = crop_dataset[0]
 
-    assert item["left_points"].shape == (32, 6)
-    assert item["right_points"].shape == (32, 6)
-    assert item["landmarks"].shape == (170, 3)
+    assert len(crop_dataset) == len(subject_ids) * 2
+    assert item["points"].shape == (32, 6)
+    assert item["landmarks"].shape == (85, 3)
+    assert item["ear"] == "left"
 
 
 def test_crop_sampler_keeps_points_inside_box():
@@ -285,7 +285,8 @@ def test_crop_sampler_keeps_points_inside_box():
     )
 
     assert sampled.shape == (32, 6)
-    assert np.all(points_inside_box(sampled[:, :3], crop_box))
+    assert np.all(sampled[:, :3] >= crop_box.minimum - 1e-5)
+    assert np.all(sampled[:, :3] <= crop_box.maximum + 1e-5)
 
 
 def test_crop_export_writes_exact_sampled_point_cloud(tmp_path):
@@ -341,6 +342,70 @@ def test_right_ear_mirroring_flips_y_and_normal_y():
     assert np.allclose(mirrored[:, 2:4], original[:, 2:4])
     assert np.allclose(mirrored[:, 4], -original[:, 4])
     assert np.allclose(mirrored[:, 5], original[:, 5])
+
+
+def test_ear_crop_arg_defaults_use_single_ear_landmarks_and_no_mirroring():
+    parser = build_arg_parser()
+    args = parser.parse_args(["--input-mode", "ear_crop"])
+
+    resolve_num_landmarks(args)
+
+    assert args.num_landmarks == 85
+    assert args.mirror_right_ear is False
+
+
+def test_ear_crop_rejects_incompatible_landmark_count():
+    parser = build_arg_parser()
+    args = parser.parse_args(["--input-mode", "ear_crop", "--num-landmarks", "170"])
+
+    with pytest.raises(ValueError, match="requires --num-landmarks 85"):
+        resolve_num_landmarks(args)
+
+
+def test_estimator_ear_crop_checkpoint_returns_two_single_ear_predictions(tmp_path):
+    mesh = trimesh.creation.box(extents=(2.0, 6.0, 2.0))
+    model_config = default_model_config()
+    model_config.update(
+        {
+            "num_landmarks": 85,
+            "dropout": 0.0,
+            "head_channels": [32],
+            "ssg_npoints": [16, 4],
+            "ssg_radii": [0.4, 0.8],
+            "ssg_nsamples": [8, 8],
+            "ssg_mlps": [[8, 8, 16], [16, 16, 32], [32, 64]],
+        }
+    )
+    model = PointNet2LandmarkRegressor(**model_config)
+    crop_config = {
+        "left": CropBox(
+            minimum=np.array([-1.0, 0.0, -1.0], dtype=np.float32),
+            maximum=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        ).to_dict(),
+        "right": CropBox(
+            minimum=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
+            maximum=np.array([1.0, 0.0, 1.0], dtype=np.float32),
+        ).to_dict(),
+    }
+    checkpoint_path = tmp_path / "single_ear_crop.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": model_config,
+            "input_mode": "ear_crop",
+            "crop_config": crop_config,
+            "ear_points": 32,
+            "mirror_right_ear": False,
+            "seed": 3,
+        },
+        checkpoint_path,
+    )
+
+    extractor = LandmarkExtractor(checkpoint_path=str(checkpoint_path))
+    left, right = extractor.extract(mesh)
+
+    assert left.shape == (85, 3)
+    assert right.shape == (85, 3)
 
 
 def test_importance_normalization_handles_constant_and_finite_values():

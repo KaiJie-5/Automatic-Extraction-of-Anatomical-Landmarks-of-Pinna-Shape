@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 
 from .dataset import Dataset as MeshLandmarkDataset
-from .ear_crop import sample_crop_point_features
+from .ear_crop import EAR_NAMES, make_crop_target, sample_crop_point_features
 from .preprocessing import (
     compute_mesh_normalization,
     make_landmark_target,
@@ -66,7 +66,7 @@ class PinnaPointCloudDataset(TorchDataset):
 
 
 class PinnaEarCropDataset(TorchDataset):
-    """Return balanced left/right crop point clouds and global-normalized targets."""
+    """Return one cropped ear point cloud and its global-normalized landmarks."""
 
     def __init__(
         self,
@@ -76,7 +76,7 @@ class PinnaEarCropDataset(TorchDataset):
         ear_points: int = 8192,
         seed: int = 0,
         subject_ids: Optional[Sequence[str]] = None,
-        mirror_right_ear: bool = True,
+        mirror_right_ear: bool = False,
         crop_oversample_factor: int = 8,
         crop_max_resample_attempts: int = 5,
         crop_min_inside_ratio: float = 0.0,
@@ -101,45 +101,41 @@ class PinnaEarCropDataset(TorchDataset):
             if missing:
                 raise ValueError(f"Unknown subject ids: {missing}")
             self.indices = [id_to_index[subject_id] for subject_id in subject_ids]
+        self.samples = [
+            (base_idx, ear)
+            for base_idx in self.indices
+            for ear in EAR_NAMES
+        ]
 
     def __len__(self) -> int:
-        return len(self.indices)
+        return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
-        base_idx = self.indices[idx]
+        base_idx, ear = self.samples[idx]
         mesh, landmarks_left, landmarks_right = self.base_dataset[base_idx]
         transform = compute_mesh_normalization(mesh)
-        left_points = sample_crop_point_features(
+        ear_offset = 0 if ear == "left" else 1
+        landmarks = landmarks_left if ear == "left" else landmarks_right
+        point_features = sample_crop_point_features(
             mesh=mesh,
             transform=transform,
-            crop_box=self.crop_config["left"],
+            crop_box=self.crop_config[ear],
             num_points=self.ear_points,
-            seed=self.seed + base_idx * 2,
-            mirror_y=False,
+            seed=self.seed + base_idx * 2 + ear_offset,
+            mirror_y=ear == "right" and self.mirror_right_ear,
             oversample_factor=self.crop_oversample_factor,
             max_attempts=self.crop_max_resample_attempts,
             min_inside_ratio=self.crop_min_inside_ratio,
         )
-        right_points = sample_crop_point_features(
-            mesh=mesh,
-            transform=transform,
-            crop_box=self.crop_config["right"],
-            num_points=self.ear_points,
-            seed=self.seed + base_idx * 2 + 1,
-            mirror_y=self.mirror_right_ear,
-            oversample_factor=self.crop_oversample_factor,
-            max_attempts=self.crop_max_resample_attempts,
-            min_inside_ratio=self.crop_min_inside_ratio,
-        )
-        target = make_landmark_target(landmarks_left, landmarks_right, transform)
+        target = make_crop_target(landmarks, transform)
 
         return {
-            "left_points": torch.from_numpy(left_points),
-            "right_points": torch.from_numpy(right_points),
+            "points": torch.from_numpy(point_features),
             "landmarks": torch.from_numpy(target),
             "centroid": torch.from_numpy(transform.centroid),
             "scale": torch.tensor(transform.scale, dtype=torch.float32),
             "identifier": self.base_dataset.get_identifier(base_idx),
+            "ear": ear,
         }
 
 

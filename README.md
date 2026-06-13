@@ -5,7 +5,7 @@ This repository contains a PyTorch baseline for the Tech Arena 2026 pinna landma
 The current code supports two input modes:
 
 - `full`: sample points from the full head mesh and use one PointNet++ encoder.
-- `ear_crop`: sample left and right ear crops separately, use the same PointNet++ encoder for both ears, join the two outputs, and predict all landmarks.
+- `ear_crop`: crop one ear submesh, sample that cropped surface, and use one shared PointNet++ model to predict 85 landmarks for that ear.
 
 The model input is sampled point features:
 
@@ -140,7 +140,7 @@ checkpoints/crops/{train,val}/
 
 Crop file meanings:
 
-- `{subject}_{left/right}_mesh.ply`: loose crop mesh for context.
+- `{subject}_{left/right}_mesh.ply`: exact clipped crop mesh.
 - `{subject}_{left/right}_points.ply`: sampled crop point cloud before optional right-ear mirroring.
 
 Use `_points.ply` when checking what the model receives.
@@ -159,17 +159,15 @@ full mesh -> 16384 points -> PointNet++ encoder -> prediction layers -> 170 x 3 
 
 ### Ear Crop
 
-`--input-mode ear_crop` fits left and right crop boxes from the training landmarks only. It then samples `--ear-points` points inside each crop box. The default is `8192` points per ear.
+`--input-mode ear_crop` fits left and right crop boxes from the training landmarks only. It then clips the mesh to one ear box, samples `--ear-points` points from that cropped surface, and predicts 85 landmarks for that ear. Each subject contributes one left-ear sample and one right-ear sample during training.
 
 Flow:
 
 ```text
-left crop  -> 8192 points -> shared PointNet++ encoder -> left output
-right crop -> 8192 points -> shared PointNet++ encoder -> right output
-left output + right output -> prediction layers -> 170 x 3 landmarks
+full mesh -> exact left/right ear crop -> 8192 crop-surface points -> PointNet++ -> 85 x 3 landmarks
 ```
 
-Right-ear mirroring changes the right-ear input points only. The target landmarks and final predictions stay in the original mesh coordinates.
+Right-ear mirroring is disabled by default. If enabled, it changes the right-ear input points only. The target landmarks and final predictions stay in the original mesh coordinates.
 
 ## Training Arguments
 
@@ -201,7 +199,7 @@ If split files are used, provide both `--train-split-file` and `--val-split-file
 | `--input-mode` | `full` | Choose `full` or `ear_crop`. |
 | `--num-points` | `16384` | Number of sampled full-mesh points for `full` mode. |
 | `--ear-points` | `8192` | Number of sampled points per ear for `ear_crop` mode. |
-| `--num-landmarks` | `170` | Number of output landmarks. Keep this at `170` for the challenge. |
+| `--num-landmarks` | mode-specific | Number of output landmarks. Resolves to `170` for `full` and `85` for `ear_crop`. |
 | `--no-normals` | `False` | Disable normal channels in the PointNet++ input. |
 
 ### Crop Arguments
@@ -209,12 +207,12 @@ If split files are used, provide both `--train-split-file` and `--val-split-file
 | Argument | Default | Meaning |
 | :--- | :--- | :--- |
 | `--crop-margin` | `0.4` | Expands fitted crop boxes around the training landmarks. |
-| `--crop-oversample-factor` | `8` | Initial multiplier used before filtering points inside the crop box. |
-| `--crop-max-resample-attempts` | `5` | Maximum number of crop sampling retries. |
-| `--crop-min-inside-ratio` | `0.0` | Diagnostic threshold for low inside-box point yield. |
+| `--crop-oversample-factor` | `8` | Retained for checkpoint compatibility; crop mode now samples directly from the clipped submesh. |
+| `--crop-max-resample-attempts` | `5` | Retained for checkpoint compatibility; crop mode now samples directly from the clipped submesh. |
+| `--crop-min-inside-ratio` | `0.0` | Retained for checkpoint compatibility; crop mode now samples directly from the clipped submesh. |
 | `--save-crop-ply` | `True` | Save crop mesh and sampled crop point PLY files. |
 | `--no-save-crop-ply` | `False` | Disable crop PLY export. |
-| `--mirror-right-ear` | `True` | Mirror right-ear input points into left-ear orientation. |
+| `--mirror-right-ear` | `False` | Mirror right-ear input points into left-ear orientation. |
 | `--no-mirror-right-ear` | `False` | Keep right-ear input points in original orientation. |
 
 ### Model Arguments

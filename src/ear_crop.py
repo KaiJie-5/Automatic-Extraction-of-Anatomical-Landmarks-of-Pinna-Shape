@@ -1,8 +1,8 @@
-"""Ear crop utilities for two-branch PointNet++ training."""
+"""Ear crop utilities for single-ear PointNet++ training."""
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Mapping, Sequence, Tuple, Union
 
 import numpy as np
 import trimesh
@@ -12,7 +12,6 @@ from .dataset import Dataset as MeshLandmarkDataset
 from .preprocessing import (
     MeshNormalization,
     compute_mesh_normalization,
-    make_landmark_target,
     normalize_point_features,
     sample_mesh_surface,
 )
@@ -92,6 +91,25 @@ def points_inside_box(points: np.ndarray, crop_box: CropBox) -> np.ndarray:
     return np.all((points >= crop_box.minimum) & (points <= crop_box.maximum), axis=1)
 
 
+def _slice_mesh_plane(
+    mesh: Trimesh,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+) -> Trimesh:
+    if hasattr(mesh, "slice_plane"):
+        return mesh.slice_plane(
+            plane_origin=plane_origin,
+            plane_normal=plane_normal,
+            cap=False,
+        )
+    return trimesh.intersections.slice_mesh_plane(
+        mesh,
+        plane_normal=plane_normal,
+        plane_origin=plane_origin,
+        cap=False,
+    )
+
+
 def compute_crop_coverage(
     dataset: MeshLandmarkDataset,
     subject_ids: Sequence[str],
@@ -141,23 +159,53 @@ def filter_mesh_by_normalized_box(
     transform: MeshNormalization,
     crop_box: CropBox,
 ) -> Trimesh:
-    """Return a submesh whose faces have at least one vertex inside the crop box."""
+    """Return a mesh clipped to the normalized crop box."""
     vertices = np.asarray(mesh.vertices, dtype=np.float32)
     faces = np.asarray(mesh.faces, dtype=np.int64)
     if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
         normalized_vertices = transform.normalize_xyz(vertices)
         mask = points_inside_box(normalized_vertices, crop_box)
-        selected = vertices[mask] if np.any(mask) else vertices
+        selected = vertices[mask]
         return Trimesh(vertices=selected, faces=np.empty((0, 3), dtype=np.int64), process=False)
 
-    normalized_vertices = transform.normalize_xyz(vertices)
-    vertex_mask = points_inside_box(normalized_vertices, crop_box)
-    face_mask = vertex_mask[faces].any(axis=1)
-    if not np.any(face_mask):
-        selected = vertices[vertex_mask] if np.any(vertex_mask) else vertices
-        return Trimesh(vertices=selected, faces=np.empty((0, 3), dtype=np.int64), process=False)
-    parts = mesh.submesh([face_mask], append=True, repair=False)
-    return parts if isinstance(parts, Trimesh) else mesh.copy()
+    minimum = transform.denormalize_xyz(crop_box.minimum.astype(np.float32))
+    maximum = transform.denormalize_xyz(crop_box.maximum.astype(np.float32))
+    crop_mesh = mesh.copy()
+    axes = np.eye(3, dtype=np.float64)
+    bounds = ((minimum, axes), (maximum, -axes))
+
+    for origins, normals in bounds:
+        for axis_idx in range(3):
+            if len(crop_mesh.vertices) == 0:
+                break
+            sliced = _slice_mesh_plane(
+                crop_mesh,
+                plane_origin=origins[axis_idx] * axes[axis_idx],
+                plane_normal=normals[axis_idx],
+            )
+            if not isinstance(sliced, Trimesh):
+                return Trimesh(
+                    vertices=np.empty((0, 3), dtype=np.float32),
+                    faces=np.empty((0, 3), dtype=np.int64),
+                    process=False,
+                )
+            crop_mesh = sliced
+
+    if not isinstance(crop_mesh, Trimesh):
+        return Trimesh(vertices=np.empty((0, 3)), faces=np.empty((0, 3), dtype=np.int64))
+    crop_mesh.remove_unreferenced_vertices()
+    return crop_mesh
+
+
+def _validate_crop_mesh(crop_mesh: Trimesh) -> None:
+    vertices = np.asarray(crop_mesh.vertices, dtype=np.float32)
+    faces = np.asarray(crop_mesh.faces, dtype=np.int64)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0:
+        raise ValueError(
+            "The clipped ear crop mesh is empty. Increase --crop-margin or check crop_config."
+        )
+    if faces.ndim == 2 and faces.shape[1] == 3 and len(faces) > 0:
+        return
 
 
 def sample_crop_point_features(
@@ -172,57 +220,14 @@ def sample_crop_point_features(
     min_inside_ratio: float = 0.0,
     return_stats: bool = False,
 ) -> Union[np.ndarray, Tuple[np.ndarray, dict]]:
-    """Sample normalized point features whose XYZ channels are inside one crop box.
-
-    Sampling happens on the full mesh first, then the sampled points are filtered
-    in normalized coordinates. This makes the returned tensor match the crop box
-    more tightly than sampling from a loose face-based submesh.
-    """
+    """Clip an ear submesh first, then sample normalized point features from it."""
     if num_points <= 0:
         raise ValueError("num_points must be positive")
-    if oversample_factor <= 0:
-        raise ValueError("oversample_factor must be positive")
-    if max_attempts <= 0:
-        raise ValueError("max_attempts must be positive")
 
-    rng = np.random.default_rng(seed)
-    inside_features = None
-    best_inside_features = None
-    best_inside_count = 0
-    inside_count = 0
-    inside_ratio = 0.0
-    best_inside_ratio = 0.0
-    candidate_count = 0
-    best_candidate_count = 0
-    attempts_used = 0
-
-    for attempt in range(max_attempts):
-        attempts_used = attempt + 1
-        candidate_count = int(num_points * oversample_factor * (2**attempt))
-        candidate_count = max(candidate_count, num_points)
-        candidates = sample_mesh_surface(mesh, num_points=candidate_count, seed=seed + attempt)
-        candidates = normalize_point_features(candidates, transform)
-        inside_mask = points_inside_box(candidates[:, :3], crop_box)
-        inside_features = candidates[inside_mask]
-        inside_count = int(inside_features.shape[0])
-        inside_ratio = inside_count / max(candidate_count, 1)
-        if inside_count > best_inside_count:
-            best_inside_features = inside_features
-            best_inside_count = inside_count
-            best_inside_ratio = inside_ratio
-            best_candidate_count = candidate_count
-        if inside_count >= num_points:
-            break
-
-    if best_inside_features is None or best_inside_count == 0:
-        raise ValueError(
-            "No sampled mesh points fell inside the crop box. "
-            "Increase --crop-margin or --crop-oversample-factor."
-        )
-
-    replace = best_inside_count < num_points
-    selected_indices = rng.choice(best_inside_count, size=num_points, replace=replace)
-    point_features = best_inside_features[selected_indices].astype(np.float32)
+    crop_mesh = filter_mesh_by_normalized_box(mesh, transform, crop_box)
+    _validate_crop_mesh(crop_mesh)
+    point_features = sample_mesh_surface(crop_mesh, num_points=num_points, seed=seed)
+    point_features = normalize_point_features(point_features, transform)
     if mirror_y:
         point_features[:, 1] *= -1.0
         if point_features.shape[1] >= 5:
@@ -230,14 +235,17 @@ def sample_crop_point_features(
 
     stats = {
         "requested_points": int(num_points),
-        "candidate_count": int(best_candidate_count),
-        "inside_count": int(best_inside_count),
-        "inside_ratio": float(best_inside_ratio),
-        "attempts": int(attempts_used),
+        "candidate_count": int(num_points),
+        "inside_count": int(num_points),
+        "inside_ratio": 1.0,
+        "attempts": 1,
         "final_sampled_count": int(point_features.shape[0]),
-        "used_replacement": bool(replace),
+        "used_replacement": bool(len(crop_mesh.faces) == 0 and len(crop_mesh.vertices) < num_points),
         "mirrored": bool(mirror_y),
-        "low_inside_ratio": bool(best_inside_ratio < float(min_inside_ratio)),
+        "low_inside_ratio": False,
+        "crop_vertex_count": int(len(crop_mesh.vertices)),
+        "crop_face_count": int(len(crop_mesh.faces)),
+        "crop_first_sampling": True,
     }
     if return_stats:
         return point_features.astype(np.float32), stats
@@ -312,8 +320,10 @@ def export_subject_crop_plys(
 
 
 def make_crop_target(
-    left_landmarks: np.ndarray,
-    right_landmarks: np.ndarray,
+    landmarks: np.ndarray,
     transform: MeshNormalization,
 ) -> np.ndarray:
-    return make_landmark_target(left_landmarks, right_landmarks, transform)
+    landmarks = np.asarray(landmarks, dtype=np.float32)
+    if landmarks.shape != (85, 3):
+        raise ValueError("ear landmarks must have shape (85, 3)")
+    return transform.normalize_xyz(landmarks).astype(np.float32)

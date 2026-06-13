@@ -19,7 +19,6 @@ from src.ear_crop import (
 )
 from src.pointnet2_model import (
     PointNet2LandmarkRegressor,
-    TwoBranchEarCropRegressor,
     default_model_config,
 )
 from src.torch_dataset import (
@@ -94,10 +93,8 @@ def make_model_config(args: argparse.Namespace) -> dict:
 
 
 def make_model(args: argparse.Namespace, model_config: dict) -> torch.nn.Module:
-    if args.input_mode == "full":
+    if args.input_mode in {"full", "ear_crop"}:
         return PointNet2LandmarkRegressor(**model_config)
-    if args.input_mode == "ear_crop":
-        return TwoBranchEarCropRegressor(**model_config)
     raise ValueError(f"Unsupported input mode: {args.input_mode}")
 
 
@@ -208,13 +205,9 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             with torch.cuda.amp.autocast(enabled=training and amp):
-                if input_mode == "full":
+                if input_mode in {"full", "ear_crop"}:
                     points = batch["points"].to(device=device, dtype=torch.float32)
                     pred = model(points)
-                elif input_mode == "ear_crop":
-                    left_points = batch["left_points"].to(device=device, dtype=torch.float32)
-                    right_points = batch["right_points"].to(device=device, dtype=torch.float32)
-                    pred = model(left_points, right_points)
                 else:
                     raise ValueError(f"Unsupported input mode: {input_mode}")
                 loss = compute_training_loss(
@@ -351,9 +344,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop-min-inside-ratio", type=float, default=0.0)
     parser.add_argument("--save-crop-ply", action="store_true", default=True)
     parser.add_argument("--no-save-crop-ply", dest="save_crop_ply", action="store_false")
-    parser.add_argument("--mirror-right-ear", action="store_true", default=True)
+    parser.add_argument("--mirror-right-ear", action="store_true", default=False)
     parser.add_argument("--no-mirror-right-ear", dest="mirror_right_ear", action="store_false")
-    parser.add_argument("--num-landmarks", type=int, default=170)
+    parser.add_argument("--num-landmarks", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=0)
 
@@ -396,9 +389,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_num_landmarks(args: argparse.Namespace) -> None:
+    expected = 85 if args.input_mode == "ear_crop" else 170
+    if args.num_landmarks is None:
+        args.num_landmarks = expected
+        return
+    if args.num_landmarks != expected:
+        raise ValueError(
+            f"--input-mode {args.input_mode} requires --num-landmarks {expected}; "
+            f"got {args.num_landmarks}."
+        )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    resolve_num_landmarks(args)
     set_seed(args.seed)
     device = make_device(args.device)
     amp_enabled = args.amp and device.type == "cuda"

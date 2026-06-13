@@ -8,7 +8,6 @@ from trimesh import Trimesh
 from .ear_crop import crop_config_from_dict, sample_crop_point_features
 from .pointnet2_model import (
     PointNet2LandmarkRegressor,
-    TwoBranchEarCropRegressor,
     default_model_config,
 )
 from .preprocessing import (
@@ -65,7 +64,7 @@ class LandmarkExtractor:
             else 0.0
         )
         self.mirror_right_ear = (
-            bool(checkpoint.get("mirror_right_ear", True)) if isinstance(checkpoint, dict) else True
+            bool(checkpoint.get("mirror_right_ear", False)) if isinstance(checkpoint, dict) else False
         )
         if isinstance(checkpoint, dict) and "seed" in checkpoint:
             self.seed = int(checkpoint["seed"])
@@ -76,7 +75,12 @@ class LandmarkExtractor:
         elif self.input_mode == "ear_crop":
             if not isinstance(checkpoint, dict) or checkpoint.get("crop_config") is None:
                 raise ValueError("Ear-crop checkpoint is missing crop_config")
-            self.model = TwoBranchEarCropRegressor(**model_config).to(self.device)
+            if int(model_config.get("num_landmarks", 0)) != 85:
+                raise ValueError(
+                    "Ear-crop checkpoints must use the single-ear 85-landmark model. "
+                    "Old two-branch 170-landmark crop checkpoints are not compatible."
+                )
+            self.model = PointNet2LandmarkRegressor(**model_config).to(self.device)
             self.crop_config = crop_config_from_dict(checkpoint["crop_config"])
         else:
             raise ValueError(f"Unsupported checkpoint input_mode: {self.input_mode}")
@@ -130,9 +134,13 @@ class LandmarkExtractor:
             left_tensor = torch.from_numpy(left_points).unsqueeze(0).to(self.device)
             right_tensor = torch.from_numpy(right_points).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                normalized_landmarks = (
-                    self.model(left_tensor, right_tensor).squeeze(0).cpu().numpy()
-                )
+                left_landmarks = self.model(left_tensor).squeeze(0).cpu().numpy()
+                right_landmarks = self.model(right_tensor).squeeze(0).cpu().numpy()
+
+            return (
+                transform.denormalize_xyz(left_landmarks).astype(np.float32),
+                transform.denormalize_xyz(right_landmarks).astype(np.float32),
+            )
 
         landmarks = transform.denormalize_xyz(normalized_landmarks).astype(np.float32)
         return split_landmark_prediction(landmarks)
