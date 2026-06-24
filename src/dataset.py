@@ -6,7 +6,7 @@ import csv
 from pathlib import Path
 
 
-DEFAULT_EXCLUDED_SUBJECT_IDS = {}
+DEFAULT_EXCLUDED_SUBJECT_IDS = {"P0027"}
 
 
 class Dataset:

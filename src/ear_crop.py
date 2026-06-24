@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence, Tuple, Union
 
+import torch
 import numpy as np
 import trimesh
 from trimesh import Trimesh
@@ -84,7 +85,6 @@ def fit_crop_config_from_training_landmarks(
         "left": expand_box(left_all.min(axis=0), left_all.max(axis=0), margin),
         "right": expand_box(right_all.min(axis=0), right_all.max(axis=0), margin),
     }
-
 
 def points_inside_box(points: np.ndarray, crop_box: CropBox) -> np.ndarray:
     points = np.asarray(points, dtype=np.float32)
@@ -327,3 +327,117 @@ def make_crop_target(
     if landmarks.shape != (85, 3):
         raise ValueError("ear landmarks must have shape (85, 3)")
     return transform.normalize_xyz(landmarks).astype(np.float32)
+
+def make_box_target(
+    landmarks: np.ndarray,
+    transform: MeshNormalization,
+    margin: float = 0.15,
+) -> np.ndarray:
+    """Creates a [cx, cy, cz, sx, sy, sz] target array from GT landmarks."""
+    landmarks = np.asarray(landmarks, dtype=np.float32)
+    if landmarks.shape != (85, 3):
+        raise ValueError("ear landmarks must have shape (85, 3)")
+
+    normalized = transform.normalize_xyz(landmarks)
+    minimum = normalized.min(axis=0)
+    maximum = normalized.max(axis=0)
+
+    # Assuming expand_box returns a CropBox object with .minimum and .maximum
+    box = expand_box(minimum, maximum, margin)
+    center = (box.minimum + box.maximum) * 0.5
+    size = box.maximum - box.minimum
+
+    return np.concatenate([center, size]).astype(np.float32)
+
+def crop_box_from_center_extents(center, negative_extent, positive_extent, scale=1.0):
+    """Creates a bounding box using asymmetric negative/positive extents."""
+    center = np.asarray(center, dtype=np.float32)
+    negative_extent = np.asarray(negative_extent, dtype=np.float32) * float(scale)
+    positive_extent = np.asarray(positive_extent, dtype=np.float32) * float(scale)
+
+    return CropBox(
+        minimum=(center - negative_extent).astype(np.float32),
+        maximum=(center + positive_extent).astype(np.float32),
+    )
+
+def compute_calibrated_asymmetric_extents(
+    dataset,
+    subject_ids,
+    broad_crop_config,
+    box_model,
+    ear_points=8192,
+    device="cuda",
+    seed=0,
+    margin=1.05,     
+    percentile=98.0,  
+    tta_runs=5,
+    axis_multiplier=None, 
+):
+    """Calculates independent safety margins for the X, Y, and Z axes."""
+    extents = {
+        "left": {"neg": [], "pos": []},
+        "right": {"neg": [], "pos": []}
+    }
+    id_to_index = {dataset.get_identifier(i): i for i in range(len(dataset))}
+
+    box_model.eval()
+
+    for subject_id in subject_ids:
+        if subject_id not in id_to_index:
+            continue
+            
+        base_idx = id_to_index[subject_id]
+        mesh, left_lm, right_lm = dataset[base_idx]
+        transform = compute_mesh_normalization(mesh)
+
+        for ear, landmarks, ear_seed in [
+            ("left", left_lm, seed + base_idx * 2),
+            ("right", right_lm, seed + base_idx * 2 + 1),
+        ]:
+            centers = []
+
+            for k in range(tta_runs):
+                broad_points = sample_crop_point_features(
+                    mesh=mesh,
+                    transform=transform,
+                    crop_box=broad_crop_config[ear],
+                    num_points=ear_points,
+                    seed=ear_seed + 1000 * k,
+                    mirror_y=False,
+                )
+
+                points_tensor = torch.from_numpy(broad_points).float().unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    pred_box = box_model(points_tensor).squeeze(0).cpu().numpy()
+
+                centers.append(pred_box[:3])
+
+            pred_center = np.median(np.stack(centers), axis=0)
+            landmarks_norm = transform.normalize_xyz(landmarks.astype(np.float32))
+
+            # ASYMMETRIC CALCULATION: How far back/forward do we need to reach?
+            req_neg = pred_center - landmarks_norm.min(axis=0)
+            req_pos = landmarks_norm.max(axis=0) - pred_center
+
+            extents[ear]["neg"].append(np.maximum(req_neg, 0.0))
+            extents[ear]["pos"].append(np.maximum(req_pos, 0.0))
+
+    # Calculate base extents
+    left_neg = (np.percentile(np.stack(extents["left"]["neg"]), percentile, axis=0) * margin).astype(np.float32)
+    left_pos = (np.percentile(np.stack(extents["left"]["pos"]), percentile, axis=0) * margin).astype(np.float32)
+    right_neg = (np.percentile(np.stack(extents["right"]["neg"]), percentile, axis=0) * margin).astype(np.float32)
+    right_pos = (np.percentile(np.stack(extents["right"]["pos"]), percentile, axis=0) * margin).astype(np.float32)
+
+    # --- Apply the axis multiplier if provided ---
+    if axis_multiplier is not None:
+        multiplier_arr = np.array(axis_multiplier, dtype=np.float32)
+        left_neg *= multiplier_arr
+        left_pos *= multiplier_arr
+        right_neg *= multiplier_arr
+        right_pos *= multiplier_arr
+
+    return {
+        "left": {"neg": left_neg, "pos": left_pos},
+        "right": {"neg": right_neg, "pos": right_pos}
+    }

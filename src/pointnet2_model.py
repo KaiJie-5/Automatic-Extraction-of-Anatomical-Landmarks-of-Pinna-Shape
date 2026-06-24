@@ -453,6 +453,42 @@ class TwoBranchEarCropRegressor(nn.Module):
         return landmarks.view(left_points.shape[0], self.num_landmarks, 3)
 
 
+class PointNet2BoxRegressor(nn.Module):
+    """Predict tight ear crop box [cx, cy, cz, sx, sy, sz]."""
+
+    def __init__(
+        self,
+        input_channels: int = 6,
+        use_normals: bool = True,
+        variant: str = "ssg",
+        head_channels: Sequence[int] = (256, 128),
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.encoder = PointNet2FeatureEncoder(
+            input_channels=input_channels,
+            use_normals=use_normals,
+            variant=variant,
+        )
+        # Reusing the existing head builder, but change output_dim to 6
+        self.regression_head = PointNet2LandmarkRegressor._build_regression_head(
+            input_dim=self.encoder.feature_dim,
+            hidden_dims=_as_list(head_channels),
+            output_dim=6,
+            dropout=float(dropout),
+        )
+
+    def forward(self, point_cloud: torch.Tensor) -> torch.Tensor:
+        features = self.encoder(point_cloud)
+        box = self.regression_head(features)
+
+        # Force size to be positive using softplus, adding a small epsilon to avoid exactly 0
+        center = box[:, :3]
+        size = torch.nn.functional.softplus(box[:, 3:]) + 1e-4
+        
+        return torch.cat([center, size], dim=1)
+        
+        
 def default_model_config() -> dict:
     """Serializable default config for checkpoints and scripts."""
     return {

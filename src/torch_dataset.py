@@ -5,9 +5,10 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset as TorchDataset
+import numpy as np
 
 from .dataset import Dataset as MeshLandmarkDataset
-from .ear_crop import EAR_NAMES, make_crop_target, sample_crop_point_features
+from .ear_crop import EAR_NAMES, make_crop_target, sample_crop_point_features, make_box_target
 from .preprocessing import (
     compute_mesh_normalization,
     make_landmark_target,
@@ -15,6 +16,7 @@ from .preprocessing import (
     sample_mesh_surface,
 )
 
+EAR_NAMES = ("left", "right")
 
 class PinnaPointCloudDataset(TorchDataset):
     """Return normalized sampled point clouds and normalized landmark targets."""
@@ -138,6 +140,77 @@ class PinnaEarCropDataset(TorchDataset):
             "ear": ear,
         }
 
+
+class PinnaEarBoxDataset(torch.utils.data.Dataset):
+    """Return broad ear crop point cloud and target ear box."""
+
+    def __init__(
+        self,
+        mesh_dir: str,
+        landmarks_dir: str,
+        broad_crop_config: dict,
+        ear_points: int = 8192,
+        seed: int = 0,
+        subject_ids=None,
+        box_margin: float = 0.15,
+    ):
+        self.base_dataset = MeshLandmarkDataset(mesh_dir=mesh_dir, landmarks_dir=landmarks_dir)
+        self.broad_crop_config = broad_crop_config
+        self.ear_points = int(ear_points)
+        self.seed = int(seed)
+        self.box_margin = float(box_margin)
+
+        if subject_ids is None:
+            self.indices = list(range(len(self.base_dataset)))
+        else:
+            wanted = {subject_id for subject_id in subject_ids}
+            id_to_index = {
+                self.base_dataset.get_identifier(idx): idx
+                for idx in range(len(self.base_dataset))
+            }
+            self.indices = [id_to_index[sid] for sid in subject_ids if sid in id_to_index]
+
+        self.samples = [
+            (base_idx, ear)
+            for base_idx in self.indices
+            for ear in EAR_NAMES
+        ]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        base_idx, ear = self.samples[idx]
+        mesh, landmarks_left, landmarks_right = self.base_dataset[base_idx]
+        transform = compute_mesh_normalization(mesh)
+
+        landmarks = landmarks_left if ear == "left" else landmarks_right
+        ear_offset = 0 if ear == "left" else 1
+
+        # Input: broad current crop
+        point_features = sample_crop_point_features(
+            mesh=mesh,
+            transform=transform,
+            crop_box=self.broad_crop_config[ear],
+            num_points=self.ear_points,
+            seed=self.seed + base_idx * 2 + ear_offset,
+            mirror_y=False,
+        )
+
+        # Target: tight per-subject box from GT landmarks
+        target_box = make_box_target(
+            landmarks=landmarks,
+            transform=transform,
+            margin=self.box_margin,
+        )
+
+        return {
+            "points": torch.from_numpy(point_features).float(),
+            "box": torch.from_numpy(target_box).float(),
+            "identifier": self.base_dataset.get_identifier(base_idx),
+            "ear": ear,
+        }
+        
 
 def split_subject_ids(
     dataset: MeshLandmarkDataset, val_ratio: float = 0.2, seed: int = 0
