@@ -82,6 +82,10 @@ class LandmarkExtractor:
                 )
             self.model = PointNet2LandmarkRegressor(**model_config).to(self.device)
             self.crop_config = crop_config_from_dict(checkpoint["crop_config"])
+        elif self.input_mode == "precropped":
+            # No crop_config stored — pre-cropped meshes are supplied externally at inference time.
+            self.model = PointNet2LandmarkRegressor(**model_config).to(self.device)
+            self.crop_config = None
         else:
             raise ValueError(f"Unsupported checkpoint input_mode: {self.input_mode}")
 
@@ -144,3 +148,47 @@ class LandmarkExtractor:
 
         landmarks = transform.denormalize_xyz(normalized_landmarks).astype(np.float32)
         return split_landmark_prediction(landmarks)
+
+    def extract_with_crops(
+        self,
+        mesh: Trimesh,
+        left_crop_mesh: Trimesh,
+        right_crop_mesh: Trimesh,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run inference for a ``precropped`` checkpoint.
+
+        Args:
+            mesh: Full-body mesh used only to compute the global normalization transform.
+            left_crop_mesh: Pre-cropped left-ear mesh (from the box regressor).
+            right_crop_mesh: Pre-cropped right-ear mesh (from the box regressor).
+
+        Returns:
+            Tuple of (left_landmarks, right_landmarks), each shape (85, 3) in original mm coordinates.
+        """
+        if self.input_mode != "precropped":
+            raise ValueError(
+                f"extract_with_crops is only for 'precropped' checkpoints; got '{self.input_mode}'. "
+                "Use extract() instead."
+            )
+        transform = compute_mesh_normalization(mesh)
+
+        left_points = sample_mesh_surface(left_crop_mesh, num_points=self.ear_points, seed=self.seed)
+        left_points = normalize_point_features(left_points, transform)
+
+        right_points = sample_mesh_surface(right_crop_mesh, num_points=self.ear_points, seed=self.seed + 1)
+        right_points = normalize_point_features(right_points, transform)
+        if self.mirror_right_ear:
+            right_points[:, 1] *= -1.0
+            if right_points.shape[1] >= 5:
+                right_points[:, 4] *= -1.0
+
+        left_tensor = torch.from_numpy(left_points).unsqueeze(0).to(self.device)
+        right_tensor = torch.from_numpy(right_points).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            left_landmarks = self.model(left_tensor).squeeze(0).cpu().numpy()
+            right_landmarks = self.model(right_tensor).squeeze(0).cpu().numpy()
+
+        return (
+            transform.denormalize_xyz(left_landmarks).astype(np.float32),
+            transform.denormalize_xyz(right_landmarks).astype(np.float32),
+        )

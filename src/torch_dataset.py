@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+import trimesh
 import torch
 from torch.utils.data import Dataset as TorchDataset
 import numpy as np
@@ -137,6 +138,89 @@ class PinnaEarCropDataset(TorchDataset):
             "centroid": torch.from_numpy(transform.centroid),
             "scale": torch.tensor(transform.scale, dtype=torch.float32),
             "identifier": self.base_dataset.get_identifier(base_idx),
+            "ear": ear,
+        }
+
+
+class PinnaPrecropDataset(TorchDataset):
+    """Train from pre-cropped ear meshes produced by the box regressor.
+
+    Expects files named ``{subject_id}_{ear}_mesh.ply`` inside ``cropped_dir``.
+    Points are sampled from the pre-cropped mesh but normalised using the
+    full-body mesh transform so that landmark targets remain consistent with
+    the ``ear_crop`` mode.
+    """
+
+    def __init__(
+        self,
+        mesh_dir: str,
+        landmarks_dir: str,
+        cropped_dir: str,
+        ear_points: int = 8192,
+        seed: int = 0,
+        subject_ids: Optional[Sequence[str]] = None,
+        mirror_right_ear: bool = False,
+    ):
+        self.base_dataset = MeshLandmarkDataset(mesh_dir=mesh_dir, landmarks_dir=landmarks_dir)
+        self.cropped_dir = Path(cropped_dir)
+        self.ear_points = int(ear_points)
+        self.seed = int(seed)
+        self.mirror_right_ear = bool(mirror_right_ear)
+
+        if subject_ids is None:
+            self.indices = list(range(len(self.base_dataset)))
+        else:
+            id_to_index = {
+                self.base_dataset.get_identifier(idx): idx for idx in range(len(self.base_dataset))
+            }
+            missing = sorted(set(subject_ids) - set(id_to_index))
+            if missing:
+                raise ValueError(f"Unknown subject ids: {missing}")
+            self.indices = [id_to_index[sid] for sid in subject_ids]
+
+        self.samples = [
+            (base_idx, ear)
+            for base_idx in self.indices
+            for ear in EAR_NAMES
+        ]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        base_idx, ear = self.samples[idx]
+        subject_id = self.base_dataset.get_identifier(base_idx)
+
+        # Full mesh → normalization transform + landmarks
+        mesh, landmarks_left, landmarks_right = self.base_dataset[base_idx]
+        transform = compute_mesh_normalization(mesh)
+
+        # Pre-cropped mesh → sample points from it
+        crop_path = self.cropped_dir / f"{subject_id}_{ear}_mesh.ply"
+        crop_mesh = trimesh.load(str(crop_path))
+
+        ear_offset = 0 if ear == "left" else 1
+        point_features = sample_mesh_surface(
+            crop_mesh,
+            num_points=self.ear_points,
+            seed=self.seed + base_idx * 2 + ear_offset,
+        )
+        point_features = normalize_point_features(point_features, transform)
+
+        if ear == "right" and self.mirror_right_ear:
+            point_features[:, 1] *= -1.0
+            if point_features.shape[1] >= 5:
+                point_features[:, 4] *= -1.0
+
+        landmarks = landmarks_left if ear == "left" else landmarks_right
+        target = make_crop_target(landmarks, transform)
+
+        return {
+            "points": torch.from_numpy(point_features),
+            "landmarks": torch.from_numpy(target),
+            "centroid": torch.from_numpy(transform.centroid),
+            "scale": torch.tensor(transform.scale, dtype=torch.float32),
+            "identifier": subject_id,
             "ear": ear,
         }
 

@@ -2,4 +2,11 @@
 *.pyc
 *.ply
 *.csv
+*.err
+*.out
 THIRD_PARTY_NOTICES.md
+landmark_overlays/
+outputs/
+predictions_meshnet/
+cache/
+runs/

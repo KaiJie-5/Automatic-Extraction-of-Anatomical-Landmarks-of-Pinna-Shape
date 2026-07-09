@@ -4,7 +4,7 @@
 #SBATCH --account=ecs
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=150G
 #SBATCH --time=2-12:00:00
@@ -28,17 +28,12 @@ INPUT_MODE="precropped"
 CROPPED_DIR="/scratch/agxl1e22/huawei2/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/cropped_mesh"
 NUM_POINTS=16384
 EAR_POINTS=8192
-CROP_MARGIN=0.40
-CROP_OVERSAMPLE_FACTOR=8
-CROP_MAX_RESAMPLE_ATTEMPTS=5
-CROP_MIN_INSIDE_RATIO=0.0
 MIRROR_RIGHT_EAR=0
-SAVE_CROP_PLY=1
 WORKERS=8
 
 VARIANT="ssg"
 HEAD_CHANNELS="512,256"
-DROPOUT=0
+DROPOUT=0.1
 SSG_NPOINTS="512,128"
 SSG_RADII="0.2,0.4"
 SSG_NSAMPLES="32,64"
@@ -97,12 +92,7 @@ INPUT_MODE=${INPUT_MODE}
 CROPPED_DIR=${CROPPED_DIR}
 NUM_POINTS=${NUM_POINTS}
 EAR_POINTS=${EAR_POINTS}
-CROP_MARGIN=${CROP_MARGIN}
-CROP_OVERSAMPLE_FACTOR=${CROP_OVERSAMPLE_FACTOR}
-CROP_MAX_RESAMPLE_ATTEMPTS=${CROP_MAX_RESAMPLE_ATTEMPTS}
-CROP_MIN_INSIDE_RATIO=${CROP_MIN_INSIDE_RATIO}
 MIRROR_RIGHT_EAR=${MIRROR_RIGHT_EAR}
-SAVE_CROP_PLY=${SAVE_CROP_PLY}
 WORKERS=${WORKERS}
 VARIANT=${VARIANT}
 HEAD_CHANNELS=${HEAD_CHANNELS}
@@ -155,10 +145,6 @@ TRAIN_ARGS=(
     --cropped-dir "${CROPPED_DIR}"
     --num-points "${NUM_POINTS}"
     --ear-points "${EAR_POINTS}"
-    --crop-margin "${CROP_MARGIN}"
-    --crop-oversample-factor "${CROP_OVERSAMPLE_FACTOR}"
-    --crop-max-resample-attempts "${CROP_MAX_RESAMPLE_ATTEMPTS}"
-    --crop-min-inside-ratio "${CROP_MIN_INSIDE_RATIO}"
     --seed "${SEED}"
     --workers "${WORKERS}"
     --variant "${VARIANT}"
@@ -195,12 +181,6 @@ if [[ "${MIRROR_RIGHT_EAR}" == "1" ]]; then
     TRAIN_ARGS+=(--mirror-right-ear)
 else
     TRAIN_ARGS+=(--no-mirror-right-ear)
-fi
-
-if [[ "${SAVE_CROP_PLY}" == "1" ]]; then
-    TRAIN_ARGS+=(--save-crop-ply)
-else
-    TRAIN_ARGS+=(--no-save-crop-ply)
 fi
 
 printf '%q ' python train_pointnet2.py "${TRAIN_ARGS[@]}" > "${RUN_DIR}/command.txt"

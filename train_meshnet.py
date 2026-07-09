@@ -1,5 +1,3 @@
-"""Train a PointNet++ regressor for pinna landmark extraction."""
-
 import argparse
 import json
 import random
@@ -11,48 +9,16 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.dataset import Dataset as MeshLandmarkDataset
-from src.ear_crop import (
-    compute_crop_coverage,
-    crop_config_to_dict,
-    export_subject_crop_plys,
-    fit_crop_config_from_training_landmarks,
-)
-from src.pointnet2_model import (
-    PointNet2LandmarkRegressor,
+from src.meshnet_model import (
+    MeshNetLandmarkRegressor,
     default_model_config,
 )
-from src.torch_dataset import (
-    PinnaEarCropDataset,
-    PinnaPrecropDataset,
-    PinnaPointCloudDataset,
-    load_subject_ids,
-    split_subject_ids,
-)
+from src.meshnet_dataset import PinnaPrecropMeshDataset
+from src.torch_dataset import load_subject_ids, split_subject_ids
 
 
 def parse_int_list(value: str) -> List[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
-
-
-def parse_float_list(value: str) -> List[float]:
-    return [float(item.strip()) for item in value.split(",") if item.strip()]
-
-
-def parse_nested_ints(value: str) -> List[List[int]]:
-    return [parse_int_list(group) for group in value.split(";") if group.strip()]
-
-
-def parse_nested_floats(value: str) -> List[List[float]]:
-    return [parse_float_list(group) for group in value.split(";") if group.strip()]
-
-
-def parse_msg_mlps(value: str) -> List[List[List[int]]]:
-    layers = []
-    for layer in value.split(";"):
-        if not layer.strip():
-            continue
-        layers.append([parse_int_list(scale) for scale in layer.split("|") if scale.strip()])
-    return layers
 
 
 def set_seed(seed: int) -> None:
@@ -74,28 +40,20 @@ def make_model_config(args: argparse.Namespace) -> dict:
     config.update(
         {
             "num_landmarks": args.num_landmarks,
-            "input_channels": 6,
-            "use_normals": not args.no_normals,
-            "variant": args.variant,
-            "head_channels": parse_int_list(args.head_channels),
+            "num_kernel": args.num_kernel,
+            "sigma": args.sigma,
+            "aggregation_method": args.aggregation_method,
+            "mask_ratio": args.mask_ratio,
             "dropout": args.dropout,
-            "ssg_npoints": parse_int_list(args.ssg_npoints),
-            "ssg_radii": parse_float_list(args.ssg_radii),
-            "ssg_nsamples": parse_int_list(args.ssg_nsamples),
-            "ssg_mlps": parse_nested_ints(args.ssg_mlps),
-            "msg_npoints": parse_int_list(args.msg_npoints),
-            "msg_radii": parse_nested_floats(args.msg_radii),
-            "msg_nsamples": parse_nested_ints(args.msg_nsamples),
-            "msg_mlps": parse_msg_mlps(args.msg_mlps),
-            "msg_global_mlp": parse_int_list(args.msg_global_mlp),
+            "head_channels": parse_int_list(args.head_channels),
         }
     )
     return config
 
 
 def make_model(args: argparse.Namespace, model_config: dict) -> torch.nn.Module:
-    if args.input_mode in {"full", "ear_crop", "precropped"}:
-        return PointNet2LandmarkRegressor(**model_config)
+    if args.input_mode == "precropped":
+        return MeshNetLandmarkRegressor(**model_config)
     raise ValueError(f"Unsupported input mode: {args.input_mode}")
 
 
@@ -183,7 +141,7 @@ def run_epoch(
     criterion: Optional[torch.nn.Module],
     loss_name: str,
     device: torch.device,
-    input_mode: str = "full",
+    input_mode: str = "precropped",
     optimizer: Optional[torch.optim.Optimizer] = None,
     amp: bool = False,
     grad_clip_norm: float = 0.0,
@@ -206,9 +164,12 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             with torch.cuda.amp.autocast(enabled=training and amp):
-                if input_mode in {"full", "ear_crop", "precropped"}:
-                    points = batch["points"].to(device=device, dtype=torch.float32)
-                    pred = model(points)
+                if input_mode == "precropped":
+                    centers = batch["centers"].to(device=device, dtype=torch.float32)
+                    corners = batch["corners"].to(device=device, dtype=torch.float32)
+                    normals = batch["normals"].to(device=device, dtype=torch.float32)
+                    neighbor_index = batch["neighbor_index"].to(device=device)
+                    pred = model(centers, corners, normals, neighbor_index)
                 else:
                     raise ValueError(f"Unsupported input mode: {input_mode}")
                 loss = compute_training_loss(
@@ -241,20 +202,16 @@ def save_checkpoint(
     args: argparse.Namespace,
     epoch: int,
     metrics: dict,
-    crop_config: Optional[dict] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "model_config": model_config,
+            "model_arch": "meshnet",
             "input_mode": args.input_mode,
-            "crop_config": crop_config,
-            "num_points": args.num_points,
-            "ear_points": args.ear_points,
-            "crop_oversample_factor": args.crop_oversample_factor,
-            "crop_max_resample_attempts": args.crop_max_resample_attempts,
-            "crop_min_inside_ratio": args.crop_min_inside_ratio,
+            "cropped_dir": args.cropped_dir,
+            "max_faces": args.max_faces,
             "mirror_right_ear": args.mirror_right_ear,
             "seed": args.seed,
             "epoch": epoch,
@@ -271,9 +228,6 @@ def build_run_config(
     val_ids: Sequence[str],
     device: torch.device,
     amp_enabled: bool,
-    crop_config: Optional[dict] = None,
-    crop_coverage: Optional[dict] = None,
-    crop_sampling_stats: Optional[dict] = None,
 ) -> dict:
     """Collect run configuration for stdout and checkpoint-folder records."""
     return {
@@ -294,11 +248,8 @@ def build_run_config(
             "cuda_device_count": torch.cuda.device_count(),
             "cuda_device_name": torch.cuda.get_device_name(0)
             if torch.cuda.is_available()
-                else None,
+            else None,
         },
-        "crop_config": crop_config,
-        "crop_coverage": crop_coverage,
-        "crop_sampling_stats": crop_sampling_stats,
     }
 
 
@@ -309,67 +260,38 @@ def write_json(path: Path, data: dict) -> None:
         handle.write("\n")
 
 
-def print_low_yield_crop_warnings(crop_sampling_stats: Optional[dict]) -> None:
-    if not crop_sampling_stats:
-        return
-    for split_name, split_stats in crop_sampling_stats.items():
-        if split_stats is None:
-            continue
-        for subject_id, subject_stats in split_stats.items():
-            for ear, stats in subject_stats.items():
-                if stats.get("low_inside_ratio", False):
-                    print(
-                        "WARNING: low crop inside-point yield "
-                        f"split={split_name} subject={subject_id} ear={ear} "
-                        f"inside_ratio={stats.get('inside_ratio', 0.0):.6f} "
-                        f"inside_count={stats.get('inside_count', 0)} "
-                        f"requested={stats.get('requested_points', 0)}"
-                    )
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
 
     parser.add_argument("--mesh-dir", default="data/mesh")
     parser.add_argument("--landmarks-dir", default="data/landmarks")
-    parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--cropped-dir", default="data/cropped_mesh")
+    parser.add_argument("--checkpoint-dir", default="checkpoints_meshnet")
+    parser.add_argument("--face-cache-dir", default=None)
     parser.add_argument("--train-split-file", default=None)
     parser.add_argument("--val-split-file", default=None)
     parser.add_argument("--val-ratio", type=float, default=0.2)
-    parser.add_argument("--input-mode", choices=["full", "ear_crop", "precropped"], default="full")
-    parser.add_argument("--cropped-dir", default=None,
-                        help="Directory of pre-cropped PLY meshes (required for --input-mode precropped). "
-                             "Expects files named {subject_id}_{left|right}_mesh.ply.")
-    parser.add_argument("--num-points", type=int, default=16384)
-    parser.add_argument("--ear-points", type=int, default=8192)
-    parser.add_argument("--crop-margin", type=float, default=0.4)
-    parser.add_argument("--crop-oversample-factor", type=int, default=8)
-    parser.add_argument("--crop-max-resample-attempts", type=int, default=5)
-    parser.add_argument("--crop-min-inside-ratio", type=float, default=0.0)
-    parser.add_argument("--save-crop-ply", action="store_true", default=True)
-    parser.add_argument("--no-save-crop-ply", dest="save_crop_ply", action="store_false")
+    parser.add_argument("--input-mode", choices=["precropped"], default="precropped")
+    parser.add_argument("--max-faces", type=int, default=1024)
     parser.add_argument("--mirror-right-ear", action="store_true", default=False)
     parser.add_argument("--no-mirror-right-ear", dest="mirror_right_ear", action="store_false")
     parser.add_argument("--num-landmarks", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=0)
 
-    parser.add_argument("--variant", choices=["ssg", "msg"], default="ssg")
-    parser.add_argument("--no-normals", action="store_true")
-    parser.add_argument("--head-channels", default="512,256")
-    parser.add_argument("--dropout", type=float, default=0)
-    parser.add_argument("--ssg-npoints", default="512,128")
-    parser.add_argument("--ssg-radii", default="0.2,0.4")
-    parser.add_argument("--ssg-nsamples", default="32,64")
-    parser.add_argument("--ssg-mlps", default="64,64,128;128,128,256;256,512,1024")
-    parser.add_argument("--msg-npoints", default="512,128")
-    parser.add_argument("--msg-radii", default="0.1,0.2,0.4;0.2,0.4,0.8")
-    parser.add_argument("--msg-nsamples", default="16,32,128;32,64,128")
+    parser.add_argument("--num-kernel", type=int, default=64)
+    parser.add_argument("--sigma", type=float, default=0.2)
     parser.add_argument(
-        "--msg-mlps",
-        default="32,32,64|64,64,128|64,96,128;64,64,128|128,128,256|128,128,256",
+        "--aggregation-method", choices=["Concat", "Max", "Average"], default="Concat"
     )
-    parser.add_argument("--msg-global-mlp", default="256,512,1024")
+    parser.add_argument("--mask-ratio", type=float, default=0.95)
+    parser.add_argument("--head-channels", default="512,256")
+    parser.add_argument("--dropout", type=float, default=0.5)
+
+    parser.add_argument("--augment", action="store_true", default=False)
+    parser.add_argument("--no-augment", dest="augment", action="store_false")
+    parser.add_argument("--jitter-sigma", type=float, default=0.002)
+    parser.add_argument("--jitter-clip", type=float, default=0.01)
 
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -394,7 +316,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def resolve_num_landmarks(args: argparse.Namespace) -> None:
-    expected = 85 if args.input_mode in {"ear_crop", "precropped"} else 170
+    expected = 85  # precropped mode: one ear per sample
     if args.num_landmarks is None:
         args.num_landmarks = expected
         return
@@ -422,128 +344,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("Provide both --train-split-file and --val-split-file, or neither")
 
     checkpoint_dir = Path(args.checkpoint_dir)
-    crop_config = None
-    crop_config_json = None
-    crop_coverage = None
-    crop_sampling_stats = None
 
-    if args.input_mode == "full":
-        train_dataset = PinnaPointCloudDataset(
-            args.mesh_dir,
-            args.landmarks_dir,
-            num_points=args.num_points,
-            seed=args.seed,
-            subject_ids=train_ids,
-        )
-        val_dataset = (
-            PinnaPointCloudDataset(
-                args.mesh_dir,
-                args.landmarks_dir,
-                num_points=args.num_points,
-                seed=args.seed + 100000,
-                subject_ids=val_ids,
-            )
-            if val_ids
-            else None
-        )
-    elif args.input_mode == "precropped":
-        if not args.cropped_dir:
-            raise ValueError("--cropped-dir is required when --input-mode is precropped")
-        train_dataset = PinnaPrecropDataset(
+    train_dataset = PinnaPrecropMeshDataset(
+        args.mesh_dir,
+        args.landmarks_dir,
+        cropped_dir=args.cropped_dir,
+        max_faces=args.max_faces,
+        seed=args.seed,
+        subject_ids=train_ids,
+        mirror_right_ear=args.mirror_right_ear,
+        augment=args.augment,
+        jitter_sigma=args.jitter_sigma,
+        jitter_clip=args.jitter_clip,
+        face_cache_dir=args.face_cache_dir,
+    )
+    val_dataset = (
+        PinnaPrecropMeshDataset(
             args.mesh_dir,
             args.landmarks_dir,
             cropped_dir=args.cropped_dir,
-            ear_points=args.ear_points,
-            seed=args.seed,
-            subject_ids=train_ids,
+            max_faces=args.max_faces,
+            seed=args.seed + 100000,
+            subject_ids=val_ids,
             mirror_right_ear=args.mirror_right_ear,
+            augment=False,
+            face_cache_dir=args.face_cache_dir,
         )
-        val_dataset = (
-            PinnaPrecropDataset(
-                args.mesh_dir,
-                args.landmarks_dir,
-                cropped_dir=args.cropped_dir,
-                ear_points=args.ear_points,
-                seed=args.seed + 100000,
-                subject_ids=val_ids,
-                mirror_right_ear=args.mirror_right_ear,
-            )
-            if val_ids
-            else None
-        )
-    else:
-        # ear_crop: fit crop boxes from training landmarks at runtime
-        crop_config = fit_crop_config_from_training_landmarks(
-            base_dataset, train_ids, margin=args.crop_margin
-        )
-        crop_config_json = crop_config_to_dict(crop_config)
-        crop_coverage = {
-            "train": compute_crop_coverage(base_dataset, train_ids, crop_config),
-            "val": compute_crop_coverage(base_dataset, val_ids, crop_config) if val_ids else None,
-        }
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        write_json(checkpoint_dir / "crop_config.json", crop_config_json)
-        write_json(checkpoint_dir / "crop_coverage.json", crop_coverage)
-        if args.save_crop_ply:
-            crop_sampling_stats = {
-                "train": export_subject_crop_plys(
-                    base_dataset,
-                    train_ids,
-                    crop_config,
-                    str(checkpoint_dir),
-                    "train",
-                    ear_points=args.ear_points,
-                    seed=args.seed,
-                    oversample_factor=args.crop_oversample_factor,
-                    max_attempts=args.crop_max_resample_attempts,
-                    min_inside_ratio=args.crop_min_inside_ratio,
-                ),
-                "val": None,
-            }
-            if val_ids:
-                crop_sampling_stats["val"] = export_subject_crop_plys(
-                    base_dataset,
-                    val_ids,
-                    crop_config,
-                    str(checkpoint_dir),
-                    "val",
-                    ear_points=args.ear_points,
-                    seed=args.seed + 100000,
-                    oversample_factor=args.crop_oversample_factor,
-                    max_attempts=args.crop_max_resample_attempts,
-                    min_inside_ratio=args.crop_min_inside_ratio,
-                )
-            write_json(checkpoint_dir / "crop_sampling_stats.json", crop_sampling_stats)
-            print_low_yield_crop_warnings(crop_sampling_stats)
-
-        train_dataset = PinnaEarCropDataset(
-            args.mesh_dir,
-            args.landmarks_dir,
-            crop_config=crop_config,
-            ear_points=args.ear_points,
-            seed=args.seed,
-            subject_ids=train_ids,
-            mirror_right_ear=args.mirror_right_ear,
-            crop_oversample_factor=args.crop_oversample_factor,
-            crop_max_resample_attempts=args.crop_max_resample_attempts,
-            crop_min_inside_ratio=args.crop_min_inside_ratio,
-        )
-        val_dataset = (
-            PinnaEarCropDataset(
-                args.mesh_dir,
-                args.landmarks_dir,
-                crop_config=crop_config,
-                ear_points=args.ear_points,
-                seed=args.seed + 100000,
-                subject_ids=val_ids,
-                mirror_right_ear=args.mirror_right_ear,
-                crop_oversample_factor=args.crop_oversample_factor,
-                crop_max_resample_attempts=args.crop_max_resample_attempts,
-                crop_min_inside_ratio=args.crop_min_inside_ratio,
-            )
-            if val_ids
-            else None
-        )
+        if val_ids
+        else None
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -572,9 +401,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         val_ids=val_ids,
         device=device,
         amp_enabled=amp_enabled,
-        crop_config=crop_config_json,
-        crop_coverage=crop_coverage,
-        crop_sampling_stats=crop_sampling_stats,
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     write_json(checkpoint_dir / "run_config.json", run_config)
@@ -588,6 +414,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     scheduler = make_scheduler(args, optimizer)
 
     best_score = float("inf")
+    best_epoch = 0
+    best_metrics = None
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
             model,
@@ -625,10 +453,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             args,
             epoch,
             latest_metrics,
-            crop_config=crop_config_json,
         )
-        if score < best_score:
+        is_best = score < best_score
+        if is_best:
             best_score = score
+            best_epoch = epoch
+            best_metrics = latest_metrics
             save_checkpoint(
                 checkpoint_dir / "best_model.pt",
                 model,
@@ -636,7 +466,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 args,
                 epoch,
                 latest_metrics,
-                crop_config=crop_config_json,
             )
 
         val_text = (
@@ -649,7 +478,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f" train_loss={train_metrics['loss']:.6f}"
             f" train_md={train_metrics['mean_distance']:.6f}"
             f"{val_text}"
+            f"{' *best*' if is_best else ''}"
         )
+
+    best_metric_name = "val_md" if (best_metrics and best_metrics["val"]) else "train_loss"
+    print(
+        f"best_checkpoint epoch={best_epoch:04d} "
+        f"{best_metric_name}={best_score:.6f} "
+        f"path={checkpoint_dir / 'best_model.pt'}"
+    )
 
 
 if __name__ == "__main__":
