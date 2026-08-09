@@ -329,15 +329,21 @@ def print_low_yield_crop_warnings(crop_sampling_stats: Optional[dict]) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
 
-    parser.add_argument("--mesh-dir", default="data/mesh")
-    parser.add_argument("--landmarks-dir", default="data/landmarks")
+    parser.add_argument(
+        "--mesh-dir",
+        default="/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh",
+    )
+    parser.add_argument(
+        "--landmarks-dir",
+        default="/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks",
+    )
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--train-split-file", default=None)
     parser.add_argument("--val-split-file", default=None)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--input-mode", choices=["full", "ear_crop"], default="full")
     parser.add_argument("--num-points", type=int, default=16384)
-    parser.add_argument("--ear-points", type=int, default=8192)
+    parser.add_argument("--ear-points", type=int, default=16384)
     parser.add_argument("--crop-margin", type=float, default=0.4)
     parser.add_argument("--crop-oversample-factor", type=int, default=8)
     parser.add_argument("--crop-max-resample-attempts", type=int, default=5)
@@ -347,8 +353,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mirror-right-ear", action="store_true", default=False)
     parser.add_argument("--no-mirror-right-ear", dest="mirror_right_ear", action="store_false")
     parser.add_argument("--num-landmarks", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--workers", type=int, default=10)
 
     parser.add_argument("--variant", choices=["ssg", "msg"], default="ssg")
     parser.add_argument("--no-normals", action="store_true")

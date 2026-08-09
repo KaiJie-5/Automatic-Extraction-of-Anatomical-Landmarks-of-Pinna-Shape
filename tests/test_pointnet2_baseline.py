@@ -64,7 +64,7 @@ def test_surface_sampler_shape_and_normal_lengths():
     assert np.allclose(normal_lengths, 1.0, atol=1e-5)
 
 
-def test_dataset_excludes_malformed_subject_by_default(tmp_path):
+def test_dataset_includes_corrected_p0027_by_default(tmp_path):
     mesh_dir = tmp_path / "mesh"
     landmarks_dir = tmp_path / "landmarks"
     mesh_dir.mkdir()
@@ -75,7 +75,7 @@ def test_dataset_excludes_malformed_subject_by_default(tmp_path):
 
     dataset = Dataset(mesh_dir=str(mesh_dir), landmarks_dir=str(landmarks_dir))
 
-    assert dataset.subject_ids == ["P0026", "P0028"]
+    assert dataset.subject_ids == ["P0026", "P0027", "P0028"]
 
 
 def test_normalization_round_trip():
@@ -154,6 +154,17 @@ def test_estimator_missing_checkpoint_raises(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="Missing trained checkpoint"):
         LandmarkExtractor(checkpoint_path=str(missing_path))
+
+
+def test_estimator_loads_legacy_raw_full_head_state_dict(tmp_path):
+    model = PointNet2LandmarkRegressor(**default_model_config())
+    checkpoint_path = tmp_path / "legacy_raw.pt"
+    torch.save(model.state_dict(), checkpoint_path)
+
+    extractor = LandmarkExtractor(checkpoint_path=str(checkpoint_path), device="cpu")
+
+    assert extractor.schema_version == 1
+    assert extractor.input_mode == "full"
 
 
 def test_split_metric_matches_left_right_average():

@@ -453,8 +453,8 @@ class TwoBranchEarCropRegressor(nn.Module):
         return landmarks.view(left_points.shape[0], self.num_landmarks, 3)
 
 
-class PointNet2BoxRegressor(nn.Module):
-    """Predict tight ear crop box [cx, cy, cz, sx, sy, sz]."""
+class LegacyPointNet2BoxRegressor(nn.Module):
+    """Legacy six-value crop regressor retained only for old research artifacts."""
 
     def __init__(
         self,
@@ -487,6 +487,37 @@ class PointNet2BoxRegressor(nn.Module):
         size = torch.nn.functional.softplus(box[:, 3:]) + 1e-4
         
         return torch.cat([center, size], dim=1)
+
+
+class PointNet2CenterLocator(nn.Module):
+    """Predict a three-dimensional ear-centre correction in millimetres."""
+
+    def __init__(
+        self,
+        input_channels: int = 6,
+        use_normals: bool = True,
+        variant: str = "ssg",
+        head_channels: Sequence[int] = (256, 128),
+        dropout: float = 0.0,
+        **encoder_config,
+    ):
+        super().__init__()
+        self.encoder = PointNet2FeatureEncoder(
+            input_channels=input_channels,
+            use_normals=use_normals,
+            variant=variant,
+            **encoder_config,
+        )
+        self.regression_head = PointNet2LandmarkRegressor._build_regression_head(
+            self.encoder.feature_dim, _as_list(head_channels), 3, float(dropout)
+        )
+
+    def forward(self, point_cloud: torch.Tensor) -> torch.Tensor:
+        return self.regression_head(self.encoder(point_cloud))
+
+
+class PointNet2BoxRegressor(PointNet2CenterLocator):
+    """Deprecated name for the proposal's three-value centre-only locator."""
         
         
 def default_model_config() -> dict:

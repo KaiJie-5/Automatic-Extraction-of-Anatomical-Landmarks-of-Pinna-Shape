@@ -1,4 +1,8 @@
-"""Use the trained Box Regressor to crop meshes, validate coverage, and save PLYs."""
+"""Legacy six-value box-regressor visualization utility.
+
+The proposal-aligned workflow uses ``train_pipeline.py calibrate`` and does not use
+this in-sample/TTA calibration path. This file remains only for old artifacts.
+"""
 
 import os
 import torch
@@ -15,13 +19,13 @@ from src.ear_crop import (
     crop_box_from_center_extents,
     points_inside_box
 )
-from src.pointnet2_model import PointNet2BoxRegressor
+from src.pointnet2_model import LegacyPointNet2BoxRegressor as PointNet2BoxRegressor
 from src.torch_dataset import split_subject_ids
 
 def main():
     # --- Configuration ---
-    mesh_dir = "data/mesh"
-    landmarks_dir = "data/landmarks"
+    mesh_dir = "/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh"
+    landmarks_dir = "/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks"
     model_path = "checkpoints_box/best_box_model.pt"
     output_dir = "predicted_crops"
     broad_margin = 0.40 

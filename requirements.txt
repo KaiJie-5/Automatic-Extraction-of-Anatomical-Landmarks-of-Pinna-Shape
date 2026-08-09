@@ -2,6 +2,7 @@ ipykernel
 matplotlib
 numpy
 trimesh
+fast-simplification
 k3d
 scipy
 torch

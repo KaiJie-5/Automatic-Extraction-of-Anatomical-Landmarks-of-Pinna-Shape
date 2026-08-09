@@ -191,8 +191,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--mesh-path", default=None)
     parser.add_argument("--subject-id", default=None)
-    parser.add_argument("--mesh-dir", default="data/mesh")
-    parser.add_argument("--landmarks-dir", default="data/landmarks")
+    parser.add_argument(
+        "--mesh-dir",
+        default="/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh",
+    )
+    parser.add_argument(
+        "--landmarks-dir",
+        default="/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks",
+    )
     parser.add_argument("--num-points", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--method", choices=["gradient", "occlusion"], default="occlusion")

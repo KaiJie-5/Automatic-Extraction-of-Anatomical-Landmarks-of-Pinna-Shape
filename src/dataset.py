@@ -6,7 +6,7 @@ import csv
 from pathlib import Path
 
 
-DEFAULT_EXCLUDED_SUBJECT_IDS = {"P0027"}
+DEFAULT_EXCLUDED_SUBJECT_IDS = frozenset()
 
 
 class Dataset:
@@ -36,7 +36,9 @@ class Dataset:
 
         # --- Load mesh ---
         mesh_path = self.mesh_dir / f"{subject_id}.ply"
-        mesh = trimesh.load(mesh_path)
+        mesh = trimesh.load(mesh_path, force="mesh", process=False)
+        if not isinstance(mesh, Trimesh):
+            raise ValueError(f"{mesh_path} did not load as a triangular mesh")
 
         # --- Load landmarks ---
         left_path = self.landmarks_dir / f"{subject_id}_left_ear_landmarks.csv"
@@ -46,12 +48,38 @@ class Dataset:
 
         return mesh, landmarks_left, landmarks_right    
     
-    def _load_landmarks(self, filepath: Path) -> np.ndarray:
+    @staticmethod
+    def _load_landmarks(filepath: Path) -> np.ndarray:
         """
         input CSV with format: index, [x y z]
         output N x 3 array
         """
-        with open(filepath, newline='') as csvfile:
+        with open(filepath, newline="", encoding="utf-8-sig") as csvfile:
             reader = csv.reader(csvfile)
-            coords = [np.fromstring(coordinate_str.strip('[]'), sep=' ') for _, coordinate_str in reader]
-        return np.array(coords)
+            rows = list(reader)
+        if len(rows) != 85:
+            raise ValueError(f"{filepath} must contain exactly 85 rows; found {len(rows)}")
+
+        coords = []
+        for expected_index, row in enumerate(rows):
+            if len(row) != 2:
+                raise ValueError(f"{filepath}:{expected_index + 1} must have exactly 2 columns")
+            try:
+                actual_index = int(row[0].strip())
+            except ValueError as exc:
+                raise ValueError(f"{filepath}:{expected_index + 1} has an invalid index") from exc
+            if actual_index != expected_index:
+                raise ValueError(
+                    f"{filepath}:{expected_index + 1} expected index {expected_index}, "
+                    f"found {actual_index}"
+                )
+            value = row[1].strip()
+            if not (value.startswith("[") and value.endswith("]")):
+                raise ValueError(f"{filepath}:{expected_index + 1} coordinates must be bracketed")
+            coordinate = np.fromstring(value[1:-1], sep=" ", dtype=np.float64)
+            if coordinate.shape != (3,) or not np.isfinite(coordinate).all():
+                raise ValueError(
+                    f"{filepath}:{expected_index + 1} must contain three finite coordinates"
+                )
+            coords.append(coordinate)
+        return np.asarray(coords, dtype=np.float32)

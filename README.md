@@ -1,6 +1,9 @@
 # Pinna Landmark Extraction with PointNet++
 
-This repository contains a PyTorch baseline for the Tech Arena 2026 pinna landmark extraction task. The task is to take a 3D head mesh as input and predict 85 landmarks for the left pinna and 85 landmarks for the right pinna.
+This repository contains both the original PointNet++ baseline and the proposal-aligned
+v2 coarse-to-fine pipeline for the Tech Arena 2026 pinna landmark extraction task.
+The v2 pipeline audits the data, uses nested subject-level cross-fitting for an ear
+centre locator, calibrates leakage-safe crops, and predicts 85 ordered landmarks per ear.
 
 The current code supports two input modes:
 
@@ -31,7 +34,8 @@ conda create -n anthropometric_env python=3.10 -y
 conda activate anthropometric_env
 ```
 
-For NVIDIA L4 or L40 GPUs, install the CUDA 12.8 PyTorch wheels:
+For the H200 training node, install a PyTorch build compatible with the cluster's
+CUDA driver. For a CUDA 12.8-compatible environment, for example:
 
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
@@ -64,10 +68,16 @@ PY
 
 ## Dataset Layout
 
-Place the data in this layout:
+The Iridis data root is:
 
 ```text
-data/
+/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/
+```
+
+It uses this layout:
+
+```text
+/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/
   mesh/
     <subject_id>.ply
   landmarks/
@@ -78,29 +88,94 @@ data/
 Example:
 
 ```text
-data/mesh/P0001.ply
-data/landmarks/P0001_left_ear_landmarks.csv
-data/landmarks/P0001_right_ear_landmarks.csv
+/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh/P0001.ply
+/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks/P0001_left_ear_landmarks.csv
+/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks/P0001_right_ear_landmarks.csv
 ```
 
-Subject `P0027` is excluded by default because it has a malformed landmark count in the current dataset copy.
+No challenge subject is excluded by default. The corrected `P0027` annotations and
+KEMAR are included. The strict audit must pass before folds or training are created.
+
+## Proposal-Aligned Pipeline
+
+The full workflow is exposed through one CLI:
+
+```bash
+python train_pipeline.py --help
+python train_pipeline.py audit \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --output-root /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/dataset_analysis_outputs
+python train_pipeline.py make-folds \
+  --audit-json /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/dataset_analysis_outputs/audit_TIMESTAMP/dataset_audit.json \
+  --output artifacts/folds.json
+```
+
+Train all nested and outer locator folds, then calibrate the final crop from the
+five outer out-of-fold prediction sets:
+
+```bash
+python train_pipeline.py fit-locator \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json --outer-fold all \
+  --output-dir runs/locator_cv --amp
+python train_pipeline.py calibrate \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --locator-run-root runs/locator_cv --outer-fold final \
+  --output artifacts/final_crop_calibration.json
+```
+
+For an outer-fold landmark experiment, first create that fold's calibration with
+`--outer-fold 0`, then use its generated `_predictions.json` file:
+
+```bash
+python train_pipeline.py fit-landmarks \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json --outer-fold 0 \
+  --calibration-json artifacts/fold0_crop_calibration.json \
+  --predictions-json artifacts/fold0_crop_calibration_predictions.json \
+  --output-dir runs/fold0_pointnet2_four_heads --four-heads --amp
+```
+
+After the registered five-fold/three-seed comparisons select a configuration, use
+the cross-validation best epochs to retrain and package one deterministic model:
+
+```bash
+python train_pipeline.py fit-final \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --locator-run-root runs/locator_cv \
+  --calibration-json artifacts/final_crop_calibration.json \
+  --locator-epochs 120 --landmark-epochs 150 \
+  --output-dir checkpoints
+python train_pipeline.py package \
+  --checkpoint checkpoints/final_pipeline.pt \
+  --output artifacts/pinna_submission.zip
+```
+
+The epoch numbers above are examples only; supply the selected values from the
+completed cross-validation manifests rather than treating them as defaults.
+
+The exact experiment order and promotion rule are recorded in
+`configs/experiment_matrix.json`; the method and leakage controls are documented
+in `TECHNICAL_METHOD.md`, with the reviewed literature and project sources in
+`RESEARCH_BASIS.md`.
 
 ## Quick Start
 
 Train the default full-head baseline:
 
 ```bash
-python train_pointnet2.py --mesh-dir data/mesh --landmarks-dir data/landmarks
+python train_pointnet2.py
 ```
 
 Train the ear-crop baseline:
 
 ```bash
 python train_pointnet2.py \
-  --mesh-dir data/mesh \
-  --landmarks-dir data/landmarks \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
   --input-mode ear_crop \
-  --ear-points 8192 \
+  --ear-points 16384 \
   --crop-margin 0.40
 ```
 
@@ -111,13 +186,16 @@ python train_pointnet2.py --epochs 1 --batch-size 1 --num-points 128
 python train_pointnet2.py --epochs 1 --batch-size 1 --input-mode ear_crop --ear-points 128
 ```
 
-Submit an HPC job:
+Submit a pipeline stage to H200 (the complete locator example is in the HPC section):
 
 ```bash
-sbatch submit_job_train_pointnet2.slurm
+sbatch submit_job_train_pointnet2.slurm audit \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --output-root /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/dataset_analysis_outputs
 ```
 
-The sbatch file keeps the main tuning values near the top of the file, including input mode, model type, point count, loss, learning rate, and batch size.
+The scheduler script forwards the stage and arguments unchanged to `train_pipeline.py`.
 
 ## Outputs
 
@@ -164,10 +242,12 @@ full mesh -> 16384 points -> PointNet++ encoder -> prediction layers -> 170 x 3 
 Flow:
 
 ```text
-full mesh -> exact left/right ear crop -> 8192 crop-surface points -> PointNet++ -> 85 x 3 landmarks
+full mesh -> exact left/right ear crop -> 16384 crop-surface points -> PointNet++ -> 85 x 3 landmarks
 ```
 
-Right-ear mirroring is disabled by default. If enabled, it changes the right-ear input points only. The target landmarks and final predictions stay in the original mesh coordinates.
+Legacy ear-crop checkpoint behaviour remains unchanged. In the v2 pipeline,
+right-ear points, normals, and targets are mirrored consistently, and predictions
+are reflected back before being returned.
 
 ## Training Arguments
 
@@ -181,14 +261,14 @@ python train_pointnet2.py --help
 
 | Argument | Default | Meaning |
 | :--- | :--- | :--- |
-| `--mesh-dir` | `data/mesh` | Folder containing subject `.ply` meshes. |
-| `--landmarks-dir` | `data/landmarks` | Folder containing left and right landmark CSV files. |
+| `--mesh-dir` | `/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh` | Folder containing subject `.ply` meshes. |
+| `--landmarks-dir` | `/iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks` | Folder containing left and right landmark CSV files. |
 | `--checkpoint-dir` | `checkpoints` | Folder where checkpoints, configs, and crop files are saved. |
 | `--train-split-file` | `None` | Optional text file with one training subject ID per line. |
 | `--val-split-file` | `None` | Optional text file with one validation subject ID per line. |
 | `--val-ratio` | `0.2` | Validation fraction when split files are not provided. |
-| `--seed` | `0` | Random seed for splitting, sampling, and training setup. |
-| `--workers` | `0` | Number of PyTorch data loader workers. |
+| `--seed` | `42` | Random seed for splitting, sampling, and training setup. |
+| `--workers` | `10` | Number of PyTorch data loader workers. |
 
 If split files are used, provide both `--train-split-file` and `--val-split-file`.
 
@@ -198,7 +278,7 @@ If split files are used, provide both `--train-split-file` and `--val-split-file
 | :--- | :--- | :--- |
 | `--input-mode` | `full` | Choose `full` or `ear_crop`. |
 | `--num-points` | `16384` | Number of sampled full-mesh points for `full` mode. |
-| `--ear-points` | `8192` | Number of sampled points per ear for `ear_crop` mode. |
+| `--ear-points` | `16384` | Number of sampled points per ear for `ear_crop` mode. |
 | `--num-landmarks` | mode-specific | Number of output landmarks. Resolves to `170` for `full` and `85` for `ear_crop`. |
 | `--no-normals` | `False` | Disable normal channels in the PointNet++ input. |
 
@@ -302,10 +382,10 @@ The challenge entry point is:
 src.estimator.LandmarkExtractor
 ```
 
-By default, it loads:
+By default, it loads the proposal-aligned bundle:
 
 ```text
-checkpoints/best_model.pt
+checkpoints/final_pipeline.pt
 ```
 
 If the checkpoint is missing, `LandmarkExtractor` raises a clear error. Before submitting, place the trained checkpoint at this path or change the default path in a controlled way.
@@ -336,7 +416,7 @@ Point importance can be exported with:
 ```bash
 python visualize_point_importance.py \
   --checkpoint-path checkpoints/best_model.pt \
-  --mesh-path data/mesh/P0001.ply \
+  --mesh-path /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh/P0001.ply \
   --method occlusion \
   --output-dir importance_outputs
 ```
@@ -353,19 +433,19 @@ Use `_points.ply` files to see the sampled crop points. Use `_mesh.ply` files on
 
 ## HPC Training
 
-Edit the hyperparameter block near the top of:
-
-```text
-submit_job_train_pointnet2.slurm
-```
-
-Then submit:
+The scheduler script uses the agreed `quad_h200` allocation and forwards a pipeline
+stage plus all remaining arguments. Submit one outer locator fold per job, for example:
 
 ```bash
-sbatch submit_job_train_pointnet2.slurm
+sbatch submit_job_train_pointnet2.slurm fit-locator \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --outer-fold 0 \
+  --output-dir runs/locator_cv
 ```
 
-Each run creates a separate folder under `runs/`. The run folder stores:
+Each pipeline run stores:
 
 - checkpoint files
 - logs
@@ -373,13 +453,15 @@ Each run creates a separate folder under `runs/`. The run folder stores:
 - the sbatch configuration
 - `run_config.json`
 
-This makes it easier to compare full-head, ear-crop, SSG, MSG, and loss-function experiments.
+This supports restartable fold/seed jobs and auditable comparisons across the registered
+experiment sequence.
 
 ## Project Structure
 
 ```text
 .
 |-- train_pointnet2.py               # Training entry point
+|-- train_pipeline.py                # Proposal-aligned staged pipeline
 |-- visualize_point_importance.py    # Point importance visualization
 |-- submit_job_train_pointnet2.slurm # HPC training script
 |-- src/
@@ -390,6 +472,9 @@ This makes it easier to compare full-head, ear-crop, SSG, MSG, and loss-function
 |   |-- pointnet2_model.py           # PointNet++ models
 |   |-- pointnet2_utils.py           # PointNet++ utility code
 |   |-- estimator.py                 # Challenge inference entry point
+|   |-- calibration.py               # OOF crop calibration
+|   |-- proposal_models.py           # Locator, contour heads, refinement
+|   |-- pointnext_model.py            # Portable PointNeXt-S-style encoder
 |   `-- metrics.py                   # Official mean distance metric
 |-- tests/
 |   `-- test_pointnet2_baseline.py

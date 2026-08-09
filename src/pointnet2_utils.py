@@ -56,7 +56,8 @@ def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     batch_size, num_points, _ = xyz.shape
     centroids = torch.zeros(batch_size, npoint, dtype=torch.long, device=device)
     distance = torch.full((batch_size, num_points), 1e10, device=device)
-    farthest = torch.randint(0, num_points, (batch_size,), dtype=torch.long, device=device)
+    centered = xyz - xyz.mean(dim=1, keepdim=True)
+    farthest = torch.sum(centered**2, dim=-1).max(dim=-1).indices
     batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
 
     for i in range(npoint):

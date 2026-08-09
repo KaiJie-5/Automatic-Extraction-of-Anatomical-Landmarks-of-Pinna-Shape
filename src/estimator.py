@@ -6,10 +6,16 @@ import torch
 from trimesh import Trimesh
 
 from .ear_crop import crop_config_from_dict, sample_crop_point_features
+from .calibration import boxes_for_prediction
+from .canonical import LocalEarTransform, WorldCropBox, decanonicalize_xyz
+from .geometry import sample_canonical_crop
 from .pointnet2_model import (
     PointNet2LandmarkRegressor,
     default_model_config,
 )
+from .proposal_models import build_landmark_model, build_locator
+from .meshnet import MeshNetLandmarkRegressor, meshnet_inputs
+from .surface import project_points_to_mesh
 from .preprocessing import (
     compute_mesh_normalization,
     normalize_point_features,
@@ -23,26 +29,32 @@ class LandmarkExtractor:
 
     def __init__(
         self,
-        checkpoint_path: str = "checkpoints/best_model.pt",
+        checkpoint_path: str = "checkpoints/final_pipeline.pt",
         num_points: int = 16384,
-        seed: int = 0,
-        device: str = "cpu",
+        seed: int = 42,
+        device: str = "auto",
     ):
         """This function needs to have default values for all arguments. These will be used when instantiating the class
         during the evaluation of your submission."""
         self.checkpoint_path = Path(checkpoint_path)
         self.num_points = int(num_points)
         self.seed = int(seed)
-        self.device = torch.device(device)
+        self.device = torch.device(
+            "cuda" if device == "auto" and torch.cuda.is_available() else "cpu" if device == "auto" else device
+        )
 
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
                 f"Missing trained checkpoint: {self.checkpoint_path}. "
-                "Train the model with train_pointnet2.py and write the best checkpoint "
+                "Train/package the model with train_pipeline.py and write the final checkpoint "
                 "to this path before running evaluation."
             )
 
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        if isinstance(checkpoint, dict) and checkpoint.get("schema_version") == 2:
+            self._load_v2(checkpoint)
+            return
+        self.schema_version = 1
         model_config = default_model_config()
         if isinstance(checkpoint, dict) and "model_config" in checkpoint:
             model_config.update(checkpoint["model_config"])
@@ -96,11 +108,129 @@ class LandmarkExtractor:
         self.model.load_state_dict(state_dict)
         self.model.eval()
 
+    @staticmethod
+    def _clean_state_dict(state_dict):
+        return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
+
+    def _load_v2(self, checkpoint: dict) -> None:
+        required = {
+            "locator",
+            "landmark",
+            "broad_config",
+            "crop_calibration",
+            "coordinates",
+            "sampling",
+            "postprocess",
+        }
+        missing = sorted(required - set(checkpoint))
+        if missing:
+            raise ValueError(f"Incomplete v2 pipeline checkpoint; missing: {missing}")
+        for component in ("locator", "landmark"):
+            component_missing = sorted(
+                {"model_config", "state_dict"} - set(checkpoint[component])
+            )
+            if component_missing:
+                raise ValueError(
+                    f"Incomplete v2 {component} component; missing: {component_missing}"
+                )
+        coordinates = checkpoint["coordinates"]
+        if coordinates.get("right_reflection") != [1.0, -1.0, 1.0]:
+            raise ValueError("Unsupported v2 right-ear coordinate reflection")
+        if coordinates.get("units") != "millimetres":
+            raise ValueError("v2 checkpoints must use millimetres")
+        self.schema_version = 2
+        self.input_mode = "proposal_v2"
+        self.locator = build_locator(checkpoint["locator"]["model_config"]).to(self.device)
+        landmark_config = dict(checkpoint["landmark"]["model_config"])
+        self.landmark_backbone = landmark_config.get("backbone", "pointnet2")
+        if self.landmark_backbone == "meshnet":
+            self.meshnet_target_faces = int(landmark_config.pop("target_faces"))
+            landmark_config.pop("backbone")
+            self.landmark_model = MeshNetLandmarkRegressor(**landmark_config).to(self.device)
+        else:
+            self.landmark_model = build_landmark_model(landmark_config).to(self.device)
+        self.locator.load_state_dict(
+            self._clean_state_dict(checkpoint["locator"]["state_dict"])
+        )
+        self.landmark_model.load_state_dict(
+            self._clean_state_dict(checkpoint["landmark"]["state_dict"])
+        )
+        self.locator.eval()
+        self.landmark_model.eval()
+        self.broad_config = checkpoint["broad_config"]
+        self.broad_box = WorldCropBox.from_dict(self.broad_config["box"])
+        self.initial_center = np.asarray(
+            self.broad_config["initial_center"], dtype=np.float32
+        )
+        self.broad_scale = float(self.broad_config["input_scale"])
+        self.crop_calibration = checkpoint["crop_calibration"]
+        self.local_scale = float(self.crop_calibration["local_scale"])
+        self.locator_points = int(checkpoint["sampling"].get("locator_points", 16384))
+        self.landmark_points = int(
+            checkpoint["sampling"].get("landmark_points", 16384)
+        )
+        if "seed" in checkpoint["sampling"]:
+            self.seed = int(checkpoint["sampling"]["seed"])
+        self.project_to_surface = bool(
+            checkpoint["postprocess"].get("project_to_surface", False)
+        )
+
+    def _extract_v2_ear(self, mesh: Trimesh, ear: str, ear_offset: int) -> np.ndarray:
+        broad_features, _, _ = sample_canonical_crop(
+            mesh,
+            self.broad_box,
+            ear,
+            self.locator_points,
+            self.seed + ear_offset,
+        )
+        broad_transform = LocalEarTransform(self.broad_box.center, self.broad_scale)
+        locator_input = broad_transform.normalize_features(broad_features)
+        locator_tensor = torch.from_numpy(locator_input).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            correction = self.locator(locator_tensor).squeeze(0).float().cpu().numpy()
+        predicted_center = self.initial_center + correction
+        primary, backup = boxes_for_prediction(predicted_center, self.crop_calibration)
+        local_features, crop_mesh, _ = sample_canonical_crop(
+            mesh,
+            primary,
+            ear,
+            self.landmark_points,
+            self.seed + 100 + ear_offset,
+            fallback_box=backup,
+            thresholds=self.crop_calibration.get("fallback_thresholds"),
+        )
+        local_transform = LocalEarTransform(predicted_center, self.local_scale)
+        with torch.no_grad():
+            if self.landmark_backbone == "meshnet":
+                face_features, neighbors = meshnet_inputs(
+                    crop_mesh, self.meshnet_target_faces, ear, local_transform
+                )
+                local_prediction = self.landmark_model(
+                    torch.from_numpy(face_features).unsqueeze(0).to(self.device),
+                    torch.from_numpy(neighbors).unsqueeze(0).to(self.device),
+                ).squeeze(0).float().cpu().numpy()
+            else:
+                model_input = local_transform.normalize_features(local_features)
+                input_tensor = torch.from_numpy(model_input).unsqueeze(0).to(self.device)
+                local_prediction = (
+                    self.landmark_model(input_tensor).squeeze(0).float().cpu().numpy()
+                )
+        canonical_prediction = local_transform.denormalize_xyz(local_prediction)
+        prediction = decanonicalize_xyz(canonical_prediction, ear).astype(np.float32)
+        if self.project_to_surface:
+            prediction = project_points_to_mesh(prediction, crop_mesh)
+        if prediction.shape != (85, 3) or not np.isfinite(prediction).all():
+            raise RuntimeError(f"v2 {ear} prediction is not a finite (85, 3) array")
+        return prediction.astype(np.float32)
+
     def extract(self, mesh: Trimesh) -> Tuple[np.ndarray, np.ndarray]:
         """Method to extract left and right ear landmarks from a 3D mesh. Both output arrays need to be of size (85, 3),
         and need to contain the 85 landmark coordinates for the left and right ear in the correct order.
         This function will be called during the evaluation on the hidden test dataset.
         """
+        if self.schema_version == 2:
+            return self._extract_v2_ear(mesh, "left", 0), self._extract_v2_ear(mesh, "right", 1)
+
         transform = compute_mesh_normalization(mesh)
         if self.input_mode == "full":
             point_features = sample_mesh_surface(mesh, num_points=self.num_points, seed=self.seed)
