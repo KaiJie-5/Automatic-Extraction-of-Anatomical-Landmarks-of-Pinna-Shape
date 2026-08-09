@@ -8,7 +8,8 @@
 #SBATCH --mem=200G
 #SBATCH --time=2-12:00:00
 
-set -euo pipefail
+set -eo pipefail
+set +u
 
 STAGE="${1:?Usage: sbatch submit_job_train_pointnet2.slurm STAGE [stage arguments...]}"
 shift
