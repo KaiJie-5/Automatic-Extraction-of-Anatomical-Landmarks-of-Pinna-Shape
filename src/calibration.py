@@ -86,6 +86,8 @@ def calibrate_directional_crops(
     percentile: float = 99.0,
     safety_candidates_mm: Sequence[float] = tuple(range(6)),
     primary_complete_coverage: float = 0.99,
+    backup_expansions: Sequence[float] = (0.2, 0.4, 0.6, 0.8, 1.0),
+    outward_epsilon_mm: float = 1e-3,
     geometry_stats: Sequence[Mapping[str, float]] = (),
 ) -> dict:
     if not records:
@@ -127,16 +129,55 @@ def calibrate_directional_crops(
     if selected_safety is None:
         raise ValueError("0-5 mm safety search did not reach 99% complete-ear coverage")
 
-    primary_negative = base_negative + selected_safety
-    primary_positive = base_positive + selected_safety
-    backup_negative = np.maximum(np.max(
-        np.stack([prediction - points.min(axis=0) for prediction, points in zip(predictions, landmarks)]),
-        axis=0,
-    ), 0.0)
-    backup_positive = np.maximum(np.max(
-        np.stack([points.max(axis=0) - prediction for prediction, points in zip(predictions, landmarks)]),
-        axis=0,
-    ), 0.0)
+    # Store the reaches in float32 because that is what inference loads.  Moving
+    # one representable value outwards prevents JSON/float32 round trips from
+    # turning a boundary landmark into a false miss.
+    primary_negative = np.nextafter(
+        np.asarray(base_negative + selected_safety, dtype=np.float32),
+        np.float32(np.inf),
+    )
+    primary_positive = np.nextafter(
+        np.asarray(base_positive + selected_safety, dtype=np.float32),
+        np.float32(np.inf),
+    )
+    selected_coverage = _complete_ear_coverage(
+        predictions, landmarks, primary_negative, primary_positive
+    )
+
+    # The backup must be a true superset of the primary crop.  The previous
+    # implementation fitted each backup direction independently to a maximum;
+    # this could make some backup axes smaller than their primary counterparts.
+    # Select the first proposal-defined expansion that covers every calibration
+    # ear, adding a tiny outward tolerance for serialized floating-point bounds.
+    selected_backup_expansion = None
+    backup_negative = None
+    backup_positive = None
+    backup_coverage = 0.0
+    for expansion in backup_expansions:
+        if float(expansion) < 0.0:
+            raise ValueError("backup expansions must be nonnegative")
+        factor = 1.0 + float(expansion)
+        candidate_negative = np.nextafter(
+            np.asarray(primary_negative * factor + outward_epsilon_mm, dtype=np.float32),
+            np.float32(np.inf),
+        )
+        candidate_positive = np.nextafter(
+            np.asarray(primary_positive * factor + outward_epsilon_mm, dtype=np.float32),
+            np.float32(np.inf),
+        )
+        coverage = _complete_ear_coverage(
+            predictions, landmarks, candidate_negative, candidate_positive
+        )
+        if coverage == 1.0:
+            selected_backup_expansion = float(expansion)
+            backup_negative = candidate_negative
+            backup_positive = candidate_positive
+            backup_coverage = coverage
+            break
+    if selected_backup_expansion is None:
+        raise ValueError(
+            "backup expansion search did not reach 100% complete-ear coverage"
+        )
     result = {
         "schema_version": 1,
         "percentile": float(percentile),
@@ -147,9 +188,11 @@ def calibrate_directional_crops(
             "complete_ear_coverage": selected_coverage,
         },
         "backup": {
-            "negative": backup_negative.astype(np.float32).tolist(),
-            "positive": backup_positive.astype(np.float32).tolist(),
-            "complete_ear_coverage": 1.0,
+            "negative": backup_negative.tolist(),
+            "positive": backup_positive.tolist(),
+            "complete_ear_coverage": backup_coverage,
+            "expansion": selected_backup_expansion,
+            "outward_epsilon_mm": float(outward_epsilon_mm),
         },
         "local_scale": float(max(np.max(primary_negative), np.max(primary_positive))),
     }
@@ -164,6 +207,74 @@ def calibrate_directional_crops(
     else:
         result["fallback_thresholds"] = {"face_count_p01": 0, "surface_area_p01": 0.0}
     return result
+
+
+def _complete_ear_coverage(
+    predictions: Sequence[np.ndarray],
+    landmarks: Sequence[np.ndarray],
+    negative: np.ndarray,
+    positive: np.ndarray,
+) -> float:
+    complete = [
+        bool(box_from_center(prediction, negative, positive).contains(points).all())
+        for prediction, points in zip(predictions, landmarks)
+    ]
+    return float(np.mean(complete))
+
+
+def evaluate_calibration(
+    records: Sequence[EarCalibrationRecord], calibration: Mapping[str, object]
+) -> dict:
+    """Measure serialized crop coverage and report the exact failing ears."""
+    if not records:
+        raise ValueError("at least one calibration record is required")
+    primary = calibration["primary"]
+    backup = calibration["backup"]
+    primary_misses = []
+    backup_misses = []
+    center_errors = []
+    for record in records:
+        points = record.canonical_landmarks()
+        prediction = record.canonical_prediction()
+        center_errors.append(float(np.linalg.norm(prediction - ear_bbox_center(points))))
+        if not box_from_center(
+            prediction, primary["negative"], primary["positive"]
+        ).contains(points).all():
+            primary_misses.append(f"{record.subject_id}:{record.ear}")
+        if not box_from_center(
+            prediction, backup["negative"], backup["positive"]
+        ).contains(points).all():
+            backup_misses.append(f"{record.subject_id}:{record.ear}")
+
+    primary_negative = np.asarray(primary["negative"], dtype=np.float64)
+    primary_positive = np.asarray(primary["positive"], dtype=np.float64)
+    backup_negative = np.asarray(backup["negative"], dtype=np.float64)
+    backup_positive = np.asarray(backup["positive"], dtype=np.float64)
+    count = len(records)
+    return {
+        "ear_count": count,
+        "center_error_mm": {
+            "mean": float(np.mean(center_errors)),
+            "median": float(np.median(center_errors)),
+            "p95": float(np.percentile(center_errors, 95.0)),
+            "p99": float(np.percentile(center_errors, 99.0)),
+            "maximum": float(np.max(center_errors)),
+        },
+        "primary": {
+            "complete_count": count - len(primary_misses),
+            "coverage": (count - len(primary_misses)) / count,
+            "misses": primary_misses,
+        },
+        "backup": {
+            "complete_count": count - len(backup_misses),
+            "coverage": (count - len(backup_misses)) / count,
+            "misses": backup_misses,
+            "is_primary_superset": bool(
+                np.all(backup_negative >= primary_negative)
+                and np.all(backup_positive >= primary_positive)
+            ),
+        },
+    }
 
 
 def boxes_for_prediction(predicted_center: np.ndarray, calibration: Mapping[str, object]):

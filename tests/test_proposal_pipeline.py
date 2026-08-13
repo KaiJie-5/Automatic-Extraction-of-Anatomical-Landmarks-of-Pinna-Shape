@@ -6,7 +6,11 @@ import torch
 import trimesh
 
 from src.audit import audit_dataset
-from src.calibration import EarCalibrationRecord, calibrate_directional_crops
+from src.calibration import (
+    EarCalibrationRecord,
+    calibrate_directional_crops,
+    evaluate_calibration,
+)
 from src.canonical import (
     LocalEarTransform,
     WorldCropBox,
@@ -109,6 +113,35 @@ def test_bbox_center_and_directional_signed_error_formula():
     assert np.allclose(calibration["primary"]["positive"], [1.0, 2.5, 3.0])
     assert calibration["primary"]["complete_ear_coverage"] == 1.0
     assert calibration["backup"]["complete_ear_coverage"] == 1.0
+    assert calibration["backup"]["expansion"] == 0.2
+    assert np.all(
+        np.asarray(calibration["backup"]["negative"])
+        >= np.asarray(calibration["primary"]["negative"])
+    )
+    assert np.all(
+        np.asarray(calibration["backup"]["positive"])
+        >= np.asarray(calibration["primary"]["positive"])
+    )
+    report = evaluate_calibration(records, calibration)
+    assert report["primary"]["coverage"] == 1.0
+    assert report["backup"]["coverage"] == 1.0
+    assert report["backup"]["is_primary_superset"]
+
+
+def test_backup_crop_search_rejects_insufficient_expansions():
+    axis = np.linspace(-1.0, 1.0, 85, dtype=np.float32)
+    normal = np.stack([axis, axis, axis], axis=1)
+    outlier = normal.copy()
+    outlier[0, 0] = -100.0
+    records = [
+        EarCalibrationRecord(f"S{i}", "left", normal, np.zeros(3, dtype=np.float32))
+        for i in range(100)
+    ]
+    records.append(
+        EarCalibrationRecord("outlier", "left", outlier, np.zeros(3, dtype=np.float32))
+    )
+    with pytest.raises(ValueError, match="backup expansion search"):
+        calibrate_directional_crops(records, backup_expansions=(0.0,))
 
 
 def test_epoch_sampling_changes_only_for_dynamic_dataset():

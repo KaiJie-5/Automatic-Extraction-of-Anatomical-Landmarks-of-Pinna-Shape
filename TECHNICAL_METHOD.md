@@ -15,9 +15,12 @@ ear centres used for final calibration and final landmark training.
 
 The primary directional crop combines the 99th percentile of annotated landmark
 reach, the appropriate signed 99th-percentile locator error, and the smallest
-0–5 mm safety margin reaching 99% complete-ear coverage. A separately calibrated
-backup crop covers 100%. The backup activates only for invalid clipping/sampling
-or geometry below the serialized first-percentile face-count/surface-area gate.
+0–5 mm safety margin reaching 99% complete-ear coverage. The backup is the
+smallest 20%, 40%, 60%, 80%, or 100% directional expansion of the primary crop
+that covers every calibration ear. Its serialized float32 reaches are moved
+outward by 0.001 mm and must remain a component-wise superset of the primary.
+The backup activates only for invalid clipping/sampling or geometry below the
+serialized first-percentile face-count/surface-area gate.
 
 ## Models and objectives
 

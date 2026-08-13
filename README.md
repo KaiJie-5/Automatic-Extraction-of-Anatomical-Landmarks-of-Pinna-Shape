@@ -123,7 +123,25 @@ python train_pipeline.py calibrate \
   --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
   --locator-run-root runs/locator_cv --outer-fold final \
   --output artifacts/final_crop_calibration.json
+python train_pipeline.py validate-calibration \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --calibration-json artifacts/final_crop_calibration.json \
+  --predictions-json artifacts/final_crop_calibration_predictions.json \
+  --outer-fold final --output artifacts/final_crop_validation.json
+python train_pipeline.py validate-calibration \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --calibration-json 'artifacts/fold{fold}_crop_calibration.json' \
+  --predictions-json 'artifacts/fold{fold}_crop_calibration_predictions.json' \
+  --folds-json artifacts/folds.json --outer-fold all \
+  --output artifacts/outer_fold_crop_validation.json
 ```
+
+`validate-calibration` is CPU-only and exits with status 2 unless primary
+complete-ear coverage is at least 99%, backup coverage is exactly 100%, and the
+backup bounds are a component-wise superset of the primary bounds. The `all`
+form pools held-out counts across all five folds; keep `{fold}` single-quoted so
+the shell passes the path template unchanged. For one fold, pass its literal
+paths with `--folds-json artifacts/folds.json --outer-fold N`.
 
 For an outer-fold landmark experiment, first create that fold's calibration with
 `--outer-fold 0`, then use its generated `_predictions.json` file:

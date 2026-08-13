@@ -21,6 +21,7 @@ from src.calibration import (
     EarCalibrationRecord,
     boxes_for_prediction,
     calibrate_directional_crops,
+    evaluate_calibration,
     fit_broad_box,
     fit_broad_box_with_margin,
 )
@@ -323,14 +324,8 @@ def command_calibrate(args):
     outer_fold = None if args.outer_fold == "final" else int(args.outer_fold)
     predictions = collect_oof_predictions(args.locator_run_root, outer_fold)
     dataset = Dataset(args.mesh_dir, args.landmarks_dir)
+    records = _calibration_records(dataset, predictions)
     index = {dataset.get_identifier(i): i for i in range(len(dataset))}
-    records = []
-    for key, canonical_prediction in predictions.items():
-        subject_id, ear = key.split(":")
-        _, left, right = dataset[index[subject_id]]
-        landmarks = left if ear == "left" else right
-        original_prediction = decanonicalize_xyz(np.asarray(canonical_prediction, dtype=np.float32), ear)
-        records.append(EarCalibrationRecord(subject_id, ear, landmarks, original_prediction))
     preliminary = calibrate_directional_crops(records)
     geometry = []
     for record in records:
@@ -356,6 +351,148 @@ def command_calibrate(args):
         {"coordinate_frame": "canonical_mm", "center_predictions": prediction_output},
     )
     print(json.dumps(calibration, indent=2, sort_keys=True))
+
+
+def _calibration_records(dataset: Dataset, predictions: Mapping[str, Sequence[float]]):
+    index = {dataset.get_identifier(i): i for i in range(len(dataset))}
+    records = []
+    for key, canonical_prediction in predictions.items():
+        subject_id, ear = key.split(":")
+        if subject_id not in index:
+            raise ValueError(f"prediction references unknown subject {subject_id}")
+        if ear not in {"left", "right"}:
+            raise ValueError(f"prediction key has invalid ear: {key}")
+        _, left, right = dataset[index[subject_id]]
+        landmarks = left if ear == "left" else right
+        original_prediction = decanonicalize_xyz(np.asarray(canonical_prediction, dtype=np.float32), ear)
+        records.append(EarCalibrationRecord(subject_id, ear, landmarks, original_prediction))
+    return records
+
+
+def _require_prediction_keys(
+    predictions: Mapping[str, Sequence[float]], subject_ids: Sequence[str]
+) -> None:
+    expected = {
+        f"{subject_id}:{ear}"
+        for subject_id in subject_ids
+        for ear in ("left", "right")
+    }
+    actual = set(predictions)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(
+            "calibration prediction coverage is incomplete: "
+            f"missing={missing[:5]}, extra={extra[:5]}"
+        )
+
+
+def command_validate_calibration(args):
+    dataset = Dataset(args.mesh_dir, args.landmarks_dir)
+    if args.outer_fold == "all":
+        if not args.folds_json:
+            raise ValueError("--folds-json is required when validating all outer folds")
+        if "{fold}" not in args.calibration_json or "{fold}" not in args.predictions_json:
+            raise ValueError(
+                "--outer-fold all requires {fold} in both calibration and prediction paths"
+            )
+        folds = read_json(args.folds_json)
+        validate_fold_dataset(dataset, folds)
+        fold_reports = []
+        for outer_index in range(5):
+            calibration = read_json(args.calibration_json.format(fold=outer_index))
+            predictions = _load_prediction_map(
+                args.predictions_json.format(fold=outer_index)
+            )
+            validation_subjects = set(
+                select_outer_fold(folds, outer_index)["validation"]
+            )
+            selected = {
+                key: value
+                for key, value in predictions.items()
+                if key.split(":", 1)[0] in validation_subjects
+            }
+            _require_prediction_keys(selected, sorted(validation_subjects))
+            fold_report = evaluate_calibration(
+                _calibration_records(dataset, selected), calibration
+            )
+            fold_report["outer_fold"] = outer_index
+            fold_reports.append(fold_report)
+        ear_count = sum(item["ear_count"] for item in fold_reports)
+        primary_complete = sum(
+            item["primary"]["complete_count"] for item in fold_reports
+        )
+        backup_complete = sum(
+            item["backup"]["complete_count"] for item in fold_reports
+        )
+        report = {
+            "scope": "pooled held-out predictions from all five outer folds",
+            "ear_count": ear_count,
+            "primary": {
+                "complete_count": primary_complete,
+                "coverage": primary_complete / ear_count,
+                "misses": [
+                    miss
+                    for item in fold_reports
+                    for miss in item["primary"]["misses"]
+                ],
+            },
+            "backup": {
+                "complete_count": backup_complete,
+                "coverage": backup_complete / ear_count,
+                "misses": [
+                    miss
+                    for item in fold_reports
+                    for miss in item["backup"]["misses"]
+                ],
+                "is_primary_superset": all(
+                    item["backup"]["is_primary_superset"] for item in fold_reports
+                ),
+            },
+            "folds": fold_reports,
+        }
+    else:
+        calibration = read_json(args.calibration_json)
+        predictions = _load_prediction_map(args.predictions_json)
+        if args.outer_fold == "final":
+            selected = predictions
+            scope = "all full-dataset out-of-fold predictions"
+            subject_ids = [dataset.get_identifier(i) for i in range(len(dataset))]
+            _require_prediction_keys(selected, subject_ids)
+        else:
+            if not args.folds_json:
+                raise ValueError("--folds-json is required when validating an outer fold")
+            outer_index = int(args.outer_fold)
+            folds = read_json(args.folds_json)
+            validate_fold_dataset(dataset, folds)
+            validation_subjects = set(select_outer_fold(folds, outer_index)["validation"])
+            selected = {
+                key: value
+                for key, value in predictions.items()
+                if key.split(":", 1)[0] in validation_subjects
+            }
+            _require_prediction_keys(selected, sorted(validation_subjects))
+            scope = f"outer fold {outer_index} held-out subjects"
+        report = evaluate_calibration(
+            _calibration_records(dataset, selected), calibration
+        )
+        report["scope"] = scope
+
+    report["requirements"] = {
+        "primary_coverage_at_least": 0.99,
+        "backup_coverage": 1.0,
+        "backup_is_primary_superset": True,
+    }
+    report["passed"] = bool(
+        report["primary"]["coverage"] >= 0.99
+        and report["backup"]["coverage"] == 1.0
+        and report["backup"]["is_primary_superset"]
+    )
+    if args.output:
+        write_json(Path(args.output), report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not report["passed"]:
+        raise SystemExit(2)
 
 
 def _load_prediction_map(path: str):
@@ -688,6 +825,19 @@ def build_parser():
     calibrate.add_argument("--outer-fold", default="final", help="0-4 for CV or final")
     calibrate.add_argument("--output", required=True)
     calibrate.set_defaults(function=command_calibrate)
+
+    validate_calibration = subparsers.add_parser("validate-calibration")
+    add_data_arguments(validate_calibration)
+    validate_calibration.add_argument("--calibration-json", required=True)
+    validate_calibration.add_argument("--predictions-json", required=True)
+    validate_calibration.add_argument("--folds-json")
+    validate_calibration.add_argument(
+        "--outer-fold",
+        default="final",
+        help="0-4, all for pooled held-out validation, or final",
+    )
+    validate_calibration.add_argument("--output")
+    validate_calibration.set_defaults(function=command_validate_calibration)
 
     landmarks = subparsers.add_parser("fit-landmarks")
     add_data_arguments(landmarks)
