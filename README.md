@@ -429,17 +429,32 @@ Challenge submissions must include:
 
 ## Visualization and Debugging
 
-Point importance can be exported with:
+The qualitative viewer accepts proposal fold `best_landmarks.pt` checkpoints only.
+It reconstructs the exact held-out OOF-centred validation crop, compares coarse,
+final, and surface-projected landmarks with ground truth, and exports spatial
+gradient/occlusion importance. Existing checkpoints require the original run seed:
 
 ```bash
-python visualize_point_importance.py \
-  --checkpoint-path checkpoints/best_model.pt \
-  --mesh-path /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh/P0001.ply \
-  --method occlusion \
-  --output-dir importance_outputs
+python visualize_point_importance.py single \
+  --checkpoint-path runs/refinement_screen/CANDIDATE/fold0_seed42/best_landmarks.pt \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --folds-json artifacts/folds.json \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --run-seed 42 --subject-id PXXXX --ear both \
+  --output-dir qualitative_outputs/refinement_candidate
 ```
 
-The tool writes colored PLY files and NumPy data files for inspection. The heatmap is a debugging aid, not an official evaluation output.
+Replace `PXXXX` with a subject listed under outer fold 0's `validation` array. The
+viewer deliberately rejects training subjects and mismatched artifacts. To render
+the held-out best, median, and worst ears, replace `single`, `--subject-id`, and
+`--ear` with `gallery`.
+
+Each rendered ear contains PNG and GLB overlays, exact colored PLY inputs, a
+per-landmark CSV, raw NPZ arrays, and a JSON manifest. Importance is based on the
+raw fold prediction; exact surface projection is reported separately and is not
+part of the differentiable importance objective.
 
 For ear-crop runs, inspect the crop PLY files under:
 
@@ -480,7 +495,7 @@ experiment sequence.
 .
 |-- train_pointnet2.py               # Training entry point
 |-- train_pipeline.py                # Proposal-aligned staged pipeline
-|-- visualize_point_importance.py    # Point importance visualization
+|-- visualize_point_importance.py    # Held-out fold qualitative viewer
 |-- submit_job_train_pointnet2.slurm # HPC training script
 |-- src/
 |   |-- dataset.py                   # Mesh and landmark file loading

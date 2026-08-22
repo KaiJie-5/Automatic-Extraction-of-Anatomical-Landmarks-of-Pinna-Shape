@@ -136,7 +136,7 @@ class ProposalLandmarkRegressor(nn.Module):
             else None
         )
 
-    def forward(self, points: torch.Tensor) -> torch.Tensor:
+    def _coarse_prediction(self, points: torch.Tensor) -> torch.Tensor:
         global_features = self.encoder(points)
         if self.four_heads:
             chunks = [
@@ -146,7 +146,16 @@ class ProposalLandmarkRegressor(nn.Module):
             coarse = torch.cat(chunks, dim=1)
         else:
             coarse = self.head(global_features).view(points.shape[0], 85, 3)
-        return self.refiner(coarse, points) if self.refiner is not None else coarse
+        return coarse
+
+    def forward_with_details(self, points: torch.Tensor) -> Mapping[str, torch.Tensor]:
+        """Return coarse and final outputs without changing the training forward API."""
+        coarse = self._coarse_prediction(points)
+        final = self.refiner(coarse, points) if self.refiner is not None else coarse
+        return {"coarse": coarse, "final": final}
+
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_details(points)["final"]
 
 
 def build_locator(config: Mapping[str, object]) -> EarCenterLocator:
@@ -155,3 +164,15 @@ def build_locator(config: Mapping[str, object]) -> EarCenterLocator:
 
 def build_landmark_model(config: Mapping[str, object]) -> ProposalLandmarkRegressor:
     return ProposalLandmarkRegressor(**dict(config))
+
+
+def build_fold_landmark_model(config: Mapping[str, object]) -> nn.Module:
+    """Build any landmark backbone accepted by the proposal fold trainer."""
+    values = dict(config)
+    if values.get("backbone") == "meshnet":
+        from .meshnet import MeshNetLandmarkRegressor
+
+        values.pop("backbone")
+        values.pop("target_faces")
+        return MeshNetLandmarkRegressor(**values)
+    return build_landmark_model(values)

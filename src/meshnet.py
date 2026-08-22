@@ -85,12 +85,12 @@ def run_meshnet_gate(
     }
 
 
-def meshnet_inputs(
+def meshnet_inputs_with_mesh(
     mesh: trimesh.Trimesh,
     target_faces: int,
     ear: str,
     transform: LocalEarTransform,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, trimesh.Trimesh]:
     """Simplify a crop and build MeshNet's 15D face geometry plus 3-neighbour indices."""
     simplified = simplify_for_meshnet(mesh, target_faces)
     valid, reason = validate_meshnet_mesh(simplified)
@@ -113,6 +113,19 @@ def meshnet_inputs(
             slot = min(int(fill[source]), 2)
             neighbors[source, slot] = destination
             fill[source] += 1
+    return features, neighbors, simplified
+
+
+def meshnet_inputs(
+    mesh: trimesh.Trimesh,
+    target_faces: int,
+    ear: str,
+    transform: LocalEarTransform,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Backward-compatible two-array MeshNet input API."""
+    features, neighbors, _ = meshnet_inputs_with_mesh(
+        mesh, target_faces, ear, transform
+    )
     return features, neighbors
 
 
@@ -136,7 +149,7 @@ class MeshNetLandmarkRegressor(nn.Module):
         self.heads = nn.ModuleList([nn.Linear(width * 2, length * 3) for length in lengths])
         self.lengths = lengths
 
-    def forward(self, face_features: torch.Tensor, neighbors: torch.Tensor | None = None):
+    def _prediction(self, face_features: torch.Tensor, neighbors: torch.Tensor | None = None):
         if face_features.shape[1] != 15:
             face_features = face_features.transpose(1, 2)
         features = self.face_stem(face_features)
@@ -150,3 +163,12 @@ class MeshNetLandmarkRegressor(nn.Module):
         pooled = self.face_fusion(torch.cat([features, neighbor_features], dim=1)).amax(dim=-1)
         outputs = [head(pooled).view(face_features.shape[0], length, 3) for head, length in zip(self.heads, self.lengths)]
         return torch.cat(outputs, dim=1)
+
+    def forward_with_details(
+        self, face_features: torch.Tensor, neighbors: torch.Tensor | None = None
+    ) -> Mapping[str, torch.Tensor]:
+        final = self._prediction(face_features, neighbors)
+        return {"coarse": final, "final": final}
+
+    def forward(self, face_features: torch.Tensor, neighbors: torch.Tensor | None = None):
+        return self.forward_with_details(face_features, neighbors)["final"]

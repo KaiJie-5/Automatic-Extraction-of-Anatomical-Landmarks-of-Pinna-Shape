@@ -9,3 +9,4 @@ runs/
 checkpoints/
 slurm-logs/
 predicted_crops/
+qualitative_outputs/

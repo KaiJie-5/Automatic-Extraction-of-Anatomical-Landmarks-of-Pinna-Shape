@@ -29,7 +29,7 @@ from src.canonical import WorldCropBox, canonicalize_xyz, decanonicalize_xyz
 from src.dataset import Dataset
 from src.estimator import LandmarkExtractor
 from src.geometry import clip_mesh_to_box, crop_geometry_stats, sample_canonical_crop
-from src.meshnet import MeshNetLandmarkRegressor, run_meshnet_gate
+from src.meshnet import run_meshnet_gate
 from src.metrics import compute_mean_landmark_distance
 from src.losses import candidate_is_promoted
 from src.pipeline_dataset import (
@@ -40,7 +40,7 @@ from src.pipeline_dataset import (
 )
 from src.pointnet2_model import default_model_config
 from src.pointnext_model import default_pointnext_config
-from src.proposal_models import build_landmark_model, build_locator
+from src.proposal_models import build_fold_landmark_model, build_locator
 from src.splits import folds_from_audit, save_folds
 from src.training import (
     predict_locator,
@@ -60,6 +60,14 @@ DATA_ROOT = PROJECT_ROOT / "data"
 def read_json(path: str):
     with Path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def write_json(path: Path, data) -> None:
@@ -110,12 +118,7 @@ def landmark_model_config(args, local_scale: float) -> dict:
 
 
 def make_landmark_model(config: Mapping[str, object]):
-    if config.get("backbone") == "meshnet":
-        values = dict(config)
-        values.pop("backbone")
-        values.pop("target_faces")
-        return MeshNetLandmarkRegressor(**values)
-    return build_landmark_model(config)
+    return build_fold_landmark_model(config)
 
 
 def make_landmark_dataset(args, predictions, calibration, subject_ids, seed, training):
@@ -528,6 +531,12 @@ def command_fit_landmarks(args):
         "validation_ids": outer["validation"],
         "calibration": calibration,
         "num_points": args.num_points,
+        "seed": args.seed,
+        "artifact_checksums": {
+            "folds_json_sha256": file_sha256(args.folds_json),
+            "predictions_json_sha256": file_sha256(args.predictions_json),
+            "calibration_json_sha256": file_sha256(args.calibration_json),
+        },
         "dense_surface_points": dense_points,
         "augmentation": args.augment,
         "loss_weights": loss_weights,

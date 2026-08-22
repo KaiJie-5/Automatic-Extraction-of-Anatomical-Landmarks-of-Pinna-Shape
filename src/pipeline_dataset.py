@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
 import numpy as np
@@ -18,11 +19,70 @@ from .canonical import (
 )
 from .dataset import Dataset as MeshLandmarkDataset
 from .geometry import sample_canonical_crop
-from .meshnet import meshnet_inputs
+from .meshnet import meshnet_inputs_with_mesh
 from .preprocessing import sample_mesh_surface
 
 
 EAR_NAMES = ("left", "right")
+
+
+@dataclass(frozen=True)
+class PreparedEarGeometry:
+    """Exact deterministic validation geometry shared by datasets and viewers."""
+
+    point_features: np.ndarray
+    sampled_canonical_features: np.ndarray
+    target: np.ndarray
+    canonical_landmarks: np.ndarray
+    center: np.ndarray
+    transform: LocalEarTransform
+    primary_box: WorldCropBox
+    backup_box: WorldCropBox
+    crop_mesh: object
+    crop_stats: Mapping[str, object]
+
+
+def prepare_ear_geometry(
+    mesh,
+    landmarks: np.ndarray,
+    ear: str,
+    center: Sequence[float],
+    calibration: Mapping[str, object],
+    num_points: int,
+    seed: int,
+) -> PreparedEarGeometry:
+    """Prepare one proposal ear exactly as landmark validation/inference expects."""
+    if ear not in EAR_NAMES:
+        raise ValueError(f"unsupported ear: {ear}")
+    canonical_center = np.asarray(center, dtype=np.float32)
+    if canonical_center.shape != (3,) or not np.isfinite(canonical_center).all():
+        raise ValueError("predicted ear centre must be a finite three-value vector")
+    primary, backup = boxes_for_prediction(canonical_center, calibration)
+    sampled, crop_mesh, stats = sample_canonical_crop(
+        mesh,
+        primary,
+        ear,
+        int(num_points),
+        int(seed),
+        fallback_box=backup,
+        thresholds=calibration.get("fallback_thresholds"),
+    )
+    transform = LocalEarTransform(canonical_center, float(calibration["local_scale"]))
+    canonical_landmarks = canonicalize_xyz(landmarks, ear).astype(np.float32)
+    point_features = transform.normalize_features(sampled).astype(np.float32)
+    target = transform.normalize_xyz(canonical_landmarks).astype(np.float32)
+    return PreparedEarGeometry(
+        point_features=point_features,
+        sampled_canonical_features=sampled.astype(np.float32),
+        target=target,
+        canonical_landmarks=canonical_landmarks,
+        center=canonical_center,
+        transform=transform,
+        primary_box=primary,
+        backup_box=backup,
+        crop_mesh=crop_mesh,
+        crop_stats=dict(stats),
+    )
 
 
 def prediction_key(subject_id: str, ear: str) -> str:
@@ -149,19 +209,12 @@ class EarLandmarkDataset(EpochResampledDataset):
         mesh, left, right = self.base[base_index]
         landmarks = left if ear == "left" else right
         center = self.predictions[prediction_key(subject_id, ear)]
-        primary, backup = boxes_for_prediction(center, self.calibration)
-        features, crop_mesh, stats = sample_canonical_crop(
-            mesh,
-            primary,
-            ear,
-            self.num_points,
+        prepared = prepare_ear_geometry(
+            mesh, landmarks, ear, center, self.calibration, self.num_points,
             self.sample_seed(item),
-            fallback_box=backup,
-            thresholds=self.calibration.get("fallback_thresholds"),
         )
-        transform = LocalEarTransform(center, self.local_scale)
-        features = transform.normalize_features(features)
-        target = transform.normalize_xyz(canonicalize_xyz(landmarks, ear))
+        features = prepared.point_features.copy()
+        target = prepared.target.copy()
         rng = np.random.default_rng(self.sample_seed(item, stream=1))
         augmentation_scale = 1.0
         if self.augment:
@@ -177,16 +230,16 @@ class EarLandmarkDataset(EpochResampledDataset):
             "center": torch.from_numpy(center.astype(np.float32)),
             "identifier": subject_id,
             "ear": ear,
-            "used_backup": stats["used_backup"],
+            "used_backup": prepared.crop_stats["used_backup"],
         }
         if self.dense_surface_points:
             dense = sample_mesh_surface(
-                crop_mesh,
+                prepared.crop_mesh,
                 num_points=self.dense_surface_points,
                 seed=self.sample_seed(item, stream=2),
             )
             dense = canonicalize_point_features(dense, ear)
-            dense_local = transform.normalize_xyz(dense[:, :3]) * augmentation_scale
+            dense_local = prepared.transform.normalize_xyz(dense[:, :3]) * augmentation_scale
             result["dense_surface"] = torch.from_numpy(dense_local.astype(np.float32))
         return result
 
@@ -206,39 +259,31 @@ class EarMeshLandmarkDataset(EarLandmarkDataset):
         mesh, left, right = self.base[base_index]
         landmarks = left if ear == "left" else right
         center = self.predictions[prediction_key(subject_id, ear)]
-        primary, backup = boxes_for_prediction(center, self.calibration)
-        _, crop_mesh, stats = sample_canonical_crop(
-            mesh,
-            primary,
-            ear,
-            num_points=1,
-            seed=self.sample_seed(item),
-            fallback_box=backup,
-            thresholds=self.calibration.get("fallback_thresholds"),
+        prepared = prepare_ear_geometry(
+            mesh, landmarks, ear, center, self.calibration, 1,
+            self.sample_seed(item),
         )
-        transform = LocalEarTransform(center, self.local_scale)
-        face_features, neighbors = meshnet_inputs(
-            crop_mesh, self.target_faces, ear, transform
+        face_features, neighbors, _ = meshnet_inputs_with_mesh(
+            prepared.crop_mesh, self.target_faces, ear, prepared.transform
         )
-        target = transform.normalize_xyz(canonicalize_xyz(landmarks, ear))
         result = {
             "face_features": torch.from_numpy(face_features),
             "neighbors": torch.from_numpy(neighbors),
-            "landmarks": torch.from_numpy(target.astype(np.float32)),
+            "landmarks": torch.from_numpy(prepared.target.astype(np.float32)),
             "scale": torch.tensor(self.local_scale, dtype=torch.float32),
             "center": torch.from_numpy(center.astype(np.float32)),
             "identifier": subject_id,
             "ear": ear,
-            "used_backup": stats["used_backup"],
+            "used_backup": prepared.crop_stats["used_backup"],
         }
         if self.dense_surface_points:
             dense = sample_mesh_surface(
-                crop_mesh,
+                prepared.crop_mesh,
                 num_points=self.dense_surface_points,
                 seed=self.sample_seed(item, stream=2),
             )
             dense = canonicalize_point_features(dense, ear)
             result["dense_surface"] = torch.from_numpy(
-                transform.normalize_xyz(dense[:, :3]).astype(np.float32)
+                prepared.transform.normalize_xyz(dense[:, :3]).astype(np.float32)
             )
         return result
