@@ -36,18 +36,27 @@ pip install -r requirements.txt
 For details on how to use the provided code resources, see the [Jupyter notebook](getting_started.ipynb).
 
 
-# Evaluation
+## Evaluation
 
-All submitted models will be evaluated on an undisclosed set of subjects. The performance of this task is evaluated by comparing the predicted landmarks with the ground truth landmarks.
+The official score is the mean Euclidean distance between predicted and ground-truth landmarks.
 
-Given a set of $N$ ground truth landmarks for one ear of subject $j$, $$L^{j, ear}_{gt} = \{ l^{j, ear}_{gt, 1}, l^{j, ear}_{gt, 2},\ldots l^{j, ear}_{gt, N} \},$$ and a set of $N$ predicted landmarks, $$L^{j,ear}_{out} = \{ l^{j, ear}_{out, 1}, l^{j, ear}_{out, 2},\ldots,l^{j, ear}_{out, N} \},$$ where and $l^{j, ear}_{gt, i}, l^{j, ear}_{out, i} \in \mathbb{R}^3$ represent the coordinates of the $i^{th}$ landmark in each set.
+For one ear of subject `j`, with `N` landmarks:
 
-The mean Euclidean distance for a single set of landmarks is computed by
-$$ d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right) =\frac{1}{N} \sum_{i=1}^{N} \left\lVert l^{j, ear}_{out, i} - l^{j, ear}_{gt, i} \right\rVert $$
+$$
+d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right)
+=\frac{1}{N} \sum_{i=1}^{N}
+\left\lVert l^{j, ear}_{out, i} - l^{j, ear}_{gt, i} \right\rVert
+$$
 
-The overall performance is then computed by averaging those distances across all $M$ subjects and all ears of the hidden test set: $$ MD =\frac{1}{2M} \sum_{j=1}^{M} \sum_{ear}  d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right), $$ with $ear \in \{ \text{left}, \text{right} \}$.
+The final score averages this distance across all hidden test subjects and both ears:
 
-This metric is implemented in the [`metrics.py`](src/metrics.py) module.
+$$
+MD =\frac{1}{2M} \sum_{j=1}^{M} \sum_{ear}
+d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right),
+\quad ear \in \{left, right\}
+$$
+
+This metric is implemented in [`src/metrics.py`](src/metrics.py).
 
 
 # Submission
