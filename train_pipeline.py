@@ -739,6 +739,144 @@ def command_meshnet_gate(args):
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def command_evaluate_projection(args):
+    """Compare raw and exact surface-projected outputs on one held-out fold."""
+    # Reuse the strictly validated fold reconstruction used by the qualitative
+    # viewer so evaluation and visualization cannot silently preprocess an ear
+    # differently from landmark validation.
+    from src.surface import project_points_to_mesh
+    from visualize_point_importance import (
+        EAR_NAMES,
+        load_fold_context,
+        prepare_trace,
+    )
+
+    context = load_fold_context(args)
+    raw_errors = []
+    projected_errors = []
+    projection_displacements = []
+    projection_timings_ms = []
+    per_ear = {}
+    total = len(context.validation_ids) * len(EAR_NAMES)
+    completed = 0
+
+    for subject_id in context.validation_ids:
+        for ear in EAR_NAMES:
+            trace = prepare_trace(
+                context, subject_id, ear, include_projection=False
+            )
+            start = time.perf_counter()
+            projected = project_points_to_mesh(
+                trace.final_world, trace.prepared.crop_mesh
+            )
+            projection_timings_ms.append((time.perf_counter() - start) * 1000.0)
+            projected = np.asarray(projected, dtype=np.float32)
+            if projected.shape != (85, 3) or not np.isfinite(projected).all():
+                raise RuntimeError(
+                    f"surface projection failed for {subject_id}:{ear}"
+                )
+
+            raw = np.asarray(trace.raw_errors_mm, dtype=np.float64)
+            projected_error = np.linalg.norm(
+                projected.astype(np.float64)
+                - trace.ground_truth_world.astype(np.float64),
+                axis=1,
+            )
+            displacement = np.linalg.norm(
+                projected.astype(np.float64)
+                - trace.final_world.astype(np.float64),
+                axis=1,
+            )
+            if (
+                raw.shape != (85,)
+                or projected_error.shape != (85,)
+                or not np.isfinite(raw).all()
+                or not np.isfinite(projected_error).all()
+                or not np.isfinite(displacement).all()
+            ):
+                raise RuntimeError(
+                    f"projection metrics are invalid for {subject_id}:{ear}"
+                )
+
+            raw_errors.append(raw)
+            projected_errors.append(projected_error)
+            projection_displacements.append(displacement)
+            raw_md = float(np.mean(raw))
+            projected_md = float(np.mean(projected_error))
+            per_ear[prediction_key(subject_id, ear)] = {
+                "raw_md_mm": raw_md,
+                "projected_md_mm": projected_md,
+                "delta_mm": projected_md - raw_md,
+                "mean_projection_displacement_mm": float(np.mean(displacement)),
+                "backup_triggered": bool(
+                    trace.prepared.crop_stats.get("used_backup", False)
+                ),
+            }
+            completed += 1
+            print(
+                f"Evaluated projection {completed}/{total}: "
+                f"{subject_id}:{ear} raw={raw_md:.6f} mm "
+                f"projected={projected_md:.6f} mm"
+            )
+
+    raw_array = np.stack(raw_errors)
+    projected_array = np.stack(projected_errors)
+    displacement_array = np.stack(projection_displacements)
+    raw_pooled = float(np.mean(raw_array))
+    projected_pooled = float(np.mean(projected_array))
+    delta = projected_pooled - raw_pooled
+    report = {
+        "schema_version": 1,
+        "component": "fold_surface_projection_evaluation",
+        "checkpoint_path": str(context.checkpoint_path),
+        "checkpoint_sha256": file_sha256(context.checkpoint_path),
+        "outer_fold": int(context.outer_fold),
+        "run_seed": int(context.run_seed),
+        "backbone": context.backbone,
+        "provenance_level": context.provenance_level,
+        "subject_count": len(context.validation_ids),
+        "ear_count": len(per_ear),
+        "raw": {
+            "pooled_md_mm": raw_pooled,
+            "per_landmark_md_mm": np.mean(raw_array, axis=0).tolist(),
+        },
+        "projected": {
+            "pooled_md_mm": projected_pooled,
+            "per_landmark_md_mm": np.mean(projected_array, axis=0).tolist(),
+        },
+        "comparison": {
+            "delta_mm": delta,
+            "relative_change_percent": (
+                float(100.0 * delta / raw_pooled) if raw_pooled > 0 else 0.0
+            ),
+            "improved_ears": int(
+                sum(
+                    item["projected_md_mm"] < item["raw_md_mm"]
+                    for item in per_ear.values()
+                )
+            ),
+            "mean_projection_displacement_mm": float(
+                np.mean(displacement_array)
+            ),
+        },
+        "runtime": {
+            "projection_median_ms_per_ear": float(
+                np.median(projection_timings_ms)
+            ),
+            "projection_mean_ms_per_ear": float(
+                np.mean(projection_timings_ms)
+            ),
+        },
+        "per_ear": per_ear,
+    }
+    write_json(Path(args.output), report)
+    print(
+        f"Fold {context.outer_fold} seed {context.run_seed}: "
+        f"raw={raw_pooled:.6f} mm, projected={projected_pooled:.6f} mm, "
+        f"delta={delta:+.6f} mm"
+    )
+
+
 def command_package(args):
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != 2:
@@ -878,6 +1016,17 @@ def build_parser():
     evaluate.add_argument("--seed", type=int, default=42)
     evaluate.add_argument("--device", default="auto")
     evaluate.set_defaults(function=command_evaluate)
+
+    projection = subparsers.add_parser("evaluate-projection")
+    add_data_arguments(projection)
+    projection.add_argument("--checkpoint-path", required=True)
+    projection.add_argument("--predictions-json", required=True)
+    projection.add_argument("--calibration-json", required=True)
+    projection.add_argument("--folds-json", required=True)
+    projection.add_argument("--run-seed", type=int)
+    projection.add_argument("--output", required=True)
+    projection.add_argument("--device", default="auto")
+    projection.set_defaults(function=command_evaluate_projection)
 
     gate = subparsers.add_parser("meshnet-gate")
     add_data_arguments(gate)

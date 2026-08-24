@@ -1,3 +1,4 @@
+import argparse
 import csv
 import hashlib
 import json
@@ -7,6 +8,7 @@ import pytest
 import torch
 import trimesh
 
+from train_pipeline import command_evaluate_projection
 from src.meshnet import meshnet_inputs_with_mesh
 from src.pipeline_dataset import (
     EarLandmarkDataset,
@@ -245,6 +247,34 @@ def test_viewer_reproduces_validation_dataset_sample_and_prediction(tmp_path, ea
     with torch.no_grad():
         direct = context.model(expected["points"].unsqueeze(0)).squeeze(0).numpy()
     assert np.array_equal(trace.final_local, direct)
+
+
+def test_quantitative_projection_evaluation_covers_the_held_out_fold(tmp_path):
+    paths = _make_artifacts(tmp_path, stored_seed=True, hashes=True)
+    output = tmp_path / "projection_evaluation.json"
+    args = argparse.Namespace(
+        checkpoint_path=str(paths["checkpoint"]),
+        predictions_json=str(paths["predictions"]),
+        calibration_json=str(paths["calibration"]),
+        folds_json=str(paths["folds"]),
+        mesh_dir=str(paths["mesh_dir"]),
+        landmarks_dir=str(paths["landmarks_dir"]),
+        run_seed=None,
+        output=str(output),
+        device="cpu",
+    )
+    command_evaluate_projection(args)
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["component"] == "fold_surface_projection_evaluation"
+    assert report["outer_fold"] == 0
+    assert report["run_seed"] == 42
+    assert report["subject_count"] == 1
+    assert report["ear_count"] == 2
+    assert set(report["per_ear"]) == {"VAL:left", "VAL:right"}
+    assert len(report["raw"]["per_landmark_md_mm"]) == 85
+    assert len(report["projected"]["per_landmark_md_mm"]) == 85
+    assert np.isfinite(report["raw"]["pooled_md_mm"])
+    assert np.isfinite(report["projected"]["pooled_md_mm"])
 
 
 def test_forward_with_details_preserves_point_and_mesh_model_outputs():

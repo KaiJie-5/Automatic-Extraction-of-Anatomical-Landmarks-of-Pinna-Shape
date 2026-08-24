@@ -456,6 +456,26 @@ per-landmark CSV, raw NPZ arrays, and a JSON manifest. Importance is based on th
 raw fold prediction; exact surface projection is reported separately and is not
 part of the differentiable importance objective.
 
+Quantitatively compare raw and exact surface-projected predictions on every
+held-out ear for one fold checkpoint with:
+
+```bash
+python train_pipeline.py evaluate-projection \
+  --checkpoint-path runs/pointnext_s/fold0_seed42/best_landmarks.pt \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --folds-json artifacts/folds.json \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --run-seed 42 \
+  --output runs/projection/pointnext_s/fold0_seed42.json \
+  --device auto
+```
+
+The output records pooled and per-landmark raw/projected MD, every held-out
+ear's scores, projection displacement, and projection-only runtime. Apply the
+same five-fold/three-seed promotion rule before enabling final-model projection.
+
 For ear-crop runs, inspect the crop PLY files under:
 
 ```text
