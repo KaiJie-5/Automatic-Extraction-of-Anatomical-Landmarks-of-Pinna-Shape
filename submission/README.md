@@ -1,122 +1,101 @@
-# Tech Arena 2026
+# 3D Pinna Landmark Extraction — Runtime Instructions
 
-The goal of this challenge is to extract landmarks for the pinna shape from the 3D head scans of a human subject. The submitted models are expected to accept a 3D mesh as the input and output precise landmarks of the pinna shape as illustrated in Figure below.
+This submission predicts 85 ordered landmarks for the left ear and 85 ordered landmarks for the right ear from an aligned triangular 3D head mesh.
 
-![system_overview](img/Overview.png)
+The evaluation entry point is:
 
-
-For this task, the 3D meshes provided are aligned along the interaural axis as
-- The Y-axis runs along the left ear canal to the right ear canal entrance. 
-- The X-axis is from the back of the head to the front of the head, passing the tip of the nose. 
-- The Z-axis runs vertically towards the top of the head.
-- The center of the head is defined by the intersection of the above-defined X, Y, and Z axes. 
-
-
-This anatomical alignment ensures that all annotations are made consistently across subjects.
-
-# Preparation
-
-## Dataset
-
-A dataset consisting of 3D meshes of the head and torso for 200 subjects along with 85 landmarks of the left and right pinna is provided.
-
-**To obtain access to the dataset, a *data sharing permission form* needs to be signed by all team members. The form can be obtained by navigating to the *submission section* of your team. Please download the form, fill in the names of *all* team members as well as their signatures, and upload the signed document on the same page. Please also provide a single email address of one of the team members to which the download information will be sent.**
-
-**After submission of the signed form, you will receive an email giving you access to the datasets. We try to keep the time between submission and access as short as possible, but since there is manual work involved, it might take several days before you can access the data.**
-
-
-## Code
-
-Set up your python environment and install all required packages.
-
-```bash
-pip install -r requirements.txt
+```python
+from src.estimator import LandmarkExtractor
 ```
 
-For details on how to use the provided code resources, see the [Jupyter notebook](getting_started.ipynb).
+The trained locator, PointNeXt landmark model, crop calibration, coordinate transforms, deterministic sampling settings, and surface-projection settings are bundled in:
+
+```text
+checkpoints/final_pipeline.pt
+```
+
+## 1. Verified environment
+
+The submission was prepared and verified with the following environment:
+
+| Component | Version |
+|---|---:|
+| Python | 3.10.20 |
+| pip | 26.1.2 |
+| PyTorch | 2.9.1+cu128 |
+| CUDA used by PyTorch | 12.8 |
+| cuDNN | 91002 |
+| NumPy | 2.2.6 |
+| trimesh | 4.12.2 |
+| SciPy | 1.15.3 |
+| Matplotlib | 3.10.9 |
+| K3D | 2.17.0 |
+| ipykernel | 7.2.0 |
 
 
-## Evaluation
+## 2. Create the Conda environment
 
-The official score is the mean Euclidean distance between predicted and ground-truth landmarks.
+Open a terminal and change to the extracted submission directory:
 
-For one ear of subject `j`, with `N` landmarks:
+```bash
+cd /absolute/path/to/submission
+```
 
-$$
-d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right)
-=\frac{1}{N} \sum_{i=1}^{N}
-\left\lVert l^{j, ear}_{out, i} - l^{j, ear}_{gt, i} \right\rVert
-$$
+Create and activate the Conda environment:
 
-The final score averages this distance across all hidden test subjects and both ears:
+```bash
+conda create --name anthropometric_env python=3.10.20 -y
+conda activate anthropometric_env
+```
 
-$$
-MD =\frac{1}{2M} \sum_{j=1}^{M} \sum_{ear}
-d\left(L^{j, ear}_{out}, L^{j, ear}_{gt}\right),
-\quad ear \in \{left, right\}
-$$
+Upgrade pip to the verified version:
 
-This metric is implemented in [`src/metrics.py`](src/metrics.py).
+```bash
+python -m pip install --upgrade pip==26.1.2
+```
 
+Install the CUDA 12.8 PyTorch build:
 
-# Submission
+```bash
+python -m pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+```
 
-Systems need to be submitted through the challenge platform, and can be updated at any time before the end of the challenge. Only the latest submission will be considered for each team and will be displayed on the leaderboard of the challenge.
+Install the remaining dependencies:
 
-Each submitted model needs to implement the `LandmarkExtractor` class in the [`estimator.py`](src/estimator.py) module. This class will be used for automatic evaluation on a hidden test data set, and the score will be reported on the leaderboard.
+```bash
+python -m pip install -r requirements.txt
+```
 
-The final submission at the end of the challenge must include:
-1. the source code to extract pinna landmarks for left and right pinna.
-2. a brief documentation of the algorithm
-3. for AI-based solutions: the training code as well as a reference to any additional datasets used.
+Verify that the environment has no broken dependencies:
 
+```bash
+python -m pip check
+```
 
-# Background
+The expected result is:
 
-*Binaural audio rendering* is the process of simulating sound sources in 3D space around a listener. It is not only used for virtual reality and augmented reality applications, but has made its way into mobile devices to provide immersive user experiences when listening to audio content (music, movies, radio play, etc.). 
+```text
+No broken requirements found.
+```
 
-In order to provide the illusion of sounds coming from various directions, sound source signals are convolved with so-called *head-related transfer functions (HRTFs)*. Those HRTFs encode the relevant binaural cues that let the listener perceive the sound from a certain direction.
+## 3. Verify Python and GPU access
 
-However, HRTFs are influenced by the human anatomy. The pinna for example causes direction-dependent sound reflections and the head causes frequency-dependent sound attenuation due to shadowing effects. Therefore, HRTFs of individuals differ due to anatomic differences. Listening to rendered audio content using HRTFs of a different individual can have a detrimental effect on the perceived sound quality, and can lead to inaccurate localization and an undesired sound color. Hence there is a demand for obtaining *individual HRTFs* to provide personalized audio rendering.
+Check the Python version:
 
-Obtaining accurate individual HRTFs usually requires time-consuming acoustic measurements and does not scale to a large user group. A cost-effective alternative would be to individualize the HRTFs based on anthropometric shapes which can be extracted from the 3D scans. 
+```bash
+python --version
+```
 
-The goal of this challenge is to extract the landmarks for the pinna shape from the 3D scans of a human subject.
+Check PyTorch, CUDA, cuDNN, and the available GPU:
 
-# Pinna Landmarks
+```bash
+python -c "import torch; print('PyTorch:', torch.__version__); print('Built CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('cuDNN:', torch.backends.cudnn.version()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+```
 
-The pinna (or auricle) is the outer ear that captures sound waves and directs them into the ear canal. Pinna plays a key role in the perception of sound, and its effect is unique to each individual. 
+When running on a GPU node, `CUDA available` should normally be `True`.
 
-The pinna is comprised of following primary components: the helix $\rightarrow$ which forms the ear's overall shape, the antihelix $\rightarrow$ an inner, curved ridge that runs parallel to the helix, and the concha $\rightarrow$ a deep, bowl-shaped hollow adjacent to the ear canal entrance, as illustrated in below Figure.
+Verify the principal imports:
 
-<img align = "center" src="img/KEMAR_pinna_parts.png" width="300" />  
-<br />
-<br />
-
-The provided pinna anthropometric landmarks can be divided into four distinct pinna contours: the *outer helix*, *outer concha*, *inner helix*, and *superior antihelix*. Each contour consists of two or more *anchor* landmarks that have clearly defined locations on the pinna surface. In between those anchor landmarks, the remaining landmarks are equally distributed, i.e. consecutive landmarks between anchor landmarks all have the same distance. The following section details the positions of the anchor landmarks on each contour.
-
-
-## Anchor points
-
-| (i) Outer helix contours with 4 fixed point landmarks  | Visualization (25 landmarks) |
-| :--- | :--- |
-| <ul><li>Index 0: *upper connection of helix with head, at the center of the ridge.*</li><li>Index 6: *upper point of the largest extent of the outer helix, annotated on the top of the ridge.*</li><li>Index 22: *lower point of the largest extent of the outer helix, annotated on the top of the ridge.*</li><li>Index 24: *lower connection of helix with head, at the center of the ridge.*</li></ul> | <img align = "center" src="img/outerhelix.png" width="200" /> |
-
-
-| (ii) Concha outline with 6 fixed point landmarks | Visualization (30 landmarks) |
-| :--- | :--- |
-| <ul><li> Index 25: *connection of concha with helix at 90º view*  </li><li> Index 33: *junction of fossa (actually: crura of antihelix) and outer concha contour*.</li><li> Index 42: *antitragus (at highest curvature)*.</li><li> Index 46: *saddle point below tragus* .</li><li> Index 50: *tragus (at highest curvature)*.</li><li> Index 54 *saddle point above tragus*.</li></ul> | <img align = "center" src="img/conchaoutline.png" width="200" /> |
-
-| (iii) Inner helix with 3 fixed point landmarks | Visualization (20 landmarks) |
-| :--- | :--- |
-| <ul><li> Index 55: *inner helix ridge at height of concha start*.</li><li> Index 64: *point opposite the highest point of the outer helix*.</li><li>Index 74: *end point of the continuation of the contour line for another 10 points with the same neighbor distance*.</li></ul> | <img align = "center" src="img/innerhelix.png" width="200" /> |
-
-| (iv) Superior Antihelix with 2 fixed point landmarks| Visualization (10 landmarks) |
-| :--- | :--- |
-| <ul><li> Index 75: *junction of fossa (actually: crura of antihelix) and outer concha contour*.</li><li> Index 84: *connection of fossa (actually: crura of antihelix) with helix*.</li></ul> | <img align = "center" src="img/superiorantihelix.png" width="200" /> |
-
-
-<br />
-<br />
-
-Since each landmark is a point in 3D space, a full set of landmarks for a single ear can be represented by a matrix of size 85 x 3.
+```bash
+python -c "import torch, numpy, trimesh, scipy; from src.estimator import LandmarkExtractor; print('Imports successful')"
+```
