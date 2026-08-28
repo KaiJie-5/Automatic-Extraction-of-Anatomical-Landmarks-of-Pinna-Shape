@@ -28,11 +28,11 @@ from src.losses import (
 from src.meshnet import validate_meshnet_mesh
 from src.estimator import LandmarkExtractor
 from src.pipeline_dataset import EpochResampledDataset
-from src.pointnext_model import PointNeXtEncoder
+from src.pointnext_model import PointNeXtEncoder, default_pointnext_config
 from src.proposal_models import ProposalLandmarkRegressor
 from src.splits import make_nested_folds
 from src.surface import project_points_to_mesh
-from train_pipeline import build_parser
+from train_pipeline import build_parser, landmark_model_config
 
 
 def _write_landmarks(path, points):
@@ -259,6 +259,83 @@ def test_pointnext_portable_forward_shape():
     with torch.no_grad():
         output = encoder(torch.randn(2, 64, 6))
     assert output.shape == (2, 8 * 16)
+
+
+def test_pointnext_width_is_cli_tunable_and_checkpoint_ready():
+    parser = build_parser()
+    common = [
+        "fit-landmarks",
+        "--folds-json",
+        "folds.json",
+        "--outer-fold",
+        "0",
+        "--predictions-json",
+        "predictions.json",
+        "--calibration-json",
+        "calibration.json",
+        "--output-dir",
+        "runs/pointnext",
+        "--backbone",
+        "pointnext",
+    ]
+    default_args = parser.parse_args(common)
+    c64_args = parser.parse_args([*common, "--pointnext-width", "64"])
+    final_args = parser.parse_args(
+        [
+            "fit-final",
+            "--locator-run-root",
+            "runs/locator_cv",
+            "--calibration-json",
+            "calibration.json",
+            "--locator-epochs",
+            "100",
+            "--landmark-epochs",
+            "100",
+            "--backbone",
+            "pointnext",
+            "--pointnext-width",
+            "64",
+        ]
+    )
+
+    default_config = landmark_model_config(default_args, local_scale=40.0)
+    c64_config = landmark_model_config(c64_args, local_scale=40.0)
+    final_config = landmark_model_config(final_args, local_scale=40.0)
+    assert default_args.pointnext_width == 32
+    assert default_config["encoder_config"]["width"] == 32
+    assert c64_args.pointnext_width == 64
+    assert c64_config["encoder_config"]["width"] == 64
+    assert final_config["encoder_config"]["width"] == 64
+    assert PointNeXtEncoder(**c64_config["encoder_config"]).feature_dim == 1024
+
+
+def test_pointnext_width_rejects_nonpositive_values():
+    assert default_pointnext_config()["width"] == 32
+    assert default_pointnext_config(64)["width"] == 64
+    with pytest.raises(ValueError, match="positive integer"):
+        default_pointnext_config(0)
+
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "fit-landmarks",
+                "--folds-json",
+                "folds.json",
+                "--outer-fold",
+                "0",
+                "--predictions-json",
+                "predictions.json",
+                "--calibration-json",
+                "calibration.json",
+                "--output-dir",
+                "runs/invalid",
+                "--backbone",
+                "pointnext",
+                "--pointnext-width",
+                "0",
+            ]
+        )
 
 
 def test_proposal_losses_have_expected_zero_and_positive_terms():

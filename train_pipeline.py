@@ -120,7 +120,9 @@ def landmark_model_config(args, local_scale: float) -> dict:
     if args.backbone == "pointnet2":
         encoder = pointnet_encoder_config()
     elif args.backbone == "pointnext":
-        encoder = default_pointnext_config()
+        encoder = default_pointnext_config(
+            width=int(getattr(args, "pointnext_width", 32))
+        )
     elif args.backbone == "pointtransformerv3":
         if not getattr(args, "amp", True):
             raise ValueError(
@@ -1243,6 +1245,13 @@ def add_runtime_arguments(parser):
     parser.add_argument("--no-resume", action="store_true")
 
 
+def positive_integer(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def add_landmark_model_arguments(parser):
     parser.add_argument(
         "--backbone",
@@ -1255,6 +1264,15 @@ def add_landmark_model_arguments(parser):
         choices=(0.01, 0.02),
         default=0.01,
         help="normalized PTv3 voxel size; ignored by other backbones",
+    )
+    parser.add_argument(
+        "--pointnext-width",
+        type=positive_integer,
+        default=32,
+        help=(
+            "base channel width for the PointNeXt landmark encoder "
+            "(C32=32, C64=64); ignored by other backbones"
+        ),
     )
     parser.add_argument("--meshnet-gate-json")
     parser.add_argument("--four-heads", action=argparse.BooleanOptionalAction, default=True)

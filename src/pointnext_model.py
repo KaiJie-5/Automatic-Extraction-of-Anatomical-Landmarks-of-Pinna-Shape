@@ -84,7 +84,7 @@ class PointNeXtSetAbstraction(nn.Module):
 
 
 class PointNeXtEncoder(nn.Module):
-    """C32/B0-style five-stage global encoder for crop-local point features."""
+    """Width-tunable B0-style five-stage encoder for crop-local point features."""
 
     def __init__(
         self,
@@ -98,8 +98,11 @@ class PointNeXtEncoder(nn.Module):
         expansion: int = 4,
     ):
         super().__init__()
+        width = int(width)
+        if width <= 0:
+            raise ValueError("PointNeXt width must be a positive integer")
         if tuple(blocks) != (1, 1, 1, 1, 1):
-            raise ValueError("portable PointNeXt currently implements the C32/B0 block layout")
+            raise ValueError("portable PointNeXt currently implements the B0 block layout")
         if len(strides) != 5:
             raise ValueError("PointNeXt requires five stride entries")
         self.input_channels = int(input_channels)
@@ -137,10 +140,13 @@ class PointNeXtEncoder(nn.Module):
         return features.amax(dim=1)
 
 
-def default_pointnext_config() -> dict:
+def default_pointnext_config(width: int = 32) -> dict:
+    width = int(width)
+    if width <= 0:
+        raise ValueError("PointNeXt width must be a positive integer")
     return {
         "input_channels": 6,
-        "width": 32,
+        "width": width,
         "strides": [1, 4, 4, 4, 4],
         "blocks": [1, 1, 1, 1, 1],
         "radius": 0.1,

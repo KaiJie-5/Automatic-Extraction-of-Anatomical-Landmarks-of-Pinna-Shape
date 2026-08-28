@@ -155,6 +155,15 @@ python train_pipeline.py fit-landmarks \
   --output-dir runs/fold0_pointnet2_four_heads --four-heads --amp
 ```
 
+The portable PointNeXt landmark encoder defaults to width C32. Its base width
+is tunable with `--pointnext-width`; for example, pass
+`--backbone pointnext --pointnext-width 64` for C64. The value must be a
+positive integer and is saved in `model_config.encoder_config.width`, so fold
+visualisation, projection evaluation, final training, and v2 inference rebuild
+the matching architecture automatically. Use a new output directory for each
+width rather than resuming a C32 checkpoint as C64. Widths divisible by eight
+are recommended for GPU efficiency.
+
 After the registered five-fold/three-seed comparisons select a configuration, use
 the cross-validation best epochs to retrain and package one deterministic model:
 
