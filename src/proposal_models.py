@@ -21,6 +21,10 @@ def _make_encoder(backbone: str, config: Mapping[str, object]):
         return PointNet2FeatureEncoder(**dict(config))
     if name == "pointnext":
         return PointNeXtEncoder(**dict(config))
+    if name == "pointtransformerv3":
+        from .pointtransformerv3_model import PointTransformerV3Encoder
+
+        return PointTransformerV3Encoder(**dict(config))
     raise ValueError(f"unsupported point backbone: {backbone}")
 
 

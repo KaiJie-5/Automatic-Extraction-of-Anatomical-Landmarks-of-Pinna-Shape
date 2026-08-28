@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.metadata
 import json
+import platform
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -40,6 +44,10 @@ from src.pipeline_dataset import (
 )
 from src.pointnet2_model import default_model_config
 from src.pointnext_model import default_pointnext_config
+from src.pointtransformerv3_model import (
+    PTV3_UPSTREAM_REVISION,
+    default_pointtransformerv3_config,
+)
 from src.proposal_models import build_fold_landmark_model, build_locator
 from src.splits import folds_from_audit, save_folds
 from src.training import (
@@ -105,7 +113,14 @@ def landmark_model_config(args, local_scale: float) -> dict:
             "width": 128,
             "four_heads": bool(args.four_heads),
         }
-    encoder = pointnet_encoder_config() if args.backbone == "pointnet2" else default_pointnext_config()
+    if args.backbone == "pointnet2":
+        encoder = pointnet_encoder_config()
+    elif args.backbone == "pointnext":
+        encoder = default_pointnext_config()
+    elif args.backbone == "pointtransformerv3":
+        encoder = default_pointtransformerv3_config(args.ptv3_grid_size)
+    else:
+        raise ValueError(f"unsupported landmark backbone: {args.backbone}")
     return {
         "backbone": args.backbone,
         "encoder_config": encoder,
@@ -892,6 +907,200 @@ def command_evaluate_projection(args):
     )
 
 
+def _installed_version(distribution: str) -> str | None:
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def command_ptv3_preflight(args):
+    """Fail-fast H200 gate for the exact optional PTv3 dependency stack."""
+
+    output = Path(args.output)
+    device = resolve_device(args.device)
+    report = {
+        "schema_version": 1,
+        "component": "pointtransformerv3_preflight",
+        "passed": False,
+        "upstream_revision": PTV3_UPSTREAM_REVISION,
+        "environment": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "cuda_available": torch.cuda.is_available(),
+            "bf16_supported": bool(
+                torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            ),
+            "distributions": {
+                name: _installed_version(name)
+                for name in (
+                    "addict",
+                    "timm",
+                    "spconv-cu118",
+                    "torch-scatter",
+                    "flash-attn",
+                )
+            },
+        },
+        "required_configuration": {
+            "num_points": int(args.num_points),
+            "grid_sizes": [float(value) for value in args.grid_size],
+            "flash_attention": True,
+            "autocast_dtype": "bfloat16",
+            "full_encoder_decoder": True,
+            "global_pool": "max",
+            "refinement_k": 32,
+        },
+        "expected_environment": {
+            "python": "3.10",
+            "torch": "2.1.0",
+            "torch_cuda": "11.8",
+            "distributions": {
+                "addict": "2.4.0",
+                "timm": "0.9.16",
+                "spconv-cu118": "2.3.8",
+                "torch-scatter": "2.1.2",
+                "flash-attn": "2.5.9.post1",
+            },
+        },
+        "grid_results": [],
+    }
+    try:
+        if sys.version_info[:2] != (3, 10):
+            raise RuntimeError(
+                f"PTv3 requires Python 3.10; found {sys.version_info.major}.{sys.version_info.minor}"
+            )
+        if torch.__version__.split("+")[0] != "2.1.0":
+            raise RuntimeError(f"PTv3 requires torch 2.1.0; found {torch.__version__}")
+        if torch.version.cuda != "11.8":
+            raise RuntimeError(
+                f"PTv3 requires the CUDA 11.8 Torch build; found {torch.version.cuda}"
+            )
+        expected_distributions = report["expected_environment"]["distributions"]
+        mismatches = {
+            name: report["environment"]["distributions"][name]
+            for name, expected in expected_distributions.items()
+            if report["environment"]["distributions"][name] is None
+            or not report["environment"]["distributions"][name].startswith(expected)
+        }
+        if mismatches:
+            raise RuntimeError(
+                "PTv3 dependency versions are missing or incompatible: "
+                f"{mismatches}; expected {expected_distributions}"
+            )
+        if device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("PTv3 preflight requires an allocated CUDA GPU")
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("PTv3 preflight requires BF16 support")
+        report["environment"]["device"] = str(device)
+        report["environment"]["gpu"] = torch.cuda.get_device_name(device)
+        for module_name in (
+            "addict",
+            "timm",
+            "spconv.pytorch",
+            "torch_scatter",
+            "flash_attn",
+        ):
+            importlib.import_module(module_name)
+
+        seed_everything(args.seed)
+        xyz = torch.rand(
+            1, int(args.num_points), 3, device=device, dtype=torch.float32
+        ) * 1.8 - 0.9
+        normals = torch.randn(
+            1, int(args.num_points), 3, device=device, dtype=torch.float32
+        )
+        normals = torch.nn.functional.normalize(normals, dim=-1)
+        fixed_input = torch.cat([xyz, normals], dim=-1)
+
+        for grid_size in args.grid_size:
+            encoder_config = default_pointtransformerv3_config(float(grid_size))
+            model_config = {
+                "backbone": "pointtransformerv3",
+                "encoder_config": encoder_config,
+                "four_heads": True,
+                "head_channels": [512, 256],
+                "dropout": 0.0,
+                "refinement_k": 32,
+                "refinement_cap_normalized": 0.125,
+            }
+            model = make_landmark_model(model_config).to(device)
+            train_input = fixed_input.detach().clone().requires_grad_(True)
+            torch.cuda.reset_peak_memory_stats(device)
+            model.train()
+            started = time.perf_counter()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                training_output = model(train_input)
+                loss = training_output.float().square().mean()
+            loss.backward()
+            torch.cuda.synchronize(device)
+            train_ms = (time.perf_counter() - started) * 1000.0
+            training_counts = list(model.encoder.last_voxel_counts)
+            finite_training = bool(torch.isfinite(training_output).all().item())
+            finite_input_gradient = bool(
+                train_input.grad is not None
+                and torch.isfinite(train_input.grad).all().item()
+            )
+            finite_parameter_gradients = all(
+                parameter.grad is None or torch.isfinite(parameter.grad).all().item()
+                for parameter in model.parameters()
+            )
+
+            model.eval()
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                first = model(fixed_input)
+                first_counts = list(model.encoder.last_voxel_counts)
+                second = model(fixed_input)
+                second_counts = list(model.encoder.last_voxel_counts)
+            deterministic = bool(torch.equal(first, second))
+            finite_evaluation = bool(torch.isfinite(first).all().item())
+            result = {
+                "grid_size": float(grid_size),
+                "input_points": int(args.num_points),
+                "training_voxel_counts": training_counts,
+                "evaluation_voxel_counts": first_counts,
+                "repeat_voxel_counts": second_counts,
+                "output_shape": list(first.shape),
+                "finite_training_output": finite_training,
+                "finite_input_gradient": finite_input_gradient,
+                "finite_parameter_gradients": finite_parameter_gradients,
+                "finite_evaluation_output": finite_evaluation,
+                "deterministic_evaluation": deterministic,
+                "forward_backward_ms": train_ms,
+                "peak_gpu_memory_mb": float(
+                    torch.cuda.max_memory_allocated(device) / 1024**2
+                ),
+            }
+            result["passed"] = bool(
+                finite_training
+                and finite_input_gradient
+                and finite_parameter_gradients
+                and finite_evaluation
+                and deterministic
+                and tuple(first.shape) == (1, 85, 3)
+                and training_counts == first_counts == second_counts
+            )
+            report["grid_results"].append(result)
+            del model, train_input, training_output, first, second, loss
+            torch.cuda.empty_cache()
+
+        report["passed"] = bool(
+            report["grid_results"]
+            and all(item["passed"] for item in report["grid_results"])
+        )
+    except Exception as error:
+        report["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+    write_json(output, report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not report["passed"]:
+        raise SystemExit(2)
+
+
 def command_package(args):
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != 2:
@@ -900,25 +1109,42 @@ def command_package(args):
     missing = sorted(required - set(checkpoint))
     if missing:
         raise ValueError(f"v2 checkpoint is incomplete: {missing}")
+    landmark_config = checkpoint.get("landmark", {}).get("model_config", {})
+    include_ptv3 = landmark_config.get("backbone") == "pointtransformerv3"
     root = Path(__file__).resolve().parent
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    package_paths = [
+        root / "src",
+        root / "configs",
+        root / "__init__.py",
+        root / "requirements.txt",
+        root / "README.md",
+        root / "TECHNICAL_METHOD.md",
+        root / "RESEARCH_BASIS.md",
+        root / "THIRD_PARTY_NOTICES.md",
+    ]
+    if include_ptv3:
+        package_paths.extend(
+            [root / "requirements-ptv3.txt", root / "PTV3_EXPERIMENT.md"]
+        )
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in [
-            root / "src",
-            root / "configs",
-            root / "__init__.py",
-            root / "requirements.txt",
-            root / "README.md",
-            root / "TECHNICAL_METHOD.md",
-            root / "RESEARCH_BASIS.md",
-            root / "THIRD_PARTY_NOTICES.md",
-        ]:
+        for path in package_paths:
             if path.is_dir():
                 for child in path.rglob("*"):
-                    if not child.is_file() or child.suffix not in {".py", ".json"}:
+                    relative = child.relative_to(root)
+                    is_ptv3_source = (
+                        relative == Path("src/pointtransformerv3_model.py")
+                        or Path("src/third_party/pointtransformerv3") in relative.parents
+                    )
+                    if is_ptv3_source and not include_ptv3:
                         continue
-                    archive.write(child, child.relative_to(root))
+                    if not child.is_file() or (
+                        child.suffix not in {".py", ".json"}
+                        and child.name != "LICENSE"
+                    ):
+                        continue
+                    archive.write(child, relative)
             elif path.exists():
                 archive.write(path, path.relative_to(root))
         archive.write(args.checkpoint, "checkpoints/final_pipeline.pt")
@@ -944,7 +1170,18 @@ def add_runtime_arguments(parser):
 
 
 def add_landmark_model_arguments(parser):
-    parser.add_argument("--backbone", choices=("pointnet2", "pointnext", "meshnet"), default="pointnet2")
+    parser.add_argument(
+        "--backbone",
+        choices=("pointnet2", "pointnext", "pointtransformerv3", "meshnet"),
+        default="pointnet2",
+    )
+    parser.add_argument(
+        "--ptv3-grid-size",
+        type=float,
+        choices=(0.01, 0.02),
+        default=0.01,
+        help="normalized PTv3 voxel size; ignored by other backbones",
+    )
     parser.add_argument("--meshnet-gate-json")
     parser.add_argument("--four-heads", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False)
@@ -1069,6 +1306,20 @@ def build_parser():
     gate.add_argument("--output", required=True)
     gate.add_argument("--seed", type=int, default=42)
     gate.set_defaults(function=command_meshnet_gate)
+
+    ptv3 = subparsers.add_parser("ptv3-preflight")
+    ptv3.add_argument("--output", default="artifacts/ptv3/preflight.json")
+    ptv3.add_argument("--num-points", type=int, default=16384)
+    ptv3.add_argument(
+        "--grid-size",
+        type=float,
+        nargs="+",
+        choices=(0.01, 0.02),
+        default=[0.01, 0.02],
+    )
+    ptv3.add_argument("--seed", type=int, default=42)
+    ptv3.add_argument("--device", default="auto")
+    ptv3.set_defaults(function=command_ptv3_preflight)
 
     promote = subparsers.add_parser("promote")
     promote.add_argument("--baseline", required=True)

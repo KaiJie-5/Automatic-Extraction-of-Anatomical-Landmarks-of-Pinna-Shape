@@ -1,0 +1,9 @@
+# Optional exact Point Transformer V3 research environment only.
+# Install PyTorch 2.1.0 + CUDA 11.8 with conda before this file.
+-r requirements.txt
+numpy==1.26.4
+addict==2.4.0
+timm==0.9.16
+spconv-cu118==2.3.8
+torch-scatter==2.1.2
+flash-attn==2.5.9.post1

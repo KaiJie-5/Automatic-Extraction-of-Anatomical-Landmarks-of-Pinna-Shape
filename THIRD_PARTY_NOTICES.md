@@ -42,3 +42,23 @@ https://github.com/guochengqian/PointNeXt
 No OpenPoints source code or compiled operators are copied into this repository.
 PointNeXt is distributed under the MIT License. Copyright (c) 2022 Guocheng Qian.
 The MIT grant and warranty disclaimer reproduced above apply to that upstream work.
+
+## Pointcept/PointTransformerV3
+
+`src/third_party/pointtransformerv3/` contains the official detached Point
+Transformer V3 implementation and serialization functions from:
+
+https://github.com/Pointcept/PointTransformerV3
+
+Xiaoyang Wu et al., "Point Transformer V3: Simpler, Faster, Stronger,"
+CVPR 2024, https://arxiv.org/abs/2312.10035.
+
+The source is pinned to revision
+`3229e9b7de1770c8ad17c316f8e349982de509f8`. The vendored implementation is
+kept architecturally unchanged. Repository-specific voxel preparation, global
+max pooling, and training-only serialization-order shuffling are implemented in
+`src/pointtransformerv3_model.py` outside the vendored source.
+
+Point Transformer V3 is distributed under the MIT License. Copyright (c) 2023
+Pointcept. The complete upstream licence is retained at
+`src/third_party/pointtransformerv3/LICENSE`.

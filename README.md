@@ -610,6 +610,10 @@ A full set of landmarks for one ear has shape:
 
 ## Third-Party Code
 
+The optional exact Point Transformer V3 research backbone and its isolated H200
+environment are documented in [`PTV3_EXPERIMENT.md`](PTV3_EXPERIMENT.md). It is
+not required for the portable PointNeXt baseline or current competition ZIP.
+
 `src/pointnet2_utils.py` adapts PointNet++ utilities from:
 
 https://github.com/yanx27/Pointnet_Pointnet2_pytorch

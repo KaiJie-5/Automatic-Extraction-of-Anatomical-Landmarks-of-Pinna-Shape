@@ -213,7 +213,7 @@ def load_fold_context(args: argparse.Namespace) -> FoldContext:
     model_config = dict(checkpoint["model_config"])
     data_config = dict(checkpoint["data_config"])
     backbone = str(model_config.get("backbone", ""))
-    if backbone not in {"pointnet2", "pointnext", "meshnet"}:
+    if backbone not in {"pointnet2", "pointnext", "pointtransformerv3", "meshnet"}:
         raise ValueError(f"unsupported proposal fold backbone: {backbone!r}")
     if backbone == "meshnet" and int(model_config.get("target_faces", 0)) <= 0:
         raise ValueError("MeshNet checkpoint is missing a positive target_faces value")

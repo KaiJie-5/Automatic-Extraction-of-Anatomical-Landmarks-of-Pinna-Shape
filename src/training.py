@@ -80,7 +80,10 @@ def probe_batch_size(
             model.load_state_dict(original)
             torch.cuda.empty_cache()
             return int(candidate)
-        except torch.cuda.OutOfMemoryError:
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+            if not isinstance(error, torch.cuda.OutOfMemoryError) and "out of memory" not in str(error).lower():
+                model.load_state_dict(original)
+                raise
             model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
     model.load_state_dict(original)
