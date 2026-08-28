@@ -167,6 +167,23 @@ def test_primary_complete_coverage_target_selects_robust_safety_margin():
     assert calibration["safety_mm"] == 2.0
     assert calibration["primary"]["complete_ear_coverage"] == 1.0
 
+    expanded = calibrate_directional_crops(
+        records,
+        primary_complete_coverage=1.0,
+        primary_expansion=0.2,
+    )
+    assert expanded["primary_expansion"] == 0.2
+    assert expanded["primary_outward_epsilon_mm"] == pytest.approx(1e-3)
+    assert np.all(
+        np.asarray(expanded["primary"]["negative"])
+        > np.asarray(calibration["primary"]["negative"])
+    )
+    assert np.all(
+        np.asarray(expanded["primary"]["positive"])
+        > np.asarray(calibration["primary"]["positive"])
+    )
+    assert expanded["local_scale"] > calibration["local_scale"]
+
 
 def test_calibrate_cli_accepts_primary_complete_coverage_target():
     args = build_parser().parse_args(
@@ -176,11 +193,14 @@ def test_calibrate_cli_accepts_primary_complete_coverage_target():
             "runs/locator_cv",
             "--primary-complete-coverage",
             "1.0",
+            "--primary-expansion",
+            "0.2",
             "--output",
             "artifacts/calibration.json",
         ]
     )
     assert args.primary_complete_coverage == 1.0
+    assert args.primary_expansion == 0.2
 
 
 def test_epoch_sampling_changes_only_for_dynamic_dataset():

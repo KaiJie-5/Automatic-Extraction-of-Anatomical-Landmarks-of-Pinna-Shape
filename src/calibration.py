@@ -86,6 +86,7 @@ def calibrate_directional_crops(
     percentile: float = 99.0,
     safety_candidates_mm: Sequence[float] = tuple(range(6)),
     primary_complete_coverage: float = 0.99,
+    primary_expansion: float = 0.0,
     backup_expansions: Sequence[float] = (0.2, 0.4, 0.6, 0.8, 1.0),
     outward_epsilon_mm: float = 1e-3,
     geometry_stats: Sequence[Mapping[str, float]] = (),
@@ -94,6 +95,8 @@ def calibrate_directional_crops(
         raise ValueError("at least one out-of-fold calibration record is required")
     if not 0.0 < float(primary_complete_coverage) <= 1.0:
         raise ValueError("primary complete-ear coverage target must be in (0, 1]")
+    if not 0.0 <= float(primary_expansion) <= 1.0:
+        raise ValueError("primary expansion must be in [0, 1]")
     true_centers = []
     predictions = []
     landmarks = []
@@ -145,6 +148,22 @@ def calibrate_directional_crops(
         np.asarray(base_positive + selected_safety, dtype=np.float32),
         np.float32(np.inf),
     )
+    if float(primary_expansion) > 0.0:
+        factor = 1.0 + float(primary_expansion)
+        primary_negative = np.nextafter(
+            np.asarray(
+                primary_negative * factor + outward_epsilon_mm,
+                dtype=np.float32,
+            ),
+            np.float32(np.inf),
+        )
+        primary_positive = np.nextafter(
+            np.asarray(
+                primary_positive * factor + outward_epsilon_mm,
+                dtype=np.float32,
+            ),
+            np.float32(np.inf),
+        )
     selected_coverage = _complete_ear_coverage(
         predictions, landmarks, primary_negative, primary_positive
     )
@@ -187,6 +206,10 @@ def calibrate_directional_crops(
         "schema_version": 1,
         "percentile": float(percentile),
         "primary_complete_coverage_target": float(primary_complete_coverage),
+        "primary_expansion": float(primary_expansion),
+        "primary_outward_epsilon_mm": (
+            float(outward_epsilon_mm) if float(primary_expansion) > 0.0 else 0.0
+        ),
         "safety_mm": selected_safety,
         "primary": {
             "negative": primary_negative.astype(np.float32).tolist(),

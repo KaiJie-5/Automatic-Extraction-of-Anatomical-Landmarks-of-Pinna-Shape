@@ -332,9 +332,13 @@ def command_calibrate(args):
     primary_complete_coverage = float(args.primary_complete_coverage)
     if not 0.0 < primary_complete_coverage <= 1.0:
         raise ValueError("--primary-complete-coverage must be in (0, 1]")
+    primary_expansion = float(args.primary_expansion)
+    if not 0.0 <= primary_expansion <= 1.0:
+        raise ValueError("--primary-expansion must be in [0, 1]")
     preliminary = calibrate_directional_crops(
         records,
         primary_complete_coverage=primary_complete_coverage,
+        primary_expansion=primary_expansion,
     )
     geometry = []
     for record in records:
@@ -346,6 +350,7 @@ def command_calibrate(args):
     calibration = calibrate_directional_crops(
         records,
         primary_complete_coverage=primary_complete_coverage,
+        primary_expansion=primary_expansion,
         geometry_stats=geometry,
     )
     prediction_output = dict(predictions)
@@ -987,6 +992,16 @@ def build_parser():
         help=(
             "training-OOF complete-ear coverage target used to select the smallest "
             "0-5 mm primary-crop safety margin (default: 0.99)"
+        ),
+    )
+    calibrate.add_argument(
+        "--primary-expansion",
+        type=float,
+        default=0.0,
+        help=(
+            "post-safety directional expansion applied to the primary crop; "
+            "0.2 promotes the proposal's first backup reach to primary "
+            "(default: 0.0)"
         ),
     )
     calibrate.add_argument("--output", required=True)
