@@ -1,4 +1,4 @@
-"""Portable PyTorch PointNeXt-S-style encoder.
+"""Portable PyTorch PointNeXt-S/PointNeXt-B-style encoder.
 
 This implementation deliberately reuses the repository's PointNet++ sampling and
 grouping primitives. It avoids compiled OpenPoints/CUDA extensions so checkpoints
@@ -13,6 +13,12 @@ import torch
 import torch.nn as nn
 
 from .pointnet2_utils import farthest_point_sample, index_points, square_distance
+
+
+POINTNEXT_VARIANT_BLOCKS = {
+    "s": (1, 1, 1, 1, 1),
+    "b": (1, 2, 3, 2, 2),
+}
 
 
 def _chunked_ball_query(radius, nsample, xyz, centers, chunk_size=512):
@@ -83,8 +89,48 @@ class PointNeXtSetAbstraction(nn.Module):
         return centers, aggregated + self.residual(center_features)
 
 
+class PointNeXtInvertedResidualBlock(nn.Module):
+    """Portable same-resolution PointNeXt inverted-residual local block."""
+
+    def __init__(
+        self,
+        channels: int,
+        radius: float,
+        nsample: int = 32,
+        expansion: int = 4,
+    ):
+        super().__init__()
+        channels = int(channels)
+        hidden = channels * int(expansion)
+        self.radius = float(radius)
+        self.nsample = int(nsample)
+        self.local = nn.Sequential(
+            nn.Linear(channels + 3, channels),
+            nn.LayerNorm(channels),
+            nn.GELU(),
+        )
+        self.pointwise = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, channels),
+            nn.LayerNorm(channels),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, xyz: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        group_indices = _chunked_ball_query(
+            self.radius, min(self.nsample, xyz.shape[1]), xyz, xyz
+        )
+        grouped_xyz = index_points(xyz, group_indices)
+        grouped_features = index_points(features, group_indices)
+        relative = (grouped_xyz - xyz.unsqueeze(2)) / max(self.radius, 1e-8)
+        local = self.local(torch.cat([relative, grouped_features], dim=-1)).amax(dim=2)
+        return self.activation(features + self.pointwise(local))
+
+
 class PointNeXtEncoder(nn.Module):
-    """Width-tunable B0-style five-stage encoder for crop-local point features."""
+    """Variant- and width-tunable five-stage crop-local point encoder."""
 
     def __init__(
         self,
@@ -96,33 +142,67 @@ class PointNeXtEncoder(nn.Module):
         radius_scaling: float = 2.0,
         nsample: int = 32,
         expansion: int = 4,
+        variant: str | None = None,
     ):
         super().__init__()
         width = int(width)
         if width <= 0:
             raise ValueError("PointNeXt width must be a positive integer")
-        if tuple(blocks) != (1, 1, 1, 1, 1):
-            raise ValueError("portable PointNeXt currently implements the B0 block layout")
+        blocks = tuple(int(value) for value in blocks)
+        if len(blocks) != 5 or any(value < 1 for value in blocks):
+            raise ValueError("PointNeXt blocks must contain five positive integers")
+        if variant is not None:
+            variant = str(variant).lower()
+            if variant not in POINTNEXT_VARIANT_BLOCKS:
+                raise ValueError(f"unsupported PointNeXt variant: {variant}")
+            if blocks != POINTNEXT_VARIANT_BLOCKS[variant]:
+                raise ValueError(
+                    f"PointNeXt-{variant.upper()} requires blocks "
+                    f"{list(POINTNEXT_VARIANT_BLOCKS[variant])}"
+                )
         if len(strides) != 5:
             raise ValueError("PointNeXt requires five stride entries")
         self.input_channels = int(input_channels)
+        self.variant = variant
+        self.blocks = blocks
         self.stem = _MLP(input_channels, width, expansion=1)
         channels = [width, width * 2, width * 4, width * 8, width * 16]
         stages = []
+        residual_stages = []
         input_dim = width
-        for stage_index, (output_dim, stride) in enumerate(zip(channels, strides)):
+        for stage_index, (output_dim, stride, block_count) in enumerate(
+            zip(channels, strides, blocks)
+        ):
+            stage_radius = radius * (radius_scaling ** max(stage_index - 1, 0))
             stages.append(
                 PointNeXtSetAbstraction(
                     input_dim,
                     output_dim,
                     stride=stride,
-                    radius=radius * (radius_scaling ** max(stage_index - 1, 0)),
+                    radius=stage_radius,
                     nsample=nsample,
                     expansion=expansion,
                 )
             )
+            residual_radius = (
+                stage_radius * radius_scaling if int(stride) != 1 else stage_radius
+            )
+            residual_stages.append(
+                nn.ModuleList(
+                    [
+                        PointNeXtInvertedResidualBlock(
+                            output_dim,
+                            radius=residual_radius,
+                            nsample=nsample,
+                            expansion=expansion,
+                        )
+                        for _ in range(block_count - 1)
+                    ]
+                )
+            )
             input_dim = output_dim
         self.stages = nn.ModuleList(stages)
+        self.residual_stages = nn.ModuleList(residual_stages)
         self.feature_dim = channels[-1]
 
     def forward(self, point_cloud: torch.Tensor) -> torch.Tensor:
@@ -135,22 +215,28 @@ class PointNeXtEncoder(nn.Module):
                 raise ValueError(f"expected {self.input_channels} input channels")
         xyz = point_cloud[..., :3]
         features = self.stem(point_cloud)
-        for stage in self.stages:
+        for stage, residual_blocks in zip(self.stages, self.residual_stages):
             xyz, features = stage(xyz, features)
+            for block in residual_blocks:
+                features = block(xyz, features)
         return features.amax(dim=1)
 
 
-def default_pointnext_config(width: int = 32) -> dict:
+def default_pointnext_config(width: int = 32, variant: str = "s") -> dict:
     width = int(width)
     if width <= 0:
         raise ValueError("PointNeXt width must be a positive integer")
+    variant = str(variant).lower()
+    if variant not in POINTNEXT_VARIANT_BLOCKS:
+        raise ValueError(f"unsupported PointNeXt variant: {variant}")
     return {
         "input_channels": 6,
         "width": width,
         "strides": [1, 4, 4, 4, 4],
-        "blocks": [1, 1, 1, 1, 1],
+        "blocks": list(POINTNEXT_VARIANT_BLOCKS[variant]),
         "radius": 0.1,
         "radius_scaling": 2.0,
         "nsample": 32,
         "expansion": 4,
+        "variant": variant,
     }

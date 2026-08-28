@@ -338,6 +338,101 @@ def test_pointnext_width_rejects_nonpositive_values():
         )
 
 
+def test_pointnext_b_variant_is_cli_tunable_and_checkpoint_ready():
+    parser = build_parser()
+    common = [
+        "fit-landmarks",
+        "--folds-json",
+        "folds.json",
+        "--outer-fold",
+        "0",
+        "--predictions-json",
+        "predictions.json",
+        "--calibration-json",
+        "calibration.json",
+        "--output-dir",
+        "runs/pointnext_b",
+        "--backbone",
+        "pointnext",
+        "--pointnext-variant",
+        "b",
+    ]
+    args = parser.parse_args(common)
+    final_args = parser.parse_args(
+        [
+            "fit-final",
+            "--locator-run-root",
+            "runs/locator_cv",
+            "--calibration-json",
+            "calibration.json",
+            "--locator-epochs",
+            "100",
+            "--landmark-epochs",
+            "100",
+            "--backbone",
+            "pointnext",
+            "--pointnext-variant",
+            "b",
+            "--pointnext-width",
+            "32",
+        ]
+    )
+    config = landmark_model_config(args, local_scale=40.0)
+    final_config = landmark_model_config(final_args, local_scale=40.0)
+    encoder_config = config["encoder_config"]
+
+    assert args.pointnext_variant == "b"
+    assert encoder_config["variant"] == "b"
+    assert encoder_config["width"] == 32
+    assert encoder_config["blocks"] == [1, 2, 3, 2, 2]
+    assert final_config["encoder_config"]["variant"] == "b"
+    assert final_config["encoder_config"]["blocks"] == [1, 2, 3, 2, 2]
+
+    encoder = PointNeXtEncoder(
+        **{
+            **encoder_config,
+            "width": 8,
+            "strides": [1, 2, 2, 2, 2],
+            "nsample": 8,
+        }
+    ).train()
+    assert sum(len(stage) for stage in encoder.residual_stages) == 5
+    points = torch.randn(1, 64, 6, requires_grad=True)
+    output = encoder(points)
+    assert output.shape == (1, 8 * 16)
+    output.square().mean().backward()
+    assert points.grad is not None
+    assert torch.isfinite(points.grad).all()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in encoder.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_pointnext_variant_config_validation():
+    assert default_pointnext_config(variant="s")["blocks"] == [1, 1, 1, 1, 1]
+    assert default_pointnext_config(variant="b")["blocks"] == [1, 2, 3, 2, 2]
+    with pytest.raises(ValueError, match="unsupported PointNeXt variant"):
+        default_pointnext_config(variant="xl")
+    with pytest.raises(ValueError, match="requires blocks"):
+        PointNeXtEncoder(variant="b", blocks=[1, 1, 1, 1, 1])
+
+
+def test_pointnext_s_variant_preserves_legacy_checkpoint_keys():
+    common = {
+        "input_channels": 6,
+        "width": 8,
+        "strides": [1, 2, 2, 2, 2],
+        "blocks": [1, 1, 1, 1, 1],
+        "nsample": 8,
+    }
+    legacy = PointNeXtEncoder(**common)
+    current = PointNeXtEncoder(**common, variant="s")
+    assert set(legacy.state_dict()) == set(current.state_dict())
+    current.load_state_dict(legacy.state_dict(), strict=True)
+
+
 def test_proposal_losses_have_expected_zero_and_positive_terms():
     target = torch.zeros(2, 85, 3)
     prediction = target.clone()

@@ -31,8 +31,8 @@ one head or four contour heads of 25, 30, 20, and 10 points.
 
 The official mean Euclidean distance in millimetres is always the base loss.
 Optional anchor, within-section spacing, and one-directional dense-surface losses
-are enabled independently. Local KNN refinement, width-tunable B0-style
-PointNeXt, MeshNet, and exact
+are enabled independently. Local KNN refinement, depth/width-tunable portable
+PointNeXt-S/PointNeXt-B, MeshNet, and exact
 surface projection are experiments and are not promoted without the registered
 five-fold, three-seed rule in `configs/experiment_matrix.json`.
 
