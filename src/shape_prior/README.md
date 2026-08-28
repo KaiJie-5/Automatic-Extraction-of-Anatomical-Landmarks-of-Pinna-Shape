@@ -5,10 +5,19 @@ It is inference-time post-processing only: it does not train the landmark model,
 the loss, or change the model architecture.
 
 The prior is applied to the crop-local canonical normalized landmark prediction after the
-landmark model and `LocalLandmarkRefiner`, and before:
+landmark model and `LocalLandmarkRefiner`.
 
-```python
-local_transform.denormalize_xyz(local_prediction)
+The purpose is to make the final 85 predicted landmarks more anatomically consistent by constraining them toward realistic ear landmark shapes observed in the labelled training data.
+
+
+```text
+ear landmark shapes from training samples
+        ↓
+learn mean ear shape + PCA components
+        ↓
+model prediction is projected into this valid shape space
+        ↓
+prediction becomes more globally consistent
 ```
 
 ## Generate A Fold Prior (Split train/val)
