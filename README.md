@@ -608,11 +608,48 @@ A full set of landmarks for one ear has shape:
 85 x 3
 ```
 
-## Third-Party Code
+## Optional Point Transformer V3 environment
 
-The optional exact Point Transformer V3 research backbone and its isolated H200
-environment are documented in [`PTV3_EXPERIMENT.md`](PTV3_EXPERIMENT.md). It is
-not required for the portable PointNeXt baseline or current competition ZIP.
+The exact Point Transformer V3 research backbone uses compiled CUDA packages
+and must be installed in a separate environment. It is not required for the
+portable PointNeXt baseline or the current competition ZIP. The complete
+training and evaluation workflow is documented in
+[`PTV3_EXPERIMENT.md`](PTV3_EXPERIMENT.md).
+
+The installation order matters. In particular, Torch `2.1.0` requires NumPy
+1.x for this environment, and its legacy C++ extension loader requires the
+`pkg_resources.packaging` compatibility export retained by setuptools
+`69.5.1`. Setuptools 70 or newer causes FlashAttention metadata generation to
+fail.
+
+```bash
+conda create -n anthropometric_ptv3_env python=3.10 -y
+conda activate anthropometric_ptv3_env
+conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=11.8 -c pytorch -c nvidia -y
+conda install cuda-nvcc=11.8 -c nvidia -y
+
+python -m pip install --upgrade pip
+python -m pip install --force-reinstall numpy==1.26.4 setuptools==69.5.1 wheel==0.43.0 packaging==24.0 psutil==5.9.8
+python -m pip install ninja fsspec
+python -m pip install -r requirements.txt
+python -m pip install torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
+python -m pip install addict==2.4.0 timm==0.9.16 spconv-cu118==2.3.8
+
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export MAX_JOBS=8
+python -m pip install flash-attn==2.5.9.post1 --no-build-isolation
+python -m pip install --no-build-isolation -r requirements-ptv3.txt
+python -m pip check
+```
+
+Compile FlashAttention on an allocated compute node, not a login node. Before
+training, run the required `ptv3-preflight` gate described in the detailed
+guide. If FlashAttention reports that `packaging` cannot be imported from
+`pkg_resources`, reinstall `setuptools==69.5.1`. If its isolated build reports
+that Torch is missing, repeat the installation with `--no-build-isolation`.
+
+## Third-Party Code
 
 `src/pointnet2_utils.py` adapts PointNet++ utilities from:
 

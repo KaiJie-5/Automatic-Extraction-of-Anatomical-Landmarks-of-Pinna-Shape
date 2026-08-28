@@ -15,17 +15,70 @@ conda create -n anthropometric_ptv3_env python=3.10 -y
 conda activate anthropometric_ptv3_env
 conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=11.8 -c pytorch -c nvidia -y
 conda install cuda-nvcc=11.8 -c nvidia -y
-python -m pip install --upgrade pip ninja packaging
+
+# Torch 2.1 was built against NumPy 1.x and its cpp_extension still imports
+# packaging through pkg_resources. Setuptools 70+ removed that compatibility
+# export, so install these versions before building FlashAttention.
+python -m pip install --upgrade pip
+python -m pip install --force-reinstall \
+  numpy==1.26.4 \
+  setuptools==69.5.1 \
+  wheel==0.43.0 \
+  packaging==24.0 \
+  psutil==5.9.8
+python -m pip install ninja fsspec
+
+python -m pip install -r requirements.txt
 python -m pip install torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
+python -m pip install addict==2.4.0 timm==0.9.16 spconv-cu118==2.3.8
+
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export MAX_JOBS=8
 python -m pip install flash-attn==2.5.9.post1 --no-build-isolation
-python -m pip install -r requirements-ptv3.txt
+
+# This is now a version assertion because the compiled dependencies are
+# already installed. Do not use this as the first install command in a fresh
+# environment.
+python -m pip install --no-build-isolation -r requirements-ptv3.txt
 python -m pip check
 nvcc --version
 ```
 
-The duplicate `torch-scatter` and `flash-attn` entries in the requirements file
-act as version assertions after the wheel/build commands. The normal
+Build FlashAttention on an allocated compute node rather than a login node. The
+duplicate `torch-scatter` and `flash-attn` entries in the requirements file act
+as version assertions after the wheel/build commands. The normal
 `requirements.txt` remains the portable baseline environment.
+
+Verify the environment before submitting the preflight:
+
+```bash
+python -c "import setuptools; print('setuptools:', setuptools.__version__); from pkg_resources import packaging; print('pkg_resources packaging:', packaging.__version__)"
+python -c "import numpy, torch; print('NumPy:', numpy.__version__); print('Torch:', torch.__version__); print('CUDA:', torch.version.cuda)"
+python -c "import addict, timm, spconv.pytorch, torch_scatter, flash_attn; print('All PTv3 dependencies imported successfully')"
+```
+
+The required core values are NumPy `1.26.4`, Torch `2.1.0`, CUDA `11.8`, and
+setuptools `69.5.1`.
+
+### FlashAttention installation failures
+
+If FlashAttention reports
+`ImportError: cannot import name 'packaging' from 'pkg_resources'`, setuptools
+is too new. Restore the compatibility version and retry without build
+isolation:
+
+```bash
+python -m pip install --force-reinstall setuptools==69.5.1 wheel==0.43.0 packaging==24.0 psutil==5.9.8
+python -c "from pkg_resources import packaging; print(packaging.__version__)"
+python -m pip install flash-attn==2.5.9.post1 --no-build-isolation --no-cache-dir
+```
+
+If it reports `No module named 'torch'` while creating a temporary build
+environment, the command omitted `--no-build-isolation`. If Torch warns that a
+module compiled with NumPy 1.x cannot run with NumPy 2.x, restore
+`numpy==1.26.4` before retrying. Garbled progress-bar characters such as
+`â”` are terminal encoding only and are not installation errors.
 
 ## Required preflight
 
