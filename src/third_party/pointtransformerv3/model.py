@@ -537,6 +537,7 @@ class Block(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
+        spconv_algo=None,
     ):
         super().__init__()
         self.channels = channels
@@ -549,6 +550,7 @@ class Block(PointModule):
                 kernel_size=3,
                 bias=True,
                 indice_key=cpe_indice_key,
+                algo=spconv_algo,
             ),
             nn.Linear(channels, channels),
             norm_layer(channels),
@@ -757,6 +759,7 @@ class Embedding(PointModule):
         embed_channels,
         norm_layer=None,
         act_layer=None,
+        spconv_algo=None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -771,6 +774,7 @@ class Embedding(PointModule):
                 padding=1,
                 bias=False,
                 indice_key="stem",
+                algo=spconv_algo,
             )
         )
         if norm_layer is not None:
@@ -816,6 +820,7 @@ class PointTransformerV3(PointModule):
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        spconv_algo=None,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -864,6 +869,7 @@ class PointTransformerV3(PointModule):
             embed_channels=enc_channels[0],
             norm_layer=bn_layer,
             act_layer=act_layer,
+            spconv_algo=spconv_algo,
         )
 
         # encoder
@@ -908,6 +914,7 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        spconv_algo=spconv_algo,
                     ),
                     name=f"block{i}",
                 )
@@ -958,6 +965,7 @@ class PointTransformerV3(PointModule):
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
+                            spconv_algo=spconv_algo,
                         ),
                         name=f"block{i}",
                     )

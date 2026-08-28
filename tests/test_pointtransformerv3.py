@@ -2,10 +2,13 @@ import pytest
 import torch
 
 from src.pointtransformerv3_model import (
+    PTV3_AMP_DTYPE,
+    PTV3_SPCONV_ALGORITHM,
     PTV3_UPSTREAM_REVISION,
     PointTransformerV3Encoder,
     default_pointtransformerv3_config,
     deterministic_voxelize,
+    validate_pointtransformerv3_checkpoint_config,
 )
 from src.precision import (
     checkpoint_amp_dtype,
@@ -74,6 +77,7 @@ def test_ptv3_locked_default_configuration():
     assert config["global_pool"] == "max"
     assert config["voxel_representative"] == "first_input_index"
     assert config["order_shuffle_policy"] == "training_only"
+    assert config["spconv_algorithm"] == PTV3_SPCONV_ALGORITHM
 
 
 def test_ptv3_rejects_non_flash_or_changed_adapter_contract_before_imports():
@@ -83,6 +87,8 @@ def test_ptv3_rejects_non_flash_or_changed_adapter_contract_before_imports():
         PointTransformerV3Encoder(global_pool="mean")
     with pytest.raises(ValueError, match="training-only order shuffling"):
         PointTransformerV3Encoder(order_shuffle_policy="always")
+    with pytest.raises(ValueError, match="spconv_algorithm='native'"):
+        PointTransformerV3Encoder(spconv_algorithm="mask_implicit_gemm")
 
 
 def test_ptv3_serialization_order_shuffle_is_training_only():
@@ -132,7 +138,11 @@ def test_ptv3_cli_records_grid_size_and_preflight_defaults():
     assert training.backbone == "pointtransformerv3"
     assert training.ptv3_grid_size == pytest.approx(0.02)
     model_config = landmark_model_config(training, local_scale=40.0)
-    assert model_config["amp_dtype"] == "float16"
+    assert model_config["amp_dtype"] == PTV3_AMP_DTYPE
+    assert (
+        model_config["encoder_config"]["spconv_algorithm"]
+        == PTV3_SPCONV_ALGORITHM
+    )
     assert preflight.grid_size == [0.01, 0.02]
     assert preflight.num_points == 16384
 
@@ -144,6 +154,20 @@ def test_ptv3_fp16_policy_is_explicit_and_uses_gradient_scaling():
     assert grad_scaler_enabled(cuda, True, "float16") is True
     assert checkpoint_amp_dtype({"amp_dtype": "float16"}) == "float16"
     assert checkpoint_amp_dtype({}) == "none"
+
+
+def test_ptv3_checkpoint_requires_native_spconv_workaround():
+    config = {
+        "backbone": "pointtransformerv3",
+        "amp_dtype": PTV3_AMP_DTYPE,
+        "encoder_config": default_pointtransformerv3_config(0.01),
+    }
+    validate_pointtransformerv3_checkpoint_config(config)
+
+    invalid = {**config, "encoder_config": dict(config["encoder_config"])}
+    invalid["encoder_config"]["spconv_algorithm"] = "mask_implicit_gemm"
+    with pytest.raises(ValueError, match="spconv_algorithm='native'"):
+        validate_pointtransformerv3_checkpoint_config(invalid)
 
 
 def test_ptv3_rejects_disabling_amp():

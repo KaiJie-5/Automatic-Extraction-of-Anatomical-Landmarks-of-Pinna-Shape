@@ -45,8 +45,11 @@ from src.pipeline_dataset import (
 from src.pointnet2_model import default_model_config
 from src.pointnext_model import default_pointnext_config
 from src.pointtransformerv3_model import (
+    PTV3_AMP_DTYPE,
+    PTV3_SPCONV_ALGORITHM,
     PTV3_UPSTREAM_REVISION,
     default_pointtransformerv3_config,
+    validate_pointtransformerv3_checkpoint_config,
 )
 from src.precision import autocast_context
 from src.proposal_models import build_fold_landmark_model, build_locator
@@ -136,10 +139,10 @@ def landmark_model_config(args, local_scale: float) -> dict:
         "refinement_cap_normalized": 5.0 / local_scale if args.refinement_k else 0.0,
     }
     if args.backbone == "pointtransformerv3":
-        # The spconv CUDA 11.8 tuner fails when a cold H200 process starts the
-        # full PTv3 path under BF16. Official PTv3 AMP uses FP16, which passes
-        # cold forward/backward and is serialized for every downstream caller.
-        config["amp_dtype"] = "float16"
+        # Upstream spconv issue #563 identifies mixed-precision evaluation as
+        # the failing path. The encoder fixes its sparse convolutions to the
+        # Native algorithm, bypassing ConvTunerSimple; PTv3 retains FP16 AMP.
+        config["amp_dtype"] = PTV3_AMP_DTYPE
     return config
 
 
@@ -962,8 +965,10 @@ def command_ptv3_preflight(args):
             "num_points": int(args.num_points),
             "grid_sizes": [float(value) for value in args.grid_size],
             "flash_attention": True,
-            "autocast_dtype": "float16",
+            "autocast_dtype": PTV3_AMP_DTYPE,
             "gradient_scaling_in_training": True,
+            "spconv_algorithm": PTV3_SPCONV_ALGORITHM,
+            "spconv_issue_workaround": "ConvAlgo.Native",
             "full_encoder_decoder": True,
             "global_pool": "max",
             "refinement_k": 32,
@@ -1038,7 +1043,7 @@ def command_ptv3_preflight(args):
                 "dropout": 0.0,
                 "refinement_k": 32,
                 "refinement_cap_normalized": 0.125,
-                "amp_dtype": "float16",
+                "amp_dtype": PTV3_AMP_DTYPE,
             }
             model = make_landmark_model(model_config).to(device)
             probe_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
@@ -1047,7 +1052,7 @@ def command_ptv3_preflight(args):
             torch.cuda.reset_peak_memory_stats(device)
             model.train()
             started = time.perf_counter()
-            with autocast_context(device, True, "float16"):
+            with autocast_context(device, True, PTV3_AMP_DTYPE):
                 training_output = model(train_input)
                 loss = training_output.float().square().mean()
             probe_scaler.scale(loss).backward()
@@ -1066,26 +1071,52 @@ def command_ptv3_preflight(args):
             )
 
             model.eval()
-            with torch.no_grad(), autocast_context(device, True, "float16"):
+            with torch.no_grad(), autocast_context(device, True, PTV3_AMP_DTYPE):
                 first = model(fixed_input)
                 first_counts = list(model.encoder.last_voxel_counts)
                 second = model(fixed_input)
                 second_counts = list(model.encoder.last_voxel_counts)
             deterministic = bool(torch.equal(first, second))
             finite_evaluation = bool(torch.isfinite(first).all().item())
+
+            # Deployment starts in a fresh process and enters eval directly,
+            # without a preceding training pass to populate spconv caches.
+            fresh_model = make_landmark_model(model_config).to(device)
+            fresh_model.load_state_dict(model.state_dict())
+            fresh_model.eval()
+            with torch.no_grad(), autocast_context(device, True, PTV3_AMP_DTYPE):
+                fresh_first = fresh_model(fixed_input)
+                fresh_first_counts = list(fresh_model.encoder.last_voxel_counts)
+                fresh_second = fresh_model(fixed_input)
+                fresh_second_counts = list(fresh_model.encoder.last_voxel_counts)
+            deterministic_fresh_evaluation = bool(
+                torch.equal(fresh_first, fresh_second)
+            )
+            reload_matches_evaluation = bool(torch.equal(first, fresh_first))
+            finite_fresh_evaluation = bool(torch.isfinite(fresh_first).all().item())
             result = {
                 "grid_size": float(grid_size),
                 "input_points": int(args.num_points),
                 "training_voxel_counts": training_counts,
                 "evaluation_voxel_counts": first_counts,
                 "repeat_voxel_counts": second_counts,
+                "fresh_evaluation_voxel_counts": fresh_first_counts,
+                "fresh_repeat_voxel_counts": fresh_second_counts,
                 "output_shape": list(first.shape),
                 "finite_training_output": finite_training,
                 "finite_input_gradient": finite_input_gradient,
                 "finite_parameter_gradients": finite_parameter_gradients,
                 "grad_scaler_enabled": bool(probe_scaler.is_enabled()),
+                "spconv_algorithm": model.encoder.spconv_algorithm,
+                "spconv_layer_count": int(model.encoder.spconv_layer_count),
+                "expected_spconv_layer_count": int(
+                    model.encoder.expected_spconv_layer_count
+                ),
                 "finite_evaluation_output": finite_evaluation,
                 "deterministic_evaluation": deterministic,
+                "finite_fresh_evaluation_output": finite_fresh_evaluation,
+                "deterministic_fresh_evaluation": deterministic_fresh_evaluation,
+                "fresh_reload_matches_evaluation": reload_matches_evaluation,
                 "forward_backward_ms": train_ms,
                 "peak_gpu_memory_mb": float(
                     torch.cuda.max_memory_allocated(device) / 1024**2
@@ -1096,13 +1127,35 @@ def command_ptv3_preflight(args):
                 and finite_input_gradient
                 and finite_parameter_gradients
                 and probe_scaler.is_enabled()
+                and model.encoder.spconv_algorithm == PTV3_SPCONV_ALGORITHM
+                and model.encoder.spconv_layer_count
+                == model.encoder.expected_spconv_layer_count
                 and finite_evaluation
                 and deterministic
+                and finite_fresh_evaluation
+                and deterministic_fresh_evaluation
+                and reload_matches_evaluation
                 and tuple(first.shape) == (1, 85, 3)
-                and training_counts == first_counts == second_counts
+                and training_counts
+                == first_counts
+                == second_counts
+                == fresh_first_counts
+                == fresh_second_counts
             )
             report["grid_results"].append(result)
-            del model, probe_optimizer, probe_scaler, train_input, training_output, first, second, loss
+            del (
+                model,
+                fresh_model,
+                probe_optimizer,
+                probe_scaler,
+                train_input,
+                training_output,
+                first,
+                second,
+                fresh_first,
+                fresh_second,
+                loss,
+            )
             torch.cuda.empty_cache()
 
         report["passed"] = bool(
@@ -1130,10 +1183,8 @@ def command_package(args):
         raise ValueError(f"v2 checkpoint is incomplete: {missing}")
     landmark_config = checkpoint.get("landmark", {}).get("model_config", {})
     include_ptv3 = landmark_config.get("backbone") == "pointtransformerv3"
-    if include_ptv3 and landmark_config.get("amp_dtype") != "float16":
-        raise ValueError(
-            "PTv3 packaging requires model_config.amp_dtype='float16'"
-        )
+    if include_ptv3:
+        validate_pointtransformerv3_checkpoint_config(landmark_config)
     root = Path(__file__).resolve().parent
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -649,10 +649,15 @@ guide. If FlashAttention reports that `packaging` cannot be imported from
 `pkg_resources`, reinstall `setuptools==69.5.1`. If its isolated build reports
 that Torch is missing, repeat the installation with `--no-build-isolation`.
 
-PTv3 checkpoints explicitly record `amp_dtype: float16`. This avoids a cold
-H200/spconv CUDA 11.8 tuner failure observed when starting the full model under
-BF16. PTv3 uses FP16 autocast and gradient scaling while losses and metrics are
-accumulated in FP32. Other backbones continue to prefer BF16 on H200.
+PTv3 checkpoints explicitly record `amp_dtype: float16` and
+`encoder_config.spconv_algorithm: native`. PTv3 uses FP16 autocast and gradient
+scaling while losses and metrics are accumulated in FP32. The native sparse
+convolution algorithm bypasses the spconv implicit-GEMM tuner failure reported
+for mixed-precision evaluation in
+[PTv3 issue #176](https://github.com/Pointcept/PointTransformerV3/issues/176)
+and [spconv issue #563](https://github.com/traveller59/spconv/issues/563).
+Do not force the complete network into training mode for validation. Other
+backbones continue to prefer BF16 on H200.
 
 ## Third-Party Code
 

@@ -16,6 +16,8 @@ import torch.nn as nn
 PTV3_UPSTREAM_REPOSITORY = "https://github.com/Pointcept/PointTransformerV3"
 PTV3_UPSTREAM_REVISION = "3229e9b7de1770c8ad17c316f8e349982de509f8"
 PTV3_REQUIRED_MODULES = ("addict", "timm", "spconv", "torch_scatter", "flash_attn")
+PTV3_AMP_DTYPE = "float16"
+PTV3_SPCONV_ALGORITHM = "native"
 
 
 class PointTransformerV3DependencyError(ImportError):
@@ -49,6 +51,27 @@ def _as_bnc(point_cloud: torch.Tensor, input_channels: int) -> torch.Tensor:
     if point_cloud.shape[1] == input_channels:
         return point_cloud.transpose(1, 2)
     raise ValueError(f"expected {input_channels} input channels")
+
+
+def validate_pointtransformerv3_checkpoint_config(
+    model_config: Mapping[str, object],
+) -> None:
+    """Reject PTv3 checkpoints that could re-enter the spconv eval tuner bug."""
+
+    amp_dtype = str(model_config.get("amp_dtype", "")).lower()
+    encoder_config = model_config.get("encoder_config")
+    if not isinstance(encoder_config, Mapping):
+        raise ValueError("PTv3 checkpoint is missing encoder_config")
+    spconv_algorithm = str(encoder_config.get("spconv_algorithm", "")).lower()
+    if amp_dtype != PTV3_AMP_DTYPE:
+        raise ValueError(
+            f"PTv3 checkpoint must record model_config.amp_dtype='{PTV3_AMP_DTYPE}'"
+        )
+    if spconv_algorithm != PTV3_SPCONV_ALGORITHM:
+        raise ValueError(
+            "PTv3 checkpoint must record "
+            f"encoder_config.spconv_algorithm='{PTV3_SPCONV_ALGORITHM}'"
+        )
 
 
 def deterministic_voxelize(
@@ -141,6 +164,7 @@ class PointTransformerV3Encoder(nn.Module):
         global_pool: str = "max",
         voxel_representative: str = "first_input_index",
         order_shuffle_policy: str = "training_only",
+        spconv_algorithm: str = PTV3_SPCONV_ALGORITHM,
         upstream_revision: str = PTV3_UPSTREAM_REVISION,
     ):
         super().__init__()
@@ -157,6 +181,11 @@ class PointTransformerV3Encoder(nn.Module):
             raise ValueError("the PTv3 adapter requires deterministic first-point voxels")
         if order_shuffle_policy != "training_only":
             raise ValueError("the PTv3 adapter requires training-only order shuffling")
+        if str(spconv_algorithm).lower() != PTV3_SPCONV_ALGORITHM:
+            raise ValueError(
+                "the PTv3 adapter requires spconv_algorithm='native' to avoid "
+                "the mixed-precision evaluation ConvTunerSimple failure"
+            )
         if len(dec_channels) != 4 or int(dec_channels[0]) <= 0:
             raise ValueError("full PTv3 decoding requires four positive decoder channel values")
 
@@ -166,9 +195,11 @@ class PointTransformerV3Encoder(nn.Module):
         self.global_pool = global_pool
         self.voxel_representative = voxel_representative
         self.order_shuffle_policy = order_shuffle_policy
+        self.spconv_algorithm = PTV3_SPCONV_ALGORITHM
         self.upstream_revision = upstream_revision
         self.feature_dim = int(dec_channels[0])
         self.last_voxel_counts: tuple[int, ...] = ()
+        native_algorithm = official_model.spconv.ConvAlgo.Native
         self.model = official_model.PointTransformerV3(
             in_channels=self.input_channels,
             order=tuple(order),
@@ -194,7 +225,23 @@ class PointTransformerV3Encoder(nn.Module):
             upcast_attention=bool(upcast_attention),
             upcast_softmax=bool(upcast_softmax),
             cls_mode=False,
+            spconv_algo=native_algorithm,
         )
+        sparse_layers = [
+            module
+            for module in self.model.modules()
+            if official_model.spconv.modules.is_spconv_module(module)
+            and hasattr(module, "algo")
+        ]
+        expected_sparse_layers = 1 + sum(enc_depths) + sum(dec_depths)
+        if len(sparse_layers) != expected_sparse_layers or any(
+            module.algo != native_algorithm for module in sparse_layers
+        ):
+            raise RuntimeError(
+                "failed to configure every PTv3 sparse convolution with ConvAlgo.Native"
+            )
+        self.spconv_layer_count = len(sparse_layers)
+        self.expected_spconv_layer_count = int(expected_sparse_layers)
 
     def _set_order_shuffle(self) -> None:
         enabled = bool(self.training)
@@ -261,5 +308,6 @@ def default_pointtransformerv3_config(grid_size: float = 0.01) -> Mapping[str, o
         "global_pool": "max",
         "voxel_representative": "first_input_index",
         "order_shuffle_policy": "training_only",
+        "spconv_algorithm": PTV3_SPCONV_ALGORITHM,
         "upstream_revision": PTV3_UPSTREAM_REVISION,
     }

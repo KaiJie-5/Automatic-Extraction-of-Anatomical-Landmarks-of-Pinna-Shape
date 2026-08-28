@@ -26,7 +26,8 @@ from src.dataset import Dataset as MeshLandmarkDataset
 from src.losses import ANCHOR_INDICES
 from src.meshnet import meshnet_inputs_with_mesh
 from src.pipeline_dataset import prediction_key, prepare_ear_geometry
-from src.precision import checkpoint_amp_dtype, checkpoint_autocast_context
+from src.precision import checkpoint_autocast_context
+from src.pointtransformerv3_model import validate_pointtransformerv3_checkpoint_config
 from src.proposal_models import build_fold_landmark_model
 from src.surface import project_points_to_mesh
 
@@ -218,13 +219,8 @@ def load_fold_context(args: argparse.Namespace) -> FoldContext:
         raise ValueError(f"unsupported proposal fold backbone: {backbone!r}")
     if backbone == "meshnet" and int(model_config.get("target_faces", 0)) <= 0:
         raise ValueError("MeshNet checkpoint is missing a positive target_faces value")
-    if (
-        backbone == "pointtransformerv3"
-        and checkpoint_amp_dtype(model_config) != "float16"
-    ):
-        raise ValueError(
-            "PTv3 checkpoint must record model_config.amp_dtype='float16'"
-        )
+    if backbone == "pointtransformerv3":
+        validate_pointtransformerv3_checkpoint_config(model_config)
     outer_fold = int(data_config.get("outer_fold", -1))
     if outer_fold not in range(5):
         raise ValueError("checkpoint data_config is missing a valid outer_fold")

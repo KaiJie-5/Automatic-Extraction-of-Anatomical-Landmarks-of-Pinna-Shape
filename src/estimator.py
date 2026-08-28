@@ -13,7 +13,8 @@ from .pointnet2_model import (
     PointNet2LandmarkRegressor,
     default_model_config,
 )
-from .precision import checkpoint_amp_dtype, checkpoint_autocast_context
+from .precision import checkpoint_autocast_context
+from .pointtransformerv3_model import validate_pointtransformerv3_checkpoint_config
 from .proposal_models import build_landmark_model, build_locator
 from .meshnet import MeshNetLandmarkRegressor, meshnet_inputs
 from .surface import project_points_to_mesh
@@ -145,12 +146,9 @@ class LandmarkExtractor:
         landmark_config = dict(checkpoint["landmark"]["model_config"])
         self.landmark_model_config = dict(landmark_config)
         self.landmark_backbone = landmark_config.get("backbone", "pointnet2")
-        if (
-            self.landmark_backbone == "pointtransformerv3"
-            and checkpoint_amp_dtype(self.landmark_model_config) != "float16"
-        ):
-            raise ValueError(
-                "v2 PTv3 checkpoints must record model_config.amp_dtype='float16'"
+        if self.landmark_backbone == "pointtransformerv3":
+            validate_pointtransformerv3_checkpoint_config(
+                self.landmark_model_config
             )
         if self.landmark_backbone == "meshnet":
             self.meshnet_target_faces = int(landmark_config.pop("target_faces"))

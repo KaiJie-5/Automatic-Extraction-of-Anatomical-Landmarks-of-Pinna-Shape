@@ -54,9 +54,12 @@ Xiaoyang Wu et al., "Point Transformer V3: Simpler, Faster, Stronger,"
 CVPR 2024, https://arxiv.org/abs/2312.10035.
 
 The source is pinned to revision
-`3229e9b7de1770c8ad17c316f8e349982de509f8`. The vendored implementation is
-kept architecturally unchanged. Repository-specific voxel preparation, global
-max pooling, and training-only serialization-order shuffling are implemented in
+`3229e9b7de1770c8ad17c316f8e349982de509f8`. The learned architecture is kept
+unchanged. The vendored constructors have one integration-only modification:
+they accept and forward an optional spconv algorithm argument. The adapter fixes
+that argument to `spconv.ConvAlgo.Native` to avoid the upstream mixed-precision
+evaluation tuner failure. Repository-specific voxel preparation, global max
+pooling, and training-only serialization-order shuffling are implemented in
 `src/pointtransformerv3_model.py` outside the vendored source.
 
 Point Transformer V3 is distributed under the MIT License. Copyright (c) 2023

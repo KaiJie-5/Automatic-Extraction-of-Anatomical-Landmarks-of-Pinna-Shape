@@ -94,11 +94,22 @@ sbatch submit_job_train_pointnet2.slurm ptv3-preflight \
 ```
 
 The job exits with status 2 after writing the report if imports, cold-start FP16
-forward/backward, finite gradients, output shape, or deterministic evaluation
-fail. PTv3 uses FP16 AMP with gradient scaling because the CUDA 11.8 spconv
-tuner failed when a cold H200 process entered the full model through BF16.
+forward/backward, finite gradients, output shape, native-spconv configuration,
+or deterministic evaluation fail. PTv3 uses FP16 AMP with gradient scaling and
+constructs every sparse convolution with `spconv.ConvAlgo.Native`. This avoids
+the mixed-precision evaluation failure in spconv's implicit-GEMM
+`ConvTunerSimple` path documented in
+[spconv issue #563](https://github.com/traveller59/spconv/issues/563) and
+[PTv3 issue #176](https://github.com/Pointcept/PointTransformerV3/issues/176).
 PointNet++ and PointNeXt retain the normal BF16-on-H200 policy. Losses and
 metrics remain FP32. There is no non-Flash fallback.
+
+Do not work around the error by leaving the whole model in training mode during
+validation: that also enables stochastic drop-path/order shuffling and changes
+normalisation behaviour. The CUDA 12.8 source-build recipe in
+[spconv issue #746](https://github.com/traveller59/spconv/issues/746#issuecomment-3155991737)
+targets Blackwell compute capability 12.0; it is not the correct installation
+for the H200 (compute capability 9.0) CUDA 11.8 environment used here.
 
 The dependency-free adapter and CLI tests can be run separately:
 
