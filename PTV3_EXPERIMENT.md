@@ -93,9 +93,12 @@ sbatch submit_job_train_pointnet2.slurm ptv3-preflight \
   --output artifacts/ptv3/preflight.json
 ```
 
-The job exits with status 2 after writing the report if imports, BF16
+The job exits with status 2 after writing the report if imports, cold-start FP16
 forward/backward, finite gradients, output shape, or deterministic evaluation
-fail. There is no non-Flash fallback.
+fail. PTv3 uses FP16 AMP with gradient scaling because the CUDA 11.8 spconv
+tuner failed when a cold H200 process entered the full model through BF16.
+PointNet++ and PointNeXt retain the normal BF16-on-H200 policy. Losses and
+metrics remain FP32. There is no non-Flash fallback.
 
 The dependency-free adapter and CLI tests can be run separately:
 

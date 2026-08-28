@@ -26,6 +26,7 @@ from src.dataset import Dataset as MeshLandmarkDataset
 from src.losses import ANCHOR_INDICES
 from src.meshnet import meshnet_inputs_with_mesh
 from src.pipeline_dataset import prediction_key, prepare_ear_geometry
+from src.precision import checkpoint_amp_dtype, checkpoint_autocast_context
 from src.proposal_models import build_fold_landmark_model
 from src.surface import project_points_to_mesh
 
@@ -217,6 +218,13 @@ def load_fold_context(args: argparse.Namespace) -> FoldContext:
         raise ValueError(f"unsupported proposal fold backbone: {backbone!r}")
     if backbone == "meshnet" and int(model_config.get("target_faces", 0)) <= 0:
         raise ValueError("MeshNet checkpoint is missing a positive target_faces value")
+    if (
+        backbone == "pointtransformerv3"
+        and checkpoint_amp_dtype(model_config) != "float16"
+    ):
+        raise ValueError(
+            "PTv3 checkpoint must record model_config.amp_dtype='float16'"
+        )
     outer_fold = int(data_config.get("outer_fold", -1))
     if outer_fold not in range(5):
         raise ValueError("checkpoint data_config is missing a valid outer_fold")
@@ -331,10 +339,11 @@ def _model_details(
     values: torch.Tensor,
     neighbors: Optional[torch.Tensor],
 ) -> Mapping[str, torch.Tensor]:
-    if context.backbone == "meshnet":
-        details = context.model.forward_with_details(values, neighbors)
-    else:
-        details = context.model.forward_with_details(values)
+    with checkpoint_autocast_context(context.device, context.model_config):
+        if context.backbone == "meshnet":
+            details = context.model.forward_with_details(values, neighbors)
+        else:
+            details = context.model.forward_with_details(values)
     for name in ("coarse", "final"):
         if name not in details or tuple(details[name].shape[1:]) != (85, 3):
             raise RuntimeError(f"model {name} output is not shaped (B, 85, 3)")

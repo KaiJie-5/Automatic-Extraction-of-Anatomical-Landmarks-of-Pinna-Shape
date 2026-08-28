@@ -167,12 +167,18 @@ def build_locator(config: Mapping[str, object]) -> EarCenterLocator:
 
 
 def build_landmark_model(config: Mapping[str, object]) -> ProposalLandmarkRegressor:
-    return ProposalLandmarkRegressor(**dict(config))
+    values = dict(config)
+    # Runtime precision is serialized beside the architecture so evaluation
+    # can reproduce PTv3's required FP16 autocast, but it is not a constructor
+    # argument of the landmark network itself.
+    values.pop("amp_dtype", None)
+    return ProposalLandmarkRegressor(**values)
 
 
 def build_fold_landmark_model(config: Mapping[str, object]) -> nn.Module:
     """Build any landmark backbone accepted by the proposal fold trainer."""
     values = dict(config)
+    values.pop("amp_dtype", None)
     if values.get("backbone") == "meshnet":
         from .meshnet import MeshNetLandmarkRegressor
 

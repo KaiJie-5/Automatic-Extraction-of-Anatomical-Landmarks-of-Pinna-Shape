@@ -13,6 +13,7 @@ from .pointnet2_model import (
     PointNet2LandmarkRegressor,
     default_model_config,
 )
+from .precision import checkpoint_amp_dtype, checkpoint_autocast_context
 from .proposal_models import build_landmark_model, build_locator
 from .meshnet import MeshNetLandmarkRegressor, meshnet_inputs
 from .surface import project_points_to_mesh
@@ -142,7 +143,15 @@ class LandmarkExtractor:
         self.input_mode = "proposal_v2"
         self.locator = build_locator(checkpoint["locator"]["model_config"]).to(self.device)
         landmark_config = dict(checkpoint["landmark"]["model_config"])
+        self.landmark_model_config = dict(landmark_config)
         self.landmark_backbone = landmark_config.get("backbone", "pointnet2")
+        if (
+            self.landmark_backbone == "pointtransformerv3"
+            and checkpoint_amp_dtype(self.landmark_model_config) != "float16"
+        ):
+            raise ValueError(
+                "v2 PTv3 checkpoints must record model_config.amp_dtype='float16'"
+            )
         if self.landmark_backbone == "meshnet":
             self.meshnet_target_faces = int(landmark_config.pop("target_faces"))
             landmark_config.pop("backbone")
@@ -200,7 +209,9 @@ class LandmarkExtractor:
             thresholds=self.crop_calibration.get("fallback_thresholds"),
         )
         local_transform = LocalEarTransform(predicted_center, self.local_scale)
-        with torch.no_grad():
+        with torch.no_grad(), checkpoint_autocast_context(
+            self.device, self.landmark_model_config
+        ):
             if self.landmark_backbone == "meshnet":
                 face_features, neighbors = meshnet_inputs(
                     crop_mesh, self.meshnet_target_faces, ear, local_transform

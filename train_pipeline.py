@@ -48,6 +48,7 @@ from src.pointtransformerv3_model import (
     PTV3_UPSTREAM_REVISION,
     default_pointtransformerv3_config,
 )
+from src.precision import autocast_context
 from src.proposal_models import build_fold_landmark_model, build_locator
 from src.splits import folds_from_audit, save_folds
 from src.training import (
@@ -118,10 +119,14 @@ def landmark_model_config(args, local_scale: float) -> dict:
     elif args.backbone == "pointnext":
         encoder = default_pointnext_config()
     elif args.backbone == "pointtransformerv3":
+        if not getattr(args, "amp", True):
+            raise ValueError(
+                "Point Transformer V3 requires FP16 AMP; remove --no-amp"
+            )
         encoder = default_pointtransformerv3_config(args.ptv3_grid_size)
     else:
         raise ValueError(f"unsupported landmark backbone: {args.backbone}")
-    return {
+    config = {
         "backbone": args.backbone,
         "encoder_config": encoder,
         "four_heads": bool(args.four_heads),
@@ -130,6 +135,12 @@ def landmark_model_config(args, local_scale: float) -> dict:
         "refinement_k": int(args.refinement_k),
         "refinement_cap_normalized": 5.0 / local_scale if args.refinement_k else 0.0,
     }
+    if args.backbone == "pointtransformerv3":
+        # The spconv CUDA 11.8 tuner fails when a cold H200 process starts the
+        # full PTv3 path under BF16. Official PTv3 AMP uses FP16, which passes
+        # cold forward/backward and is serialized for every downstream caller.
+        config["amp_dtype"] = "float16"
+    return config
 
 
 def make_landmark_model(config: Mapping[str, object]):
@@ -570,11 +581,13 @@ def command_fit_landmarks(args):
         "dense_surface_points": dense_points,
         "augmentation": args.augment,
         "loss_weights": loss_weights,
+        "amp_dtype": model_config.get("amp_dtype", "auto"),
     }
     metrics = train_landmarks(
         model, train_data, validation_data, args.output_dir, model_config, data_config,
         loss_weights, device, args.epochs, args.batch_size, 32, args.workers, 1e-3,
         1e-4, args.patience, args.amp, not args.no_resume,
+        str(model_config.get("amp_dtype", "auto")),
     )
     write_json(Path(args.output_dir) / "run_manifest.json", {"model_config": model_config, "data_config": data_config, "metrics": metrics})
     print(json.dumps(metrics, indent=2, sort_keys=True))
@@ -659,6 +672,7 @@ def command_fit_final(args):
         {"calibration": calibration, "train_ids": subject_ids, "loss_weights": weights},
         weights, device, args.landmark_epochs, args.batch_size, 32, args.workers,
         1e-3, 1e-4, 30, args.amp, not args.no_resume,
+        str(landmark_config.get("amp_dtype", "auto")),
     )
     landmark_checkpoint = torch.load(output / "landmarks" / "best_landmarks.pt", map_location="cpu")
     bundle = _bundle_v2(locator_checkpoint, landmark_checkpoint, broad, calibration, args, subject_ids)
@@ -948,7 +962,8 @@ def command_ptv3_preflight(args):
             "num_points": int(args.num_points),
             "grid_sizes": [float(value) for value in args.grid_size],
             "flash_attention": True,
-            "autocast_dtype": "bfloat16",
+            "autocast_dtype": "float16",
+            "gradient_scaling_in_training": True,
             "full_encoder_decoder": True,
             "global_pool": "max",
             "refinement_k": 32,
@@ -992,8 +1007,6 @@ def command_ptv3_preflight(args):
             )
         if device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("PTv3 preflight requires an allocated CUDA GPU")
-        if not torch.cuda.is_bf16_supported():
-            raise RuntimeError("PTv3 preflight requires BF16 support")
         report["environment"]["device"] = str(device)
         report["environment"]["gpu"] = torch.cuda.get_device_name(device)
         for module_name in (
@@ -1025,16 +1038,20 @@ def command_ptv3_preflight(args):
                 "dropout": 0.0,
                 "refinement_k": 32,
                 "refinement_cap_normalized": 0.125,
+                "amp_dtype": "float16",
             }
             model = make_landmark_model(model_config).to(device)
+            probe_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+            probe_scaler = torch.cuda.amp.GradScaler(enabled=True)
             train_input = fixed_input.detach().clone().requires_grad_(True)
             torch.cuda.reset_peak_memory_stats(device)
             model.train()
             started = time.perf_counter()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with autocast_context(device, True, "float16"):
                 training_output = model(train_input)
                 loss = training_output.float().square().mean()
-            loss.backward()
+            probe_scaler.scale(loss).backward()
+            probe_scaler.unscale_(probe_optimizer)
             torch.cuda.synchronize(device)
             train_ms = (time.perf_counter() - started) * 1000.0
             training_counts = list(model.encoder.last_voxel_counts)
@@ -1049,7 +1066,7 @@ def command_ptv3_preflight(args):
             )
 
             model.eval()
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.no_grad(), autocast_context(device, True, "float16"):
                 first = model(fixed_input)
                 first_counts = list(model.encoder.last_voxel_counts)
                 second = model(fixed_input)
@@ -1066,6 +1083,7 @@ def command_ptv3_preflight(args):
                 "finite_training_output": finite_training,
                 "finite_input_gradient": finite_input_gradient,
                 "finite_parameter_gradients": finite_parameter_gradients,
+                "grad_scaler_enabled": bool(probe_scaler.is_enabled()),
                 "finite_evaluation_output": finite_evaluation,
                 "deterministic_evaluation": deterministic,
                 "forward_backward_ms": train_ms,
@@ -1077,13 +1095,14 @@ def command_ptv3_preflight(args):
                 finite_training
                 and finite_input_gradient
                 and finite_parameter_gradients
+                and probe_scaler.is_enabled()
                 and finite_evaluation
                 and deterministic
                 and tuple(first.shape) == (1, 85, 3)
                 and training_counts == first_counts == second_counts
             )
             report["grid_results"].append(result)
-            del model, train_input, training_output, first, second, loss
+            del model, probe_optimizer, probe_scaler, train_input, training_output, first, second, loss
             torch.cuda.empty_cache()
 
         report["passed"] = bool(
@@ -1111,6 +1130,10 @@ def command_package(args):
         raise ValueError(f"v2 checkpoint is incomplete: {missing}")
     landmark_config = checkpoint.get("landmark", {}).get("model_config", {})
     include_ptv3 = landmark_config.get("backbone") == "pointtransformerv3"
+    if include_ptv3 and landmark_config.get("amp_dtype") != "float16":
+        raise ValueError(
+            "PTv3 packaging requires model_config.amp_dtype='float16'"
+        )
     root = Path(__file__).resolve().parent
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

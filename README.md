@@ -649,6 +649,11 @@ guide. If FlashAttention reports that `packaging` cannot be imported from
 `pkg_resources`, reinstall `setuptools==69.5.1`. If its isolated build reports
 that Torch is missing, repeat the installation with `--no-build-isolation`.
 
+PTv3 checkpoints explicitly record `amp_dtype: float16`. This avoids a cold
+H200/spconv CUDA 11.8 tuner failure observed when starting the full model under
+BF16. PTv3 uses FP16 autocast and gradient scaling while losses and metrics are
+accumulated in FP32. Other backbones continue to prefer BF16 on H200.
+
 ## Third-Party Code
 
 `src/pointnet2_utils.py` adapts PointNet++ utilities from:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import random
 import time
@@ -14,6 +13,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from .losses import proposal_landmark_loss
+from .precision import (
+    autocast_context,
+    grad_scaler_enabled,
+    resolved_amp_dtype_name,
+)
 
 
 def seed_everything(seed: int) -> None:
@@ -30,11 +34,12 @@ def resolve_device(value: str) -> torch.device:
     return torch.device(value)
 
 
-def _autocast(device: torch.device, enabled: bool):
-    if not enabled or device.type != "cuda":
-        return contextlib.nullcontext()
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return torch.autocast(device_type="cuda", dtype=dtype)
+def _autocast(
+    device: torch.device,
+    enabled: bool,
+    amp_dtype: str = "auto",
+):
+    return autocast_context(device, enabled, amp_dtype)
 
 
 def _json_dump(path: Path, data: Mapping[str, object]) -> None:
@@ -59,6 +64,8 @@ def probe_batch_size(
     sample: Mapping[str, object],
     device: torch.device,
     candidates: Sequence[int] = (32, 16, 8, 4, 2, 1),
+    amp: bool = True,
+    amp_dtype: str = "auto",
 ) -> int:
     """Probe model forward/backward memory without changing learned parameters."""
     if device.type != "cuda":
@@ -73,7 +80,7 @@ def probe_batch_size(
             else:
                 points = sample["points"].unsqueeze(0).expand(candidate, -1, -1).contiguous().to(device)
             model.zero_grad(set_to_none=True)
-            with _autocast(device, True):
+            with _autocast(device, amp, amp_dtype):
                 output = model(face_features, neighbors) if "face_features" in sample else model(points)
                 output.float().square().mean().backward()
             model.zero_grad(set_to_none=True)
@@ -100,6 +107,8 @@ def _save_component_checkpoint(
     epoch: int,
     metrics: Mapping[str, object],
     data_config: Mapping[str, object],
+    training_config: Mapping[str, object] | None = None,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -113,6 +122,8 @@ def _save_component_checkpoint(
             "epoch": int(epoch),
             "metrics": dict(metrics),
             "data_config": dict(data_config),
+            "training_config": dict(training_config or {}),
+            "scaler_state_dict": scaler.state_dict() if scaler is not None else {},
         },
         path,
     )
@@ -135,29 +146,48 @@ def train_locator(
     patience: int = 30,
     amp: bool = True,
     resume: bool = True,
+    amp_dtype: str = "auto",
 ) -> Mapping[str, object]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     model = model.to(device)
+    resolved_dtype = resolved_amp_dtype_name(device, amp, amp_dtype)
+    runtime_config = {
+        "amp": bool(amp),
+        "amp_dtype": resolved_dtype,
+        "grad_scaler_enabled": grad_scaler_enabled(device, amp, amp_dtype),
+    }
     if batch_size <= 0:
-        batch_size = probe_batch_size(model, train_dataset[0], device)
+        batch_size = probe_batch_size(
+            model, train_dataset[0], device, amp=amp, amp_dtype=amp_dtype
+        )
     accumulation = max(1, int(np.ceil(effective_batch_size / batch_size)))
     train_loader = _loader(train_dataset, batch_size, workers, True)
     validation_loader = _loader(validation_dataset, batch_size, workers, False) if validation_dataset else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp and device.type == "cuda" and not torch.cuda.is_bf16_supported())
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=runtime_config["grad_scaler_enabled"]
+    )
     start_epoch = 1
     best = float("inf")
     stale = 0
     last_path = output / "last_locator.pt"
     if resume and last_path.exists():
         checkpoint = torch.load(last_path, map_location=device)
+        saved_runtime = checkpoint.get("training_config", {})
+        if saved_runtime and saved_runtime.get("amp_dtype") != resolved_dtype:
+            raise ValueError(
+                "cannot resume locator with a different AMP dtype: "
+                f"checkpoint={saved_runtime.get('amp_dtype')}, current={resolved_dtype}"
+            )
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = int(checkpoint["epoch"]) + 1
         best = float(checkpoint["metrics"].get("best_center_error_mm", best))
+        if checkpoint.get("scaler_state_dict"):
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     history = []
     metrics_path = output / "metrics.json"
@@ -170,6 +200,7 @@ def train_locator(
             "best_epoch": int(best_item["epoch"]),
             "physical_batch_size": int(best_item["physical_batch_size"]),
             "gradient_accumulation": int(best_item["gradient_accumulation"]),
+            **runtime_config,
         }
     for epoch in range(start_epoch, epochs + 1):
         train_dataset.set_epoch(epoch)
@@ -180,7 +211,7 @@ def train_locator(
         for step, batch in enumerate(train_loader, 1):
             points = batch["points"].to(device)
             target = batch["center_correction"].to(device)
-            with _autocast(device, amp):
+            with _autocast(device, amp, amp_dtype):
                 prediction = model(points)
                 loss = torch.linalg.norm(prediction.float() - target.float(), dim=-1).mean()
                 scaled_loss = loss / accumulation
@@ -220,15 +251,16 @@ def train_locator(
             "best_center_error_mm": best,
             "physical_batch_size": batch_size,
             "gradient_accumulation": accumulation,
+            **runtime_config,
         }
         history.append({"epoch": epoch, **metrics})
-        _save_component_checkpoint(last_path, "locator", model, model_config, optimizer, scheduler, epoch, metrics, data_config)
+        _save_component_checkpoint(last_path, "locator", model, model_config, optimizer, scheduler, epoch, metrics, data_config, runtime_config, scaler)
         if improved:
-            _save_component_checkpoint(output / "best_locator.pt", "locator", model, model_config, optimizer, scheduler, epoch, metrics, data_config)
+            _save_component_checkpoint(output / "best_locator.pt", "locator", model, model_config, optimizer, scheduler, epoch, metrics, data_config, runtime_config, scaler)
         _json_dump(metrics_path, {"history": history, "best": best})
         if validation_loader and stale >= patience:
             break
-    return {"best_center_error_mm": best, "best_epoch": min(history, key=lambda item: item["validation_center_error_mm"])["epoch"], "physical_batch_size": batch_size, "gradient_accumulation": accumulation}
+    return {"best_center_error_mm": best, "best_epoch": min(history, key=lambda item: item["validation_center_error_mm"])["epoch"], "physical_batch_size": batch_size, "gradient_accumulation": accumulation, **runtime_config}
 
 
 def predict_locator(
@@ -268,29 +300,48 @@ def train_landmarks(
     patience: int = 30,
     amp: bool = True,
     resume: bool = True,
+    amp_dtype: str = "auto",
 ) -> Mapping[str, object]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     model = model.to(device)
+    resolved_dtype = resolved_amp_dtype_name(device, amp, amp_dtype)
+    runtime_config = {
+        "amp": bool(amp),
+        "amp_dtype": resolved_dtype,
+        "grad_scaler_enabled": grad_scaler_enabled(device, amp, amp_dtype),
+    }
     if batch_size <= 0:
-        batch_size = probe_batch_size(model, train_dataset[0], device)
+        batch_size = probe_batch_size(
+            model, train_dataset[0], device, amp=amp, amp_dtype=amp_dtype
+        )
     accumulation = max(1, int(np.ceil(effective_batch_size / batch_size)))
     train_loader = _loader(train_dataset, batch_size, workers, True)
     validation_loader = _loader(validation_dataset, batch_size, workers, False) if validation_dataset else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp and device.type == "cuda" and not torch.cuda.is_bf16_supported())
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=runtime_config["grad_scaler_enabled"]
+    )
     start_epoch = 1
     best = float("inf")
     stale = 0
     last_path = output / "last_landmarks.pt"
     if resume and last_path.exists():
         checkpoint = torch.load(last_path, map_location=device)
+        saved_runtime = checkpoint.get("training_config", {})
+        if saved_runtime and saved_runtime.get("amp_dtype") != resolved_dtype:
+            raise ValueError(
+                "cannot resume landmarks with a different AMP dtype: "
+                f"checkpoint={saved_runtime.get('amp_dtype')}, current={resolved_dtype}"
+            )
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = int(checkpoint["epoch"]) + 1
         best = float(checkpoint["metrics"].get("best_md_mm", best))
+        if checkpoint.get("scaler_state_dict"):
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
     history = []
     metrics_path = output / "metrics.json"
     if resume and metrics_path.exists():
@@ -302,6 +353,7 @@ def train_landmarks(
             "best_epoch": int(best_item["epoch"]),
             "physical_batch_size": int(best_item["physical_batch_size"]),
             "gradient_accumulation": int(best_item["gradient_accumulation"]),
+            **runtime_config,
         }
 
     def run(loader, training: bool):
@@ -322,7 +374,7 @@ def train_landmarks(
             dense = batch.get("dense_surface")
             dense = dense.to(device) if dense is not None else None
             with torch.set_grad_enabled(training):
-                with _autocast(device, amp):
+                with _autocast(device, amp, amp_dtype):
                     prediction = model(face_features, neighbors) if "face_features" in batch else model(points)
                     losses = proposal_landmark_loss(
                         prediction.float(), target.float(), batch["scale"].to(device), dense_surface=dense,
@@ -363,16 +415,17 @@ def train_landmarks(
             "best_md_mm": best,
             "physical_batch_size": batch_size,
             "gradient_accumulation": accumulation,
+            **runtime_config,
         }
         history.append({"epoch": epoch, **metrics})
-        _save_component_checkpoint(last_path, "landmarks", model, model_config, optimizer, scheduler, epoch, metrics, data_config)
+        _save_component_checkpoint(last_path, "landmarks", model, model_config, optimizer, scheduler, epoch, metrics, data_config, runtime_config, scaler)
         if improved:
-            _save_component_checkpoint(output / "best_landmarks.pt", "landmarks", model, model_config, optimizer, scheduler, epoch, metrics, data_config)
+            _save_component_checkpoint(output / "best_landmarks.pt", "landmarks", model, model_config, optimizer, scheduler, epoch, metrics, data_config, runtime_config, scaler)
         _json_dump(metrics_path, {"history": history, "best": best})
         if validation_loader and stale >= patience:
             break
     best_item = min(history, key=lambda item: item["validation"]["mean_distance"])
-    return {"best_md_mm": best, "best_epoch": best_item["epoch"], "physical_batch_size": batch_size, "gradient_accumulation": accumulation}
+    return {"best_md_mm": best, "best_epoch": best_item["epoch"], "physical_batch_size": batch_size, "gradient_accumulation": accumulation, **runtime_config}
 
 
 def benchmark_inference(

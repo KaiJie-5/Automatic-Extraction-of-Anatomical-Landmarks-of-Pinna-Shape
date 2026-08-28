@@ -7,7 +7,12 @@ from src.pointtransformerv3_model import (
     default_pointtransformerv3_config,
     deterministic_voxelize,
 )
-from train_pipeline import build_parser
+from src.precision import (
+    checkpoint_amp_dtype,
+    grad_scaler_enabled,
+    resolve_amp_dtype,
+)
+from train_pipeline import build_parser, landmark_model_config
 
 
 def _voxel_input():
@@ -126,5 +131,52 @@ def test_ptv3_cli_records_grid_size_and_preflight_defaults():
 
     assert training.backbone == "pointtransformerv3"
     assert training.ptv3_grid_size == pytest.approx(0.02)
+    model_config = landmark_model_config(training, local_scale=40.0)
+    assert model_config["amp_dtype"] == "float16"
     assert preflight.grid_size == [0.01, 0.02]
     assert preflight.num_points == 16384
+
+
+def test_ptv3_fp16_policy_is_explicit_and_uses_gradient_scaling():
+    cuda = torch.device("cuda")
+
+    assert resolve_amp_dtype(cuda, True, "float16") is torch.float16
+    assert grad_scaler_enabled(cuda, True, "float16") is True
+    assert checkpoint_amp_dtype({"amp_dtype": "float16"}) == "float16"
+    assert checkpoint_amp_dtype({}) == "none"
+
+
+def test_ptv3_rejects_disabling_amp():
+    parser = build_parser()
+    training = parser.parse_args(
+        [
+            "fit-landmarks",
+            "--folds-json",
+            "folds.json",
+            "--outer-fold",
+            "0",
+            "--predictions-json",
+            "predictions.json",
+            "--calibration-json",
+            "calibration.json",
+            "--output-dir",
+            "runs/ptv3",
+            "--backbone",
+            "pointtransformerv3",
+            "--no-amp",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires FP16 AMP"):
+        landmark_model_config(training, local_scale=40.0)
+
+
+def test_auto_amp_policy_for_other_backbones_is_unchanged(monkeypatch):
+    cuda = torch.device("cuda")
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    assert resolve_amp_dtype(cuda, True, "auto") is torch.bfloat16
+    assert grad_scaler_enabled(cuda, True, "auto") is False
+
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    assert resolve_amp_dtype(cuda, True, "auto") is torch.float16
+    assert grad_scaler_enabled(cuda, True, "auto") is True
