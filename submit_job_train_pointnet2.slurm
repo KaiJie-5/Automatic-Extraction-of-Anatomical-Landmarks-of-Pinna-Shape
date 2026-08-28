@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=quad_h200
+#SBATCH --partition=i7_h200
 #SBATCH --account=ecs
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
