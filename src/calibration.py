@@ -92,6 +92,8 @@ def calibrate_directional_crops(
 ) -> dict:
     if not records:
         raise ValueError("at least one out-of-fold calibration record is required")
+    if not 0.0 < float(primary_complete_coverage) <= 1.0:
+        raise ValueError("primary complete-ear coverage target must be in (0, 1]")
     true_centers = []
     predictions = []
     landmarks = []
@@ -127,7 +129,10 @@ def calibrate_directional_crops(
             selected_coverage = coverage
             break
     if selected_safety is None:
-        raise ValueError("0-5 mm safety search did not reach 99% complete-ear coverage")
+        raise ValueError(
+            "safety search did not reach the requested "
+            f"{100.0 * float(primary_complete_coverage):g}% complete-ear coverage"
+        )
 
     # Store the reaches in float32 because that is what inference loads.  Moving
     # one representable value outwards prevents JSON/float32 round trips from
@@ -181,6 +186,7 @@ def calibrate_directional_crops(
     result = {
         "schema_version": 1,
         "percentile": float(percentile),
+        "primary_complete_coverage_target": float(primary_complete_coverage),
         "safety_mm": selected_safety,
         "primary": {
             "negative": primary_negative.astype(np.float32).tolist(),

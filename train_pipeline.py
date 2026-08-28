@@ -329,7 +329,13 @@ def command_calibrate(args):
     dataset = Dataset(args.mesh_dir, args.landmarks_dir)
     records = _calibration_records(dataset, predictions)
     index = {dataset.get_identifier(i): i for i in range(len(dataset))}
-    preliminary = calibrate_directional_crops(records)
+    primary_complete_coverage = float(args.primary_complete_coverage)
+    if not 0.0 < primary_complete_coverage <= 1.0:
+        raise ValueError("--primary-complete-coverage must be in (0, 1]")
+    preliminary = calibrate_directional_crops(
+        records,
+        primary_complete_coverage=primary_complete_coverage,
+    )
     geometry = []
     for record in records:
         mesh, _, _ = dataset[index[record.subject_id]]
@@ -337,7 +343,11 @@ def command_calibrate(args):
         primary, _ = boxes_for_prediction(canonical_prediction, preliminary)
         crop = clip_mesh_to_box(mesh, primary.for_ear(record.ear))
         geometry.append(crop_geometry_stats(crop))
-    calibration = calibrate_directional_crops(records, geometry_stats=geometry)
+    calibration = calibrate_directional_crops(
+        records,
+        primary_complete_coverage=primary_complete_coverage,
+        geometry_stats=geometry,
+    )
     prediction_output = dict(predictions)
     if outer_fold is not None:
         matching = read_json(
@@ -970,6 +980,15 @@ def build_parser():
     add_data_arguments(calibrate)
     calibrate.add_argument("--locator-run-root", required=True)
     calibrate.add_argument("--outer-fold", default="final", help="0-4 for CV or final")
+    calibrate.add_argument(
+        "--primary-complete-coverage",
+        type=float,
+        default=0.99,
+        help=(
+            "training-OOF complete-ear coverage target used to select the smallest "
+            "0-5 mm primary-crop safety margin (default: 0.99)"
+        ),
+    )
     calibrate.add_argument("--output", required=True)
     calibrate.set_defaults(function=command_calibrate)
 

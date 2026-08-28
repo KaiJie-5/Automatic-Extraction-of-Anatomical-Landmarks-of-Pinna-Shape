@@ -32,6 +32,7 @@ from src.pointnext_model import PointNeXtEncoder
 from src.proposal_models import ProposalLandmarkRegressor
 from src.splits import make_nested_folds
 from src.surface import project_points_to_mesh
+from train_pipeline import build_parser
 
 
 def _write_landmarks(path, points):
@@ -142,6 +143,44 @@ def test_backup_crop_search_rejects_insufficient_expansions():
     )
     with pytest.raises(ValueError, match="backup expansion search"):
         calibrate_directional_crops(records, backup_expansions=(0.0,))
+
+
+def test_primary_complete_coverage_target_selects_robust_safety_margin():
+    axis = np.linspace(-1.0, 1.0, 85, dtype=np.float32)
+    normal = np.stack([axis, axis, axis], axis=1)
+    outlier = normal.copy()
+    outlier[0, 0] = -3.0
+    records = [
+        EarCalibrationRecord(f"S{i}", "left", normal, np.zeros(3, dtype=np.float32))
+        for i in range(100)
+    ]
+    records.append(
+        EarCalibrationRecord("outlier", "left", outlier, np.zeros(3, dtype=np.float32))
+    )
+
+    calibration = calibrate_directional_crops(
+        records,
+        primary_complete_coverage=1.0,
+    )
+
+    assert calibration["primary_complete_coverage_target"] == 1.0
+    assert calibration["safety_mm"] == 2.0
+    assert calibration["primary"]["complete_ear_coverage"] == 1.0
+
+
+def test_calibrate_cli_accepts_primary_complete_coverage_target():
+    args = build_parser().parse_args(
+        [
+            "calibrate",
+            "--locator-run-root",
+            "runs/locator_cv",
+            "--primary-complete-coverage",
+            "1.0",
+            "--output",
+            "artifacts/calibration.json",
+        ]
+    )
+    assert args.primary_complete_coverage == 1.0
 
 
 def test_epoch_sampling_changes_only_for_dynamic_dataset():
