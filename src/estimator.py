@@ -17,6 +17,7 @@ from .precision import checkpoint_autocast_context
 from .pointtransformerv3_model import validate_pointtransformerv3_checkpoint_config
 from .proposal_models import build_landmark_model, build_locator
 from .meshnet import MeshNetLandmarkRegressor, meshnet_inputs
+from .shape_prior import PCAShapePrior
 from .surface import project_points_to_mesh
 from .preprocessing import (
     compute_mesh_normalization,
@@ -44,6 +45,7 @@ class LandmarkExtractor:
         self.device = torch.device(
             "cuda" if device == "auto" and torch.cuda.is_available() else "cpu" if device == "auto" else device
         )
+        self.pca_shape_prior = None
 
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
@@ -114,6 +116,32 @@ class LandmarkExtractor:
     def _clean_state_dict(state_dict):
         return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
 
+    @staticmethod
+    def _load_pca_shape_prior(postprocess):
+        config = postprocess.get("pca_shape_prior")
+        if not isinstance(config, dict) or not bool(config.get("enabled", False)):
+            return None
+        prior = config.get("prior")
+        if not isinstance(prior, dict):
+            raise ValueError("pca_shape_prior.prior must be embedded in the checkpoint")
+        return PCAShapePrior(
+            mean_shape=prior["mean_shape"],
+            components=prior["components"],
+            n_components=int(prior["n_components"]),
+            beta=float(config.get("beta", prior.get("beta", 1.0))),
+            landmark_count=int(prior.get("landmark_count", 85)),
+            coordinate_frame=str(prior.get("coordinate_frame", "")),
+            normalization=str(prior.get("normalization", "")),
+        )
+
+    def _apply_pca_shape_prior(self, local_prediction: np.ndarray) -> np.ndarray:
+        if self.pca_shape_prior is None:
+            return local_prediction
+        refined = self.pca_shape_prior.blend(local_prediction)
+        if refined.shape != (85, 3) or not np.isfinite(refined).all():
+            raise RuntimeError("PCA shape prior returned an invalid (85, 3) prediction")
+        return refined
+
     def _load_v2(self, checkpoint: dict) -> None:
         required = {
             "locator",
@@ -178,9 +206,9 @@ class LandmarkExtractor:
         )
         if "seed" in checkpoint["sampling"]:
             self.seed = int(checkpoint["sampling"]["seed"])
-        self.project_to_surface = bool(
-            checkpoint["postprocess"].get("project_to_surface", False)
-        )
+        postprocess = checkpoint["postprocess"]
+        self.project_to_surface = bool(postprocess.get("project_to_surface", False))
+        self.pca_shape_prior = self._load_pca_shape_prior(postprocess)
 
     def _extract_v2_ear(self, mesh: Trimesh, ear: str, ear_offset: int) -> np.ndarray:
         broad_features, _, _ = sample_canonical_crop(
@@ -224,6 +252,7 @@ class LandmarkExtractor:
                 local_prediction = (
                     self.landmark_model(input_tensor).squeeze(0).float().cpu().numpy()
                 )
+        local_prediction = self._apply_pca_shape_prior(local_prediction)
         canonical_prediction = local_transform.denormalize_xyz(local_prediction)
         prediction = decanonicalize_xyz(canonical_prediction, ear).astype(np.float32)
         if self.project_to_surface:
