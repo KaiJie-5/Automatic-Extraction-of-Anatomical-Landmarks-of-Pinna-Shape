@@ -1,4 +1,4 @@
-"""Portable PyTorch PointNeXt-S/PointNeXt-B-style encoder.
+"""Portable PyTorch PointNeXt S/B/L/XL-style encoder.
 
 This implementation deliberately reuses the repository's PointNet++ sampling and
 grouping primitives. It avoids compiled OpenPoints/CUDA extensions so checkpoints
@@ -18,6 +18,15 @@ from .pointnet2_utils import farthest_point_sample, index_points, square_distanc
 POINTNEXT_VARIANT_BLOCKS = {
     "s": (1, 1, 1, 1, 1),
     "b": (1, 2, 3, 2, 2),
+    "l": (1, 3, 5, 3, 3),
+    "xl": (1, 4, 7, 4, 4),
+}
+
+POINTNEXT_VARIANT_WIDTHS = {
+    "s": 32,
+    "b": 32,
+    "l": 32,
+    "xl": 64,
 }
 
 
@@ -222,13 +231,13 @@ class PointNeXtEncoder(nn.Module):
         return features.amax(dim=1)
 
 
-def default_pointnext_config(width: int = 32, variant: str = "s") -> dict:
-    width = int(width)
-    if width <= 0:
-        raise ValueError("PointNeXt width must be a positive integer")
+def default_pointnext_config(width: int | None = None, variant: str = "s") -> dict:
     variant = str(variant).lower()
     if variant not in POINTNEXT_VARIANT_BLOCKS:
         raise ValueError(f"unsupported PointNeXt variant: {variant}")
+    width = POINTNEXT_VARIANT_WIDTHS[variant] if width is None else int(width)
+    if width <= 0:
+        raise ValueError("PointNeXt width must be a positive integer")
     return {
         "input_channels": 6,
         "width": width,

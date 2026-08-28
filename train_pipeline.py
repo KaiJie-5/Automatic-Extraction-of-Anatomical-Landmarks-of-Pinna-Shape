@@ -121,7 +121,7 @@ def landmark_model_config(args, local_scale: float) -> dict:
         encoder = pointnet_encoder_config()
     elif args.backbone == "pointnext":
         encoder = default_pointnext_config(
-            width=int(getattr(args, "pointnext_width", 32)),
+            width=getattr(args, "pointnext_width", None),
             variant=str(getattr(args, "pointnext_variant", "s")),
         )
     elif args.backbone == "pointtransformerv3":
@@ -1269,19 +1269,19 @@ def add_landmark_model_arguments(parser):
     parser.add_argument(
         "--pointnext-width",
         type=positive_integer,
-        default=32,
+        default=None,
         help=(
-            "base channel width for the PointNeXt landmark encoder "
-            "(C32=32, C64=64); ignored by other backbones"
+            "optional PointNeXt base-width override; by default S/B/L use "
+            "C32 and XL uses C64; ignored by other backbones"
         ),
     )
     parser.add_argument(
         "--pointnext-variant",
-        choices=("s", "b"),
+        choices=("s", "b", "l", "xl"),
         default="s",
         help=(
-            "PointNeXt depth layout: s=[1,1,1,1,1], "
-            "b=[1,2,3,2,2]; ignored by other backbones"
+            "PointNeXt depth preset: s=[1,1,1,1,1], b=[1,2,3,2,2], "
+            "l=[1,3,5,3,3], xl=[1,4,7,4,4]; ignored by other backbones"
         ),
     )
     parser.add_argument("--meshnet-gate-json")

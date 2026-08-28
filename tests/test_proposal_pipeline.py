@@ -301,7 +301,7 @@ def test_pointnext_width_is_cli_tunable_and_checkpoint_ready():
     default_config = landmark_model_config(default_args, local_scale=40.0)
     c64_config = landmark_model_config(c64_args, local_scale=40.0)
     final_config = landmark_model_config(final_args, local_scale=40.0)
-    assert default_args.pointnext_width == 32
+    assert default_args.pointnext_width is None
     assert default_config["encoder_config"]["width"] == 32
     assert c64_args.pointnext_width == 64
     assert c64_config["encoder_config"]["width"] == 64
@@ -413,10 +413,86 @@ def test_pointnext_b_variant_is_cli_tunable_and_checkpoint_ready():
 def test_pointnext_variant_config_validation():
     assert default_pointnext_config(variant="s")["blocks"] == [1, 1, 1, 1, 1]
     assert default_pointnext_config(variant="b")["blocks"] == [1, 2, 3, 2, 2]
+    assert default_pointnext_config(variant="l")["blocks"] == [1, 3, 5, 3, 3]
+    assert default_pointnext_config(variant="xl")["blocks"] == [1, 4, 7, 4, 4]
+    assert default_pointnext_config(variant="l")["width"] == 32
+    assert default_pointnext_config(variant="xl")["width"] == 64
     with pytest.raises(ValueError, match="unsupported PointNeXt variant"):
-        default_pointnext_config(variant="xl")
+        default_pointnext_config(variant="xxl")
     with pytest.raises(ValueError, match="requires blocks"):
         PointNeXtEncoder(variant="b", blocks=[1, 1, 1, 1, 1])
+
+
+@pytest.mark.parametrize(
+    ("variant", "blocks", "width", "extra_blocks"),
+    [
+        ("l", [1, 3, 5, 3, 3], 32, 10),
+        ("xl", [1, 4, 7, 4, 4], 64, 15),
+    ],
+)
+def test_pointnext_l_xl_cli_presets(variant, blocks, width, extra_blocks):
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "fit-landmarks",
+            "--folds-json",
+            "folds.json",
+            "--outer-fold",
+            "0",
+            "--predictions-json",
+            "predictions.json",
+            "--calibration-json",
+            "calibration.json",
+            "--output-dir",
+            f"runs/pointnext_{variant}",
+            "--backbone",
+            "pointnext",
+            "--pointnext-variant",
+            variant,
+        ]
+    )
+    config = landmark_model_config(args, local_scale=40.0)["encoder_config"]
+    assert args.pointnext_width is None
+    assert config["variant"] == variant
+    assert config["blocks"] == blocks
+    assert config["width"] == width
+
+    tiny_config = {
+        **config,
+        "width": 8,
+        "strides": [1, 2, 2, 2, 2],
+        "nsample": 8,
+    }
+    encoder = PointNeXtEncoder(**tiny_config)
+    assert sum(len(stage) for stage in encoder.residual_stages) == extra_blocks
+    assert encoder.feature_dim == 8 * 16
+
+
+def test_pointnext_xl_width_can_be_explicitly_overridden():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "fit-final",
+            "--locator-run-root",
+            "runs/locator_cv",
+            "--calibration-json",
+            "calibration.json",
+            "--locator-epochs",
+            "100",
+            "--landmark-epochs",
+            "100",
+            "--backbone",
+            "pointnext",
+            "--pointnext-variant",
+            "xl",
+            "--pointnext-width",
+            "32",
+        ]
+    )
+    config = landmark_model_config(args, local_scale=40.0)["encoder_config"]
+    assert config["variant"] == "xl"
+    assert config["blocks"] == [1, 4, 7, 4, 4]
+    assert config["width"] == 32
 
 
 def test_pointnext_s_variant_preserves_legacy_checkpoint_keys():

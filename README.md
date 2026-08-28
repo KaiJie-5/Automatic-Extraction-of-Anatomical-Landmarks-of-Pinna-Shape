@@ -155,15 +155,15 @@ python train_pipeline.py fit-landmarks \
   --output-dir runs/fold0_pointnet2_four_heads --four-heads --amp
 ```
 
-The portable PointNeXt landmark encoder defaults to PointNeXt-S-style C32. Use
-`--pointnext-variant b --pointnext-width 32` for the PointNeXt-B depth layout
-`[1,2,3,2,2]`; S uses `[1,1,1,1,1]`. The variant, complete block layout, and
-width are saved in `model_config.encoder_config`, so fold visualisation,
-projection evaluation, final training, and v2 inference rebuild the matching
-architecture automatically. Base width remains independently tunable with
-`--pointnext-width`, but official B comparisons use width 32. Always use a new
-output directory when changing either depth or width; never resume a checkpoint
-from a different PointNeXt configuration.
+The portable PointNeXt landmark encoder defaults to PointNeXt-S-style C32. Select
+the official depth/width presets with `--pointnext-variant s|b|l|xl`: S uses
+`[1,1,1,1,1]` C32, B uses `[1,2,3,2,2]` C32, L uses `[1,3,5,3,3]` C32, and XL
+uses `[1,4,7,4,4]` C64. The variant, complete block layout, and resolved width
+are saved in `model_config.encoder_config`, so fold visualisation, projection
+evaluation, final training, and v2 inference rebuild the matching architecture
+automatically. `--pointnext-width` remains an optional override for nonstandard
+width ablations. Always use a new output directory when changing either depth or
+width; never resume a checkpoint from a different PointNeXt configuration.
 
 After the registered five-fold/three-seed comparisons select a configuration, use
 the cross-validation best epochs to retrain and package one deterministic model:
@@ -537,7 +537,7 @@ experiment sequence.
 |   |-- estimator.py                 # Challenge inference entry point
 |   |-- calibration.py               # OOF crop calibration
 |   |-- proposal_models.py           # Locator, contour heads, refinement
-|   |-- pointnext_model.py            # Portable PointNeXt-S-style encoder
+|   |-- pointnext_model.py            # Portable PointNeXt S/B/L/XL-style encoder
 |   `-- metrics.py                   # Official mean distance metric
 |-- tests/
 |   `-- test_pointnet2_baseline.py
