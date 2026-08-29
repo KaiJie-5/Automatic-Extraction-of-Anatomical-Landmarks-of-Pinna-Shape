@@ -165,6 +165,14 @@ automatically. `--pointnext-width` remains an optional override for nonstandard
 width ablations. Always use a new output directory when changing either depth or
 width; never resume a checkpoint from a different PointNeXt configuration.
 
+Local refinement defaults to KNN neighbourhoods queried directly around each
+raw coarse landmark. `--refinement-anchor nearest-surface-sample` instead snaps
+only the KNN query centre to the closest sampled input point before gathering
+the neighbourhood. The predicted offset remains residual to the raw coarse
+landmark, preserving the training gradient path, and exact triangle projection
+remains a final post-processing operation. The selected anchor mode is stored in
+the landmark checkpoint model configuration.
+
 After the registered five-fold/three-seed comparisons select a configuration, use
 the cross-validation best epochs to retrain and package one deterministic model:
 

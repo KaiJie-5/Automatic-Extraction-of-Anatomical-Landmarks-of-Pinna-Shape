@@ -140,6 +140,7 @@ def landmark_model_config(args, local_scale: float) -> dict:
         "dropout": 0.0,
         "refinement_k": int(args.refinement_k),
         "refinement_cap_normalized": 5.0 / local_scale if args.refinement_k else 0.0,
+        "refinement_anchor": str(getattr(args, "refinement_anchor", "raw")),
     }
     if args.backbone == "pointtransformerv3":
         # Upstream spconv issue #563 identifies mixed-precision evaluation as
@@ -1288,6 +1289,15 @@ def add_landmark_model_arguments(parser):
     parser.add_argument("--four-heads", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--refinement-k", type=int, choices=(0, 32, 64), default=0)
+    parser.add_argument(
+        "--refinement-anchor",
+        choices=("raw", "nearest-surface-sample"),
+        default="raw",
+        help=(
+            "KNN query centre for local refinement; nearest-surface-sample "
+            "anchors the query to the closest sampled input point"
+        ),
+    )
     parser.add_argument("--anchor-weight", type=float, choices=(0.0, 0.01, 0.05, 0.1), default=0.0)
     parser.add_argument("--spacing-weight", type=float, choices=(0.0, 0.01, 0.05, 0.1), default=0.0)
     parser.add_argument("--surface-weight", type=float, choices=(0.0, 0.01, 0.05, 0.1), default=0.0)

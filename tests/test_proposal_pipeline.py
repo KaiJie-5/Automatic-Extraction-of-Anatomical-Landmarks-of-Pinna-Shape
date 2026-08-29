@@ -29,7 +29,7 @@ from src.meshnet import validate_meshnet_mesh
 from src.estimator import LandmarkExtractor
 from src.pipeline_dataset import EpochResampledDataset
 from src.pointnext_model import PointNeXtEncoder, default_pointnext_config
-from src.proposal_models import ProposalLandmarkRegressor
+from src.proposal_models import LocalLandmarkRefiner, ProposalLandmarkRegressor
 from src.splits import make_nested_folds
 from src.surface import project_points_to_mesh
 from train_pipeline import build_parser, landmark_model_config
@@ -239,17 +239,71 @@ def test_four_contour_heads_preserve_85_landmark_order_shape():
 
 def test_local_refiner_shapes_for_both_knn_sizes():
     for k in (32, 64):
-        model = ProposalLandmarkRegressor(
+        for anchor in ("raw", "nearest-surface-sample"):
+            model = ProposalLandmarkRegressor(
+                backbone="pointnet2",
+                encoder_config=_tiny_pointnet_config(),
+                four_heads=False,
+                head_channels=[32],
+                refinement_k=k,
+                refinement_cap_normalized=0.1,
+                refinement_anchor=anchor,
+            ).eval()
+            with torch.no_grad():
+                output = model(torch.randn(1, 64, 6))
+            assert output.shape == (1, 85, 3)
+
+
+def test_surface_anchored_refiner_uses_nearest_sample_as_query_center():
+    xyz = torch.tensor(
+        [[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0]]]
+    )
+    coarse = torch.tensor([[[1.8, 0.2, 1.0], [0.1, 2.8, -0.5]]])
+    raw = LocalLandmarkRefiner(32, 0.1, anchor_mode="raw")
+    anchored = LocalLandmarkRefiner(
+        32, 0.1, anchor_mode="nearest-surface-sample"
+    )
+    assert torch.equal(raw._query_centers(coarse, xyz), coarse)
+    assert torch.equal(
+        anchored._query_centers(coarse, xyz),
+        torch.tensor([[[2.0, 0.0, 0.0], [0.0, 3.0, 0.0]]]),
+    )
+
+
+def test_refinement_anchor_is_cli_tunable_and_checkpointed():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "fit-landmarks",
+            "--folds-json",
+            "folds.json",
+            "--outer-fold",
+            "0",
+            "--predictions-json",
+            "predictions.json",
+            "--calibration-json",
+            "calibration.json",
+            "--output-dir",
+            "runs/surface_anchor",
+            "--backbone",
+            "pointnext",
+            "--refinement-k",
+            "32",
+            "--refinement-anchor",
+            "nearest-surface-sample",
+        ]
+    )
+    config = landmark_model_config(args, local_scale=40.0)
+    assert config["refinement_anchor"] == "nearest-surface-sample"
+    model = ProposalLandmarkRegressor(**config)
+    assert model.refiner.anchor_mode == "nearest-surface-sample"
+    with pytest.raises(ValueError, match="requires refinement_k"):
+        ProposalLandmarkRegressor(
             backbone="pointnet2",
             encoder_config=_tiny_pointnet_config(),
-            four_heads=False,
-            head_channels=[32],
-            refinement_k=k,
-            refinement_cap_normalized=0.1,
-        ).eval()
-        with torch.no_grad():
-            output = model(torch.randn(1, 64, 6))
-        assert output.shape == (1, 85, 3)
+            refinement_k=0,
+            refinement_anchor="nearest-surface-sample",
+        )
 
 
 def test_pointnext_portable_forward_shape():

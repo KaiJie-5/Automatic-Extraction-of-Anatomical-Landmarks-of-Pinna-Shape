@@ -13,6 +13,7 @@ from .pointnext_model import PointNeXtEncoder
 
 
 CONTOUR_LENGTHS = (25, 30, 20, 10)
+REFINEMENT_ANCHOR_MODES = ("raw", "nearest-surface-sample")
 
 
 def _make_encoder(backbone: str, config: Mapping[str, object]):
@@ -54,12 +55,20 @@ class LocalLandmarkRefiner(nn.Module):
         embedding_dim: int = 8,
         contour_embedding_dim: int = 4,
         hidden_dim: int = 64,
+        anchor_mode: str = "raw",
     ):
         super().__init__()
         if k not in {32, 64}:
             raise ValueError("local refinement k must be 32 or 64")
+        anchor_mode = str(anchor_mode).lower()
+        if anchor_mode not in REFINEMENT_ANCHOR_MODES:
+            raise ValueError(
+                "local refinement anchor_mode must be one of "
+                f"{REFINEMENT_ANCHOR_MODES}"
+            )
         self.k = int(k)
         self.offset_cap_normalized = float(offset_cap_normalized)
+        self.anchor_mode = anchor_mode
         self.identity = nn.Embedding(85, embedding_dim)
         self.contour_identity = nn.Embedding(4, contour_embedding_dim)
         contour_ids = torch.repeat_interleave(
@@ -76,13 +85,22 @@ class LocalLandmarkRefiner(nn.Module):
         )
         self.offset_head = nn.Linear(hidden_dim, 3)
 
+    def _query_centers(
+        self, coarse: torch.Tensor, xyz: torch.Tensor
+    ) -> torch.Tensor:
+        if self.anchor_mode == "raw":
+            return coarse
+        nearest_indices = torch.cdist(coarse, xyz).argmin(dim=-1)
+        return index_points(xyz, nearest_indices)
+
     def forward(self, coarse: torch.Tensor, point_cloud: torch.Tensor) -> torch.Tensor:
         if point_cloud.shape[-1] != 6:
             point_cloud = point_cloud.transpose(1, 2)
         xyz = point_cloud[..., :3].float()
         normals = point_cloud[..., 3:6].float()
         coarse_float = coarse.float()
-        indices = torch.cdist(coarse_float, xyz).topk(
+        query_centers = self._query_centers(coarse_float, xyz)
+        indices = torch.cdist(query_centers, xyz).topk(
             min(self.k, xyz.shape[1]), dim=-1, largest=False
         ).indices
         neighbor_xyz = index_points(xyz, indices)
@@ -115,8 +133,19 @@ class ProposalLandmarkRegressor(nn.Module):
         dropout: float = 0.0,
         refinement_k: int = 0,
         refinement_cap_normalized: float = 0.0,
+        refinement_anchor: str = "raw",
     ):
         super().__init__()
+        refinement_anchor = str(refinement_anchor).lower()
+        if refinement_anchor not in REFINEMENT_ANCHOR_MODES:
+            raise ValueError(
+                "refinement_anchor must be one of "
+                f"{REFINEMENT_ANCHOR_MODES}"
+            )
+        if not refinement_k and refinement_anchor != "raw":
+            raise ValueError(
+                "non-raw refinement_anchor requires refinement_k to be enabled"
+            )
         self.encoder = _make_encoder(backbone, encoder_config or {})
         self.four_heads = bool(four_heads)
         if self.four_heads:
@@ -135,7 +164,11 @@ class ProposalLandmarkRegressor(nn.Module):
             )
             self.heads = nn.ModuleList()
         self.refiner = (
-            LocalLandmarkRefiner(refinement_k, refinement_cap_normalized)
+            LocalLandmarkRefiner(
+                refinement_k,
+                refinement_cap_normalized,
+                anchor_mode=refinement_anchor,
+            )
             if refinement_k
             else None
         )

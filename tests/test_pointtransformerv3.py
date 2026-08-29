@@ -146,6 +146,18 @@ def test_ptv3_cli_records_grid_size_and_preflight_defaults():
     assert preflight.grid_size == [0.01, 0.02]
     assert preflight.num_points == 16384
 
+    dense_preflight = parser.parse_args(
+        [
+            "ptv3-preflight",
+            "--num-points",
+            "32768",
+            "--grid-size",
+            "0.02",
+        ]
+    )
+    assert dense_preflight.num_points == 32768
+    assert dense_preflight.grid_size == [0.02]
+
 
 def test_ptv3_fp16_policy_is_explicit_and_uses_gradient_scaling():
     cuda = torch.device("cuda")
