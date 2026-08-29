@@ -592,9 +592,21 @@ def command_fit_landmarks(args):
     }
     metrics = train_landmarks(
         model, train_data, validation_data, args.output_dir, model_config, data_config,
-        loss_weights, device, args.epochs, args.batch_size, 32, args.workers, 1e-3,
-        1e-4, args.patience, args.amp, not args.no_resume,
-        str(model_config.get("amp_dtype", "auto")),
+        loss_weights, device,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        effective_batch_size=args.effective_batch_size,
+        workers=args.workers,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        amp=args.amp,
+        resume=not args.no_resume,
+        amp_dtype=str(model_config.get("amp_dtype", "auto")),
+        encoder_learning_rate=args.encoder_learning_rate,
+        warmup_epochs=args.warmup_epochs,
+        minimum_learning_rate=args.minimum_learning_rate,
+        gradient_clip_norm=args.gradient_clip_norm,
     )
     write_json(Path(args.output_dir) / "run_manifest.json", {"model_config": model_config, "data_config": data_config, "metrics": metrics})
     print(json.dumps(metrics, indent=2, sort_keys=True))
@@ -677,9 +689,21 @@ def command_fit_final(args):
     train_landmarks(
         landmark_model, landmark_data, None, str(output / "landmarks"), landmark_config,
         {"calibration": calibration, "train_ids": subject_ids, "loss_weights": weights},
-        weights, device, args.landmark_epochs, args.batch_size, 32, args.workers,
-        1e-3, 1e-4, 30, args.amp, not args.no_resume,
-        str(landmark_config.get("amp_dtype", "auto")),
+        weights, device,
+        epochs=args.landmark_epochs,
+        batch_size=args.batch_size,
+        effective_batch_size=args.effective_batch_size,
+        workers=args.workers,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        amp=args.amp,
+        resume=not args.no_resume,
+        amp_dtype=str(landmark_config.get("amp_dtype", "auto")),
+        encoder_learning_rate=args.encoder_learning_rate,
+        warmup_epochs=args.warmup_epochs,
+        minimum_learning_rate=args.minimum_learning_rate,
+        gradient_clip_norm=args.gradient_clip_norm,
     )
     landmark_checkpoint = torch.load(output / "landmarks" / "best_landmarks.pt", map_location="cpu")
     bundle = _bundle_v2(locator_checkpoint, landmark_checkpoint, broad, calibration, args, subject_ids)
@@ -1254,6 +1278,73 @@ def positive_integer(value: str) -> int:
     return parsed
 
 
+def nonnegative_integer(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError("value must be a positive finite number")
+    return parsed
+
+
+def nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed < 0.0:
+        raise argparse.ArgumentTypeError(
+            "value must be a non-negative finite number"
+        )
+    return parsed
+
+
+def add_landmark_training_arguments(parser):
+    parser.add_argument(
+        "--learning-rate",
+        type=positive_float,
+        default=1e-3,
+        help="AdamW rate for landmark heads/refiner and, by default, the encoder",
+    )
+    parser.add_argument(
+        "--encoder-learning-rate",
+        type=positive_float,
+        default=None,
+        help="optional separate AdamW rate for the point encoder",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=nonnegative_float,
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=nonnegative_integer,
+        default=0,
+        help="linear warm-up from 10%% to the configured rates before cosine decay",
+    )
+    parser.add_argument(
+        "--minimum-learning-rate",
+        type=nonnegative_float,
+        default=0.0,
+        help="absolute final rate for every AdamW parameter group",
+    )
+    parser.add_argument(
+        "--gradient-clip-norm",
+        type=nonnegative_float,
+        default=0.0,
+        help="maximum global gradient norm; zero disables clipping",
+    )
+    parser.add_argument(
+        "--effective-batch-size",
+        type=positive_integer,
+        default=32,
+        help="target batch size reached through gradient accumulation",
+    )
+
+
 def add_landmark_model_arguments(parser):
     parser.add_argument(
         "--backbone",
@@ -1372,6 +1463,7 @@ def build_parser():
     landmarks = subparsers.add_parser("fit-landmarks")
     add_data_arguments(landmarks)
     add_runtime_arguments(landmarks)
+    add_landmark_training_arguments(landmarks)
     add_landmark_model_arguments(landmarks)
     landmarks.add_argument("--folds-json", required=True)
     landmarks.add_argument("--outer-fold", type=int, required=True)
@@ -1383,6 +1475,7 @@ def build_parser():
     final = subparsers.add_parser("fit-final")
     add_data_arguments(final)
     add_runtime_arguments(final)
+    add_landmark_training_arguments(final)
     add_landmark_model_arguments(final)
     final.add_argument("--locator-run-root", required=True)
     final.add_argument("--calibration-json", required=True)

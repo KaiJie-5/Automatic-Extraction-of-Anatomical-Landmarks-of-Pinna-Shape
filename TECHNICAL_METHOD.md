@@ -37,6 +37,13 @@ MeshNet, and exact
 surface projection are experiments and are not promoted without the registered
 five-fold, three-seed rule in `configs/experiment_matrix.json`.
 
+Landmark optimizer ablations may independently configure the head/refiner and
+encoder AdamW rates, weight decay, a deterministic 10%-to-100% linear warm-up
+followed by cosine decay, an absolute minimum rate, global gradient-norm
+clipping after AMP unscaling, and effective batch size. These values are
+checkpointed and resume-validated. The locator retains its locked optimizer
+configuration so a landmark-backbone experiment cannot change localization.
+
 ## Submission contract
 
 `src.estimator.LandmarkExtractor` loads a schema-version-2 bundle by default and

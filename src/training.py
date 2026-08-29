@@ -97,6 +97,188 @@ def probe_batch_size(
     raise RuntimeError("model did not fit on the GPU even with physical batch size 1")
 
 
+def _landmark_optimizer(
+    model: torch.nn.Module,
+    learning_rate: float,
+    encoder_learning_rate: float | None,
+    weight_decay: float,
+) -> tuple[torch.optim.Optimizer, float]:
+    """Build AdamW with an optional lower rate for the point backbone."""
+    learning_rate = float(learning_rate)
+    resolved_encoder_rate = (
+        learning_rate
+        if encoder_learning_rate is None
+        else float(encoder_learning_rate)
+    )
+    weight_decay = float(weight_decay)
+    if learning_rate <= 0.0 or resolved_encoder_rate <= 0.0:
+        raise ValueError("learning rates must be positive")
+    if weight_decay < 0.0:
+        raise ValueError("weight_decay must be non-negative")
+
+    encoder = getattr(model, "encoder", None)
+    if encoder is None and encoder_learning_rate is not None:
+        raise ValueError(
+            "encoder_learning_rate requires a landmark model with an encoder"
+        )
+    if encoder is None or resolved_encoder_rate == learning_rate:
+        optimizer = torch.optim.AdamW(
+            [{"params": model.parameters(), "lr": learning_rate, "group_name": "all"}],
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+        return optimizer, resolved_encoder_rate
+
+    encoder_parameters = list(encoder.parameters())
+    encoder_ids = {id(parameter) for parameter in encoder_parameters}
+    remaining_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if id(parameter) not in encoder_ids
+    ]
+    if not encoder_parameters or not remaining_parameters:
+        raise ValueError(
+            "separate encoder learning rate requires nonempty encoder and head parameters"
+        )
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": encoder_parameters,
+                "lr": resolved_encoder_rate,
+                "group_name": "encoder",
+            },
+            {
+                "params": remaining_parameters,
+                "lr": learning_rate,
+                "group_name": "heads_and_refiner",
+            },
+        ],
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    return optimizer, resolved_encoder_rate
+
+
+def _landmark_scheduler(
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+    warmup_epochs: int,
+    minimum_learning_rate: float,
+):
+    """Return the legacy cosine schedule or a deterministic warm-up cosine schedule."""
+    epochs = int(epochs)
+    warmup_epochs = int(warmup_epochs)
+    minimum_learning_rate = float(minimum_learning_rate)
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if warmup_epochs < 0 or warmup_epochs >= epochs:
+        raise ValueError("warmup_epochs must be in [0, epochs)")
+    if minimum_learning_rate < 0.0:
+        raise ValueError("minimum_learning_rate must be non-negative")
+    initial_rates = [float(group["lr"]) for group in optimizer.param_groups]
+    if any(minimum_learning_rate > rate for rate in initial_rates):
+        raise ValueError(
+            "minimum_learning_rate cannot exceed an optimizer group's initial rate"
+        )
+
+    if warmup_epochs == 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, epochs),
+            eta_min=minimum_learning_rate,
+        )
+
+    lambdas = []
+    for initial_rate in initial_rates:
+        minimum_factor = minimum_learning_rate / initial_rate
+
+        def multiplier(
+            step: int,
+            *,
+            minimum_factor: float = minimum_factor,
+        ) -> float:
+            if step < warmup_epochs:
+                if warmup_epochs == 1:
+                    warmup_factor = 1.0
+                else:
+                    warmup_factor = 0.1 + 0.9 * float(step) / float(
+                        warmup_epochs - 1
+                    )
+                return max(minimum_factor, warmup_factor)
+            progress = float(step - warmup_epochs) / float(
+                max(1, epochs - warmup_epochs)
+            )
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + float(np.cos(np.pi * progress)))
+            return minimum_factor + (1.0 - minimum_factor) * cosine
+
+        lambdas.append(multiplier)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
+
+
+def _validate_landmark_resume_config(
+    saved: Mapping[str, object], current: Mapping[str, object]
+) -> None:
+    """Reject optimizer/schedule changes that would corrupt a resumed run."""
+    if not saved:
+        return
+    if saved.get("amp_dtype") != current.get("amp_dtype"):
+        raise ValueError(
+            "cannot resume landmarks with a different AMP dtype: "
+            f"checkpoint={saved.get('amp_dtype')}, current={current.get('amp_dtype')}"
+        )
+
+    optimizer_keys = (
+        "optimizer",
+        "learning_rate",
+        "encoder_learning_rate",
+        "weight_decay",
+        "scheduler",
+        "warmup_epochs",
+        "warmup_start_factor",
+        "minimum_learning_rate",
+        "gradient_clip_norm",
+        "epochs",
+        "patience",
+        "effective_batch_size",
+        "physical_batch_size",
+        "gradient_accumulation",
+    )
+    if "learning_rate" not in saved:
+        legacy_defaults = {
+            "learning_rate": 1e-3,
+            "encoder_learning_rate": 1e-3,
+            "weight_decay": 1e-4,
+            "scheduler": "cosine",
+            "warmup_epochs": 0,
+            "minimum_learning_rate": 0.0,
+            "gradient_clip_norm": 0.0,
+        }
+        mismatches = [
+            key
+            for key, expected in legacy_defaults.items()
+            if current.get(key) != expected
+        ]
+        if mismatches:
+            raise ValueError(
+                "cannot resume a legacy landmark checkpoint with new optimizer "
+                f"settings ({', '.join(mismatches)}); use a new output directory"
+            )
+        return
+
+    mismatches = [
+        key for key in optimizer_keys if saved.get(key) != current.get(key)
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{key}: checkpoint={saved.get(key)!r}, current={current.get(key)!r}"
+            for key in mismatches
+        )
+        raise ValueError(
+            "cannot resume landmarks with different training settings; " + details
+        )
+
+
 def _save_component_checkpoint(
     path: Path,
     component: str,
@@ -301,6 +483,10 @@ def train_landmarks(
     amp: bool = True,
     resume: bool = True,
     amp_dtype: str = "auto",
+    encoder_learning_rate: float | None = None,
+    warmup_epochs: int = 0,
+    minimum_learning_rate: float = 0.0,
+    gradient_clip_norm: float = 0.0,
 ) -> Mapping[str, object]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -318,8 +504,38 @@ def train_landmarks(
     accumulation = max(1, int(np.ceil(effective_batch_size / batch_size)))
     train_loader = _loader(train_dataset, batch_size, workers, True)
     validation_loader = _loader(validation_dataset, batch_size, workers, False) if validation_dataset else None
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    optimizer, resolved_encoder_rate = _landmark_optimizer(
+        model,
+        learning_rate,
+        encoder_learning_rate,
+        weight_decay,
+    )
+    scheduler = _landmark_scheduler(
+        optimizer,
+        epochs,
+        warmup_epochs,
+        minimum_learning_rate,
+    )
+    gradient_clip_norm = float(gradient_clip_norm)
+    if gradient_clip_norm < 0.0:
+        raise ValueError("gradient_clip_norm must be non-negative")
+    training_config = {
+        **runtime_config,
+        "optimizer": "adamw",
+        "learning_rate": float(learning_rate),
+        "encoder_learning_rate": float(resolved_encoder_rate),
+        "weight_decay": float(weight_decay),
+        "scheduler": "warmup_cosine" if int(warmup_epochs) else "cosine",
+        "warmup_epochs": int(warmup_epochs),
+        "warmup_start_factor": 0.1 if int(warmup_epochs) else 1.0,
+        "minimum_learning_rate": float(minimum_learning_rate),
+        "gradient_clip_norm": gradient_clip_norm,
+        "epochs": int(epochs),
+        "patience": int(patience),
+        "effective_batch_size": int(effective_batch_size),
+        "physical_batch_size": int(batch_size),
+        "gradient_accumulation": int(accumulation),
+    }
     scaler = torch.cuda.amp.GradScaler(
         enabled=runtime_config["grad_scaler_enabled"]
     )
@@ -330,11 +546,7 @@ def train_landmarks(
     if resume and last_path.exists():
         checkpoint = torch.load(last_path, map_location=device)
         saved_runtime = checkpoint.get("training_config", {})
-        if saved_runtime and saved_runtime.get("amp_dtype") != resolved_dtype:
-            raise ValueError(
-                "cannot resume landmarks with a different AMP dtype: "
-                f"checkpoint={saved_runtime.get('amp_dtype')}, current={resolved_dtype}"
-            )
+        _validate_landmark_resume_config(saved_runtime, training_config)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -346,6 +558,12 @@ def train_landmarks(
     metrics_path = output / "metrics.json"
     if resume and metrics_path.exists():
         history = list(json.loads(metrics_path.read_text(encoding="utf-8")).get("history", []))
+        if history:
+            best_history_index = min(
+                range(len(history)),
+                key=lambda index: history[index]["validation"]["mean_distance"],
+            )
+            stale = len(history) - best_history_index - 1
     if start_epoch > epochs:
         best_item = min(history, key=lambda item: item["validation"]["mean_distance"])
         return {
@@ -353,6 +571,7 @@ def train_landmarks(
             "best_epoch": int(best_item["epoch"]),
             "physical_batch_size": int(best_item["physical_batch_size"]),
             "gradient_accumulation": int(best_item["gradient_accumulation"]),
+            "training_config": training_config,
             **runtime_config,
         }
 
@@ -385,6 +604,11 @@ def train_landmarks(
                 if training:
                     scaler.scale(losses["total"] / accumulation).backward()
                     if step % accumulation == 0 or step == len(loader):
+                        if gradient_clip_norm > 0.0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), gradient_clip_norm
+                            )
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad(set_to_none=True)
@@ -394,6 +618,10 @@ def train_landmarks(
         return {key: value / max(count, 1) for key, value in sums.items()}
 
     for epoch in range(start_epoch, epochs + 1):
+        epoch_learning_rates = {
+            str(group.get("group_name", f"group_{index}")): float(group["lr"])
+            for index, group in enumerate(optimizer.param_groups)
+        }
         train_dataset.set_epoch(epoch)
         train_metrics = run(train_loader, True)
         validation_metrics = train_metrics
@@ -415,17 +643,29 @@ def train_landmarks(
             "best_md_mm": best,
             "physical_batch_size": batch_size,
             "gradient_accumulation": accumulation,
+            "learning_rates": epoch_learning_rates,
+            "training_config": training_config,
             **runtime_config,
         }
         history.append({"epoch": epoch, **metrics})
-        _save_component_checkpoint(last_path, "landmarks", model, model_config, optimizer, scheduler, epoch, metrics, data_config, runtime_config, scaler)
+        _save_component_checkpoint(last_path, "landmarks", model, model_config, optimizer, scheduler, epoch, metrics, data_config, training_config, scaler)
         if improved:
-            _save_component_checkpoint(output / "best_landmarks.pt", "landmarks", model, model_config, optimizer, scheduler, epoch, metrics, data_config, runtime_config, scaler)
-        _json_dump(metrics_path, {"history": history, "best": best})
+            _save_component_checkpoint(output / "best_landmarks.pt", "landmarks", model, model_config, optimizer, scheduler, epoch, metrics, data_config, training_config, scaler)
+        _json_dump(
+            metrics_path,
+            {"history": history, "best": best, "training_config": training_config},
+        )
         if validation_loader and stale >= patience:
             break
     best_item = min(history, key=lambda item: item["validation"]["mean_distance"])
-    return {"best_md_mm": best, "best_epoch": best_item["epoch"], "physical_batch_size": batch_size, "gradient_accumulation": accumulation, **runtime_config}
+    return {
+        "best_md_mm": best,
+        "best_epoch": best_item["epoch"],
+        "physical_batch_size": batch_size,
+        "gradient_accumulation": accumulation,
+        "training_config": training_config,
+        **runtime_config,
+    }
 
 
 def benchmark_inference(

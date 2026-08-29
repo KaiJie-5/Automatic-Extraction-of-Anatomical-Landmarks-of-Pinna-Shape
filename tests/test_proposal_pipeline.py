@@ -32,6 +32,11 @@ from src.pointnext_model import PointNeXtEncoder, default_pointnext_config
 from src.proposal_models import LocalLandmarkRefiner, ProposalLandmarkRegressor
 from src.splits import make_nested_folds
 from src.surface import project_points_to_mesh
+from src.training import (
+    _landmark_optimizer,
+    _landmark_scheduler,
+    _validate_landmark_resume_config,
+)
 from train_pipeline import build_parser, landmark_model_config
 
 
@@ -304,6 +309,66 @@ def test_refinement_anchor_is_cli_tunable_and_checkpointed():
             refinement_k=0,
             refinement_anchor="nearest-surface-sample",
         )
+
+
+def test_landmark_optimizer_supports_transformer_parameter_groups_and_warmup():
+    class TinyLandmarkModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Linear(3, 4)
+            self.head = torch.nn.Linear(4, 3)
+
+    model = TinyLandmarkModel()
+    optimizer, encoder_rate = _landmark_optimizer(
+        model,
+        learning_rate=1e-3,
+        encoder_learning_rate=3e-4,
+        weight_decay=1e-2,
+    )
+    assert encoder_rate == pytest.approx(3e-4)
+    assert [group["group_name"] for group in optimizer.param_groups] == [
+        "encoder",
+        "heads_and_refiner",
+    ]
+    scheduler = _landmark_scheduler(
+        optimizer,
+        epochs=300,
+        warmup_epochs=10,
+        minimum_learning_rate=1e-6,
+    )
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
+        [3e-5, 1e-4]
+    )
+    for _ in range(9):
+        optimizer.step()
+        scheduler.step()
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
+        [3e-4, 1e-3]
+    )
+
+
+def test_landmark_training_resume_rejects_changed_optimizer_settings():
+    current = {
+        "amp_dtype": "float16",
+        "optimizer": "adamw",
+        "learning_rate": 1e-3,
+        "encoder_learning_rate": 3e-4,
+        "weight_decay": 1e-2,
+        "scheduler": "warmup_cosine",
+        "warmup_epochs": 10,
+        "warmup_start_factor": 0.1,
+        "minimum_learning_rate": 1e-6,
+        "gradient_clip_norm": 1.0,
+        "epochs": 300,
+        "patience": 50,
+        "effective_batch_size": 32,
+        "physical_batch_size": 4,
+        "gradient_accumulation": 8,
+    }
+    _validate_landmark_resume_config(dict(current), current)
+    changed = {**current, "learning_rate": 5e-4}
+    with pytest.raises(ValueError, match="learning_rate"):
+        _validate_landmark_resume_config(current, changed)
 
 
 def test_pointnext_portable_forward_shape():

@@ -131,12 +131,33 @@ def test_ptv3_cli_records_grid_size_and_preflight_defaults():
             "pointtransformerv3",
             "--ptv3-grid-size",
             "0.02",
+            "--learning-rate",
+            "0.001",
+            "--encoder-learning-rate",
+            "0.0003",
+            "--weight-decay",
+            "0.01",
+            "--warmup-epochs",
+            "10",
+            "--minimum-learning-rate",
+            "0.000001",
+            "--gradient-clip-norm",
+            "1.0",
+            "--effective-batch-size",
+            "32",
         ]
     )
     preflight = parser.parse_args(["ptv3-preflight"])
 
     assert training.backbone == "pointtransformerv3"
     assert training.ptv3_grid_size == pytest.approx(0.02)
+    assert training.learning_rate == pytest.approx(1e-3)
+    assert training.encoder_learning_rate == pytest.approx(3e-4)
+    assert training.weight_decay == pytest.approx(1e-2)
+    assert training.warmup_epochs == 10
+    assert training.minimum_learning_rate == pytest.approx(1e-6)
+    assert training.gradient_clip_norm == pytest.approx(1.0)
+    assert training.effective_batch_size == 32
     model_config = landmark_model_config(training, local_scale=40.0)
     assert model_config["amp_dtype"] == PTV3_AMP_DTYPE
     assert (

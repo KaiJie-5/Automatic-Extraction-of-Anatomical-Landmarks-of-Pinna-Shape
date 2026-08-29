@@ -677,6 +677,29 @@ and [spconv issue #563](https://github.com/traveller59/spconv/issues/563).
 Do not force the complete network into training mode for validation. Other
 backbones continue to prefer BF16 on H200.
 
+Landmark training exposes optimizer controls for transformer-specific screens:
+
+```text
+--learning-rate
+--encoder-learning-rate
+--weight-decay
+--warmup-epochs
+--minimum-learning-rate
+--gradient-clip-norm
+--effective-batch-size
+```
+
+`--learning-rate` controls the contour heads and local refiner.
+`--encoder-learning-rate` optionally creates a separate AdamW parameter group
+for the point backbone; omitting it uses the head rate everywhere. A positive
+warm-up starts at 10% of each configured rate, reaches the configured rates on
+the final warm-up epoch, and then follows cosine decay to the absolute minimum
+rate. Gradient clipping is applied after AMP unscaling. All resolved optimizer,
+schedule, physical-batch, and accumulation settings are stored in checkpoints
+and `metrics.json`. Resuming with different settings is rejected; use a new
+output directory for every hyperparameter candidate. Defaults exactly preserve
+the original single-rate AdamW and cosine schedule.
+
 ## Third-Party Code
 
 `src/pointnet2_utils.py` adapts PointNet++ utilities from:
