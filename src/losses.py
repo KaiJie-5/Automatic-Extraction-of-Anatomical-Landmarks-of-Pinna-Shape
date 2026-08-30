@@ -96,10 +96,14 @@ def surface_heatmap_kl(
     target_probabilities = torch.softmax(target_logits, dim=-1)
     target_log_probabilities = torch.log_softmax(target_logits, dim=-1)
     predicted_log_probabilities = torch.log_softmax(logits.float(), dim=-1)
-    return (
+    divergence = (
         target_probabilities
         * (target_log_probabilities - predicted_log_probabilities)
     ).sum(dim=-1).mean()
+    # KL is mathematically non-negative, but an almost perfect distribution can
+    # accumulate a tiny negative value (around 1e-21) in finite precision.
+    # Clamping restores the invariant without affecting any meaningful loss.
+    return divergence.clamp_min(0.0)
 
 
 def proposal_landmark_loss(
