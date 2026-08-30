@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -25,6 +26,13 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def unit_float(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be in [0, 1]")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mesh-dir", required=True)
@@ -34,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictions-json", required=True)
     parser.add_argument("--calibration-json", required=True)
     parser.add_argument("--components", type=positive_int, default=32)
-    parser.add_argument("--beta", type=float, default=1.0)
+    parser.add_argument("--beta", type=unit_float, default=1.0)
     parser.add_argument("--output", required=True)
     parser.add_argument("--manifest", required=True)
     return parser
@@ -45,8 +53,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     dataset = Dataset(args.mesh_dir, args.landmarks_dir)
     folds = read_json(args.folds_json)
     calibration = read_json(args.calibration_json)
-    predictions = load_center_predictions(args.predictions_json)
+    dataset_ids = [dataset.get_identifier(index) for index in range(len(dataset))]
+    predictions = load_center_predictions(args.predictions_json, dataset_ids)
     subject_ids = select_training_subjects(dataset, folds, args.outer_fold)
+    dataset_checksum = hashlib.sha256(
+        "\n".join(sorted(dataset_ids)).encode("utf-8")
+    ).hexdigest()
+    if folds.get("subject_checksum") != dataset_checksum:
+        raise ValueError("dataset subject IDs do not match folds JSON checksum")
     shapes = build_training_shapes(dataset, subject_ids, predictions, calibration)
 
     prior = PCAShapePrior.fit(shapes, n_components=args.components, beta=args.beta)
@@ -66,6 +80,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "folds_json_sha256": file_sha256(args.folds_json),
         "predictions_json_sha256": file_sha256(args.predictions_json),
         "calibration_json_sha256": file_sha256(args.calibration_json),
+        "prior_sha256": file_sha256(args.output),
     }
     manifest_path = Path(args.manifest)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)

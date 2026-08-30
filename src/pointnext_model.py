@@ -176,6 +176,10 @@ class PointNeXtEncoder(nn.Module):
         self.blocks = blocks
         self.stem = _MLP(input_channels, width, expansion=1)
         channels = [width, width * 2, width * 4, width * 8, width * 16]
+        # Plain Python metadata only: adding this field does not alter legacy
+        # PointNeXt state-dictionary keys.  Surface decoders use it to build
+        # feature-propagation layers around the same proven encoder.
+        self.stage_channels = tuple(channels)
         stages = []
         residual_stages = []
         input_dim = width
@@ -214,7 +218,14 @@ class PointNeXtEncoder(nn.Module):
         self.residual_stages = nn.ModuleList(residual_stages)
         self.feature_dim = channels[-1]
 
-    def forward(self, point_cloud: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, point_cloud: torch.Tensor) -> dict:
+        """Return every spatial feature level plus the legacy global feature.
+
+        The ordinary coordinate-regression model continues to call
+        :meth:`forward`, whose result is unchanged.  Keeping this path inside
+        the encoder prevents a surface decoder from reimplementing or subtly
+        changing the PointNeXt sampling and neighbourhood operations.
+        """
         if point_cloud.ndim != 3:
             raise ValueError("point_cloud must have shape (B, N, C) or (B, C, N)")
         if point_cloud.shape[-1] != self.input_channels:
@@ -224,11 +235,22 @@ class PointNeXtEncoder(nn.Module):
                 raise ValueError(f"expected {self.input_channels} input channels")
         xyz = point_cloud[..., :3]
         features = self.stem(point_cloud)
+        xyz_levels = []
+        feature_levels = []
         for stage, residual_blocks in zip(self.stages, self.residual_stages):
             xyz, features = stage(xyz, features)
             for block in residual_blocks:
                 features = block(xyz, features)
-        return features.amax(dim=1)
+            xyz_levels.append(xyz)
+            feature_levels.append(features)
+        return {
+            "xyz": xyz_levels,
+            "features": feature_levels,
+            "global": features.amax(dim=1),
+        }
+
+    def forward(self, point_cloud: torch.Tensor) -> torch.Tensor:
+        return self.forward_features(point_cloud)["global"]
 
 
 def default_pointnext_config(width: int | None = None, variant: str = "s") -> dict:

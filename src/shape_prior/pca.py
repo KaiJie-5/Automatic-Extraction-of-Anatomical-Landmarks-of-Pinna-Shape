@@ -58,7 +58,11 @@ class PCAShapePrior:
         self.beta = float(self.beta)
         if self.coordinate_frame != COORDINATE_FRAME or self.normalization != NORMALIZATION:
             raise ValueError("unsupported PCA shape-prior coordinate metadata")
-        if self.n_components < 0 or not np.isfinite(self.beta):
+        if (
+            self.n_components <= 0
+            or not np.isfinite(self.beta)
+            or not 0.0 <= self.beta <= 1.0
+        ):
             raise ValueError("invalid PCA shape-prior settings")
 
     @classmethod
@@ -97,6 +101,8 @@ class PCAShapePrior:
         """Blend one prediction or a batch with its PCA projection."""
         values = np.asarray(prediction, dtype=np.float32)
         weight = self.beta if beta is None else float(beta)
+        if not np.isfinite(weight) or not 0.0 <= weight <= 1.0:
+            raise ValueError("PCA blend beta must be finite and in [0, 1]")
         projected = (
             self.project_one(values, n_components)
             if values.ndim == 2

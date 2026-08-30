@@ -31,9 +31,15 @@ one head or four contour heads of 25, 30, 20, and 10 points.
 
 The official mean Euclidean distance in millimetres is always the base loss.
 Optional anchor, within-section spacing, and one-directional dense-surface losses
-are enabled independently. Local KNN refinement supports raw-coarse or nearest
-sampled-surface query anchors. Depth/width-tunable portable PointNeXt S/B/L/XL,
-MeshNet, and exact
+are enabled independently. The optional PointNeXt surface-heatmap decoder
+propagates the encoder hierarchy to the original sampled surface and learns one
+Gaussian-supervised probability distribution per ordered landmark. Its coarse
+coordinates are top-K probability expectations, followed by the unchanged local
+refiner. Local KNN refinement supports raw-coarse or nearest sampled-surface
+query anchors. A fold-only PCA shape prior is evaluated both before and after
+the exact triangle projection, with prior artifacts cryptographically bound to
+their folds and calibration inputs. Depth/width-tunable portable PointNeXt
+S/B/L/XL, MeshNet, statistical shape priors, and exact
 surface projection are experiments and are not promoted without the registered
 five-fold, three-seed rule in `configs/experiment_matrix.json`.
 

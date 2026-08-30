@@ -173,6 +173,26 @@ landmark, preserving the training gradient path, and exact triangle projection
 remains a final post-processing operation. The selected anchor mode is stored in
 the landmark checkpoint model configuration.
 
+Two optional landmark experiments remain isolated from the coordinate-regression
+baseline:
+
+- `--landmark-decoder surface-heatmap` keeps PointNeXt's five spatial feature
+  levels, propagates them back to every sampled crop-surface point, and predicts
+  85 ordered landmark probability maps. Coordinates are differentiable top-K
+  expectations over sampled surface candidates; K=32 refinement and exact
+  triangle projection remain unchanged. This decoder requires `--backbone
+  pointnext` and a positive `--heatmap-weight`.
+- `generate-pca-prior` and `evaluate-pca-prior` fit a PCA prior from only the
+  outer-training landmarks and evaluate the deployment order of model output,
+  PCA blend, then exact projection. The manifest binds the prior to the fold,
+  calibration, centre predictions, and training subject IDs. Never reuse one
+  fold's prior on another fold.
+
+For PCA confirmation, place the 15 locked reports at
+`<report-root>/foldN_seedS.json` and run `summarize-pca-prior`. It promotes only
+when the ear-pooled projected MD is lower across all 15 reports and at least
+three of five fold means improve.
+
 After the registered five-fold/three-seed comparisons select a configuration, use
 the cross-validation best epochs to retrain and package one deterministic model:
 

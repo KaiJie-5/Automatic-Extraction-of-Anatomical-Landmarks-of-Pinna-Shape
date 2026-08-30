@@ -30,9 +30,41 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def load_center_predictions(path: str | Path) -> Mapping[str, Sequence[float]]:
+def load_center_predictions(
+    path: str | Path,
+    expected_subject_ids: Sequence[str] | None = None,
+) -> Mapping[str, np.ndarray]:
     data = read_json(path)
-    return data.get("center_predictions", data)
+    if data.get("coordinate_frame") != "canonical_mm":
+        raise ValueError(
+            "centre predictions must declare coordinate_frame='canonical_mm'"
+        )
+    raw = data.get("center_predictions")
+    if not isinstance(raw, Mapping):
+        raise ValueError("centre predictions JSON is missing center_predictions")
+    if expected_subject_ids is not None:
+        expected = {
+            f"{subject_id}:{ear}"
+            for subject_id in expected_subject_ids
+            for ear in EAR_NAMES
+        }
+        actual = set(raw)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            raise ValueError(
+                "centre prediction coverage does not match the dataset: "
+                f"missing={missing[:5]}, extra={extra[:5]}"
+            )
+    result = {}
+    for key, value in raw.items():
+        center = np.asarray(value, dtype=np.float32)
+        if center.shape != (3,) or not np.isfinite(center).all():
+            raise ValueError(
+                f"centre prediction {key} is not a finite three-value vector"
+            )
+        result[str(key)] = center
+    return result
 
 
 def select_training_subjects(dataset: Dataset, folds: Mapping[str, object], outer_fold: str) -> list[str]:

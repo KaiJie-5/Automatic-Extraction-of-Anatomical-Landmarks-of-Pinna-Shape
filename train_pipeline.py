@@ -106,6 +106,9 @@ def locator_model_config(backbone: str = "pointnet2") -> dict:
 
 
 def landmark_model_config(args, local_scale: float) -> dict:
+    decoder = str(getattr(args, "landmark_decoder", "coordinate-regression"))
+    if decoder == "surface-heatmap" and args.backbone != "pointnext":
+        raise ValueError("--landmark-decoder surface-heatmap requires --backbone pointnext")
     if args.backbone == "meshnet":
         gate = read_json(args.meshnet_gate_json) if args.meshnet_gate_json else None
         if not gate or not gate.get("passed") or not gate.get("target_faces"):
@@ -132,6 +135,23 @@ def landmark_model_config(args, local_scale: float) -> dict:
         encoder = default_pointtransformerv3_config(args.ptv3_grid_size)
     else:
         raise ValueError(f"unsupported landmark backbone: {args.backbone}")
+    if decoder == "surface-heatmap":
+        if int(args.heatmap_topk) > int(args.num_points):
+            raise ValueError("--heatmap-topk cannot exceed --num-points")
+        return {
+            "backbone": "pointnext",
+            "decoder": "surface_heatmap",
+            "encoder_config": encoder,
+            "four_heads": bool(args.four_heads),
+            "heatmap_feature_dim": int(args.heatmap_feature_dim),
+            "heatmap_topk": int(args.heatmap_topk),
+            "heatmap_coordinate_temperature": float(
+                args.heatmap_coordinate_temperature
+            ),
+            "refinement_k": int(args.refinement_k),
+            "refinement_cap_normalized": 5.0 / local_scale if args.refinement_k else 0.0,
+            "refinement_anchor": str(getattr(args, "refinement_anchor", "raw")),
+        }
     config = {
         "backbone": args.backbone,
         "encoder_config": encoder,
@@ -148,6 +168,26 @@ def landmark_model_config(args, local_scale: float) -> dict:
         # Native algorithm, bypassing ConvTunerSimple; PTv3 retains FP16 AMP.
         config["amp_dtype"] = PTV3_AMP_DTYPE
     return config
+
+
+def landmark_loss_config(args) -> dict:
+    decoder = str(getattr(args, "landmark_decoder", "coordinate-regression"))
+    heatmap_weight = float(getattr(args, "heatmap_weight", 0.0))
+    if decoder == "surface-heatmap" and heatmap_weight <= 0.0:
+        raise ValueError(
+            "surface-heatmap training requires a positive --heatmap-weight"
+        )
+    if decoder != "surface-heatmap" and heatmap_weight != 0.0:
+        raise ValueError(
+            "--heatmap-weight is only valid with --landmark-decoder surface-heatmap"
+        )
+    return {
+        "anchor": float(args.anchor_weight),
+        "spacing": float(args.spacing_weight),
+        "surface": float(args.surface_weight),
+        "heatmap": heatmap_weight,
+        "heatmap_sigma_mm": float(getattr(args, "heatmap_sigma_mm", 2.0)),
+    }
 
 
 def make_landmark_model(config: Mapping[str, object]):
@@ -568,11 +608,7 @@ def command_fit_landmarks(args):
     )
     model_config = landmark_model_config(args, float(calibration["local_scale"]))
     model = make_landmark_model(model_config)
-    loss_weights = {
-        "anchor": args.anchor_weight,
-        "spacing": args.spacing_weight,
-        "surface": args.surface_weight,
-    }
+    loss_weights = landmark_loss_config(args)
     data_config = {
         "outer_fold": args.outer_fold,
         "train_ids": outer["train"],
@@ -685,7 +721,7 @@ def command_fit_final(args):
     landmark_data = make_landmark_dataset(
         args, predictions, calibration, subject_ids, args.seed, True
     )
-    weights = {"anchor": args.anchor_weight, "spacing": args.spacing_weight, "surface": args.surface_weight}
+    weights = landmark_loss_config(args)
     train_landmarks(
         landmark_model, landmark_data, None, str(output / "landmarks"), landmark_config,
         {"calibration": calibration, "train_ids": subject_ids, "loss_weights": weights},
@@ -897,6 +933,22 @@ def command_evaluate_projection(args):
     raw_array = np.stack(raw_errors)
     projected_array = np.stack(projected_errors)
     displacement_array = np.stack(projection_displacements)
+    raw_ear_md = np.asarray(
+        [item["raw_md_mm"] for item in per_ear.values()], dtype=np.float64
+    )
+    projected_ear_md = np.asarray(
+        [item["projected_md_mm"] for item in per_ear.values()], dtype=np.float64
+    )
+
+    def distribution(values):
+        return {
+            "mean": float(np.mean(values)),
+            "median": float(np.median(values)),
+            "p90": float(np.percentile(values, 90.0)),
+            "p95": float(np.percentile(values, 95.0)),
+            "maximum": float(np.max(values)),
+        }
+
     raw_pooled = float(np.mean(raw_array))
     projected_pooled = float(np.mean(projected_array))
     delta = projected_pooled - raw_pooled
@@ -914,10 +966,12 @@ def command_evaluate_projection(args):
         "raw": {
             "pooled_md_mm": raw_pooled,
             "per_landmark_md_mm": np.mean(raw_array, axis=0).tolist(),
+            "ear_distribution_mm": distribution(raw_ear_md),
         },
         "projected": {
             "pooled_md_mm": projected_pooled,
             "per_landmark_md_mm": np.mean(projected_array, axis=0).tolist(),
+            "ear_distribution_mm": distribution(projected_ear_md),
         },
         "comparison": {
             "delta_mm": delta,
@@ -930,6 +984,8 @@ def command_evaluate_projection(args):
                     for item in per_ear.values()
                 )
             ),
+            "unchanged_ears": int(np.sum(projected_ear_md == raw_ear_md)),
+            "worsened_ears": int(np.sum(projected_ear_md > raw_ear_md)),
             "mean_projection_displacement_mm": float(
                 np.mean(displacement_array)
             ),
@@ -949,6 +1005,86 @@ def command_evaluate_projection(args):
         f"Fold {context.outer_fold} seed {context.run_seed}: "
         f"raw={raw_pooled:.6f} mm, projected={projected_pooled:.6f} mm, "
         f"delta={delta:+.6f} mm"
+    )
+
+
+def command_generate_pca_prior(args):
+    """Fit a leakage-safe PCA prior using only one outer-training fold."""
+    from src.shape_prior.generate_prior import main as generate_prior
+
+    generate_prior(
+        [
+            "--mesh-dir",
+            args.mesh_dir,
+            "--landmarks-dir",
+            args.landmarks_dir,
+            "--folds-json",
+            args.folds_json,
+            "--outer-fold",
+            str(args.outer_fold),
+            "--predictions-json",
+            args.predictions_json,
+            "--calibration-json",
+            args.calibration_json,
+            "--components",
+            str(args.components),
+            "--beta",
+            str(args.beta),
+            "--output",
+            args.output,
+            "--manifest",
+            args.manifest,
+        ]
+    )
+
+
+def command_evaluate_pca_prior(args):
+    """Evaluate PCA before exact projection on a strictly held-out fold."""
+    from src.shape_prior.evaluate_prior import main as evaluate_prior
+
+    values = [
+        "--checkpoint-path",
+        args.checkpoint_path,
+        "--prior-path",
+        args.prior_path,
+        "--prior-manifest",
+        args.prior_manifest,
+        "--mesh-dir",
+        args.mesh_dir,
+        "--landmarks-dir",
+        args.landmarks_dir,
+        "--folds-json",
+        args.folds_json,
+        "--predictions-json",
+        args.predictions_json,
+        "--calibration-json",
+        args.calibration_json,
+        "--components",
+        str(args.components),
+        "--beta",
+        str(args.beta),
+        "--output",
+        args.output,
+        "--device",
+        args.device,
+    ]
+    if args.run_seed is not None:
+        values.extend(["--run-seed", str(args.run_seed)])
+    evaluate_prior(values)
+
+
+def command_summarize_pca_prior(args):
+    from src.shape_prior.summarize_prior import main as summarize_prior
+
+    summarize_prior(
+        [
+            "--report-root",
+            args.report_root,
+            "--seeds",
+            *(str(seed) for seed in args.seeds),
+            "--output",
+            args.output,
+        ]
     )
 
 
@@ -1301,6 +1437,13 @@ def nonnegative_float(value: str) -> float:
     return parsed
 
 
+def unit_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be finite and in [0, 1]")
+    return parsed
+
+
 def add_landmark_training_arguments(parser):
     parser.add_argument(
         "--learning-rate",
@@ -1375,6 +1518,46 @@ def add_landmark_model_arguments(parser):
             "PointNeXt depth preset: s=[1,1,1,1,1], b=[1,2,3,2,2], "
             "l=[1,3,5,3,3], xl=[1,4,7,4,4]; ignored by other backbones"
         ),
+    )
+    parser.add_argument(
+        "--landmark-decoder",
+        choices=("coordinate-regression", "surface-heatmap"),
+        default="coordinate-regression",
+        help=(
+            "coordinate-regression preserves the legacy global XYZ heads; "
+            "surface-heatmap retains PointNeXt spatial features and predicts "
+            "85 distributions over sampled crop-surface points"
+        ),
+    )
+    parser.add_argument(
+        "--heatmap-feature-dim",
+        type=positive_integer,
+        default=128,
+        help="full-resolution point/query feature width for the surface decoder",
+    )
+    parser.add_argument(
+        "--heatmap-topk",
+        type=positive_integer,
+        default=64,
+        help="highest-scoring surface candidates used for each coordinate expectation",
+    )
+    parser.add_argument(
+        "--heatmap-coordinate-temperature",
+        type=positive_float,
+        default=1.0,
+        help="softmax temperature within the selected surface candidates",
+    )
+    parser.add_argument(
+        "--heatmap-weight",
+        type=nonnegative_float,
+        default=0.0,
+        help="weight of Gaussian surface-heatmap KL; must be positive for the surface decoder",
+    )
+    parser.add_argument(
+        "--heatmap-sigma-mm",
+        type=positive_float,
+        default=2.0,
+        help="Gaussian target standard deviation in original millimetres",
     )
     parser.add_argument("--meshnet-gate-json")
     parser.add_argument("--four-heads", action=argparse.BooleanOptionalAction, default=True)
@@ -1503,6 +1686,39 @@ def build_parser():
     projection.add_argument("--output", required=True)
     projection.add_argument("--device", default="auto")
     projection.set_defaults(function=command_evaluate_projection)
+
+    pca_generate = subparsers.add_parser("generate-pca-prior")
+    add_data_arguments(pca_generate)
+    pca_generate.add_argument("--folds-json", required=True)
+    pca_generate.add_argument("--outer-fold", required=True, help="0-4 or final")
+    pca_generate.add_argument("--predictions-json", required=True)
+    pca_generate.add_argument("--calibration-json", required=True)
+    pca_generate.add_argument("--components", type=positive_integer, default=32)
+    pca_generate.add_argument("--beta", type=unit_float, default=1.0)
+    pca_generate.add_argument("--output", required=True)
+    pca_generate.add_argument("--manifest", required=True)
+    pca_generate.set_defaults(function=command_generate_pca_prior)
+
+    pca_evaluate = subparsers.add_parser("evaluate-pca-prior")
+    add_data_arguments(pca_evaluate)
+    pca_evaluate.add_argument("--checkpoint-path", required=True)
+    pca_evaluate.add_argument("--prior-path", required=True)
+    pca_evaluate.add_argument("--prior-manifest", required=True)
+    pca_evaluate.add_argument("--folds-json", required=True)
+    pca_evaluate.add_argument("--predictions-json", required=True)
+    pca_evaluate.add_argument("--calibration-json", required=True)
+    pca_evaluate.add_argument("--components", type=positive_integer, default=32)
+    pca_evaluate.add_argument("--beta", type=unit_float, default=1.0)
+    pca_evaluate.add_argument("--run-seed", type=int)
+    pca_evaluate.add_argument("--output", required=True)
+    pca_evaluate.add_argument("--device", default="auto")
+    pca_evaluate.set_defaults(function=command_evaluate_pca_prior)
+
+    pca_summary = subparsers.add_parser("summarize-pca-prior")
+    pca_summary.add_argument("--report-root", required=True)
+    pca_summary.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
+    pca_summary.add_argument("--output", required=True)
+    pca_summary.set_defaults(function=command_summarize_pca_prior)
 
     gate = subparsers.add_parser("meshnet-gate")
     add_data_arguments(gate)

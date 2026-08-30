@@ -1,87 +1,83 @@
-# PCA Shape Prior
+# Projection-Aware PCA Shape Prior
 
-This module builds and applies a PCA statistical shape prior for the 85 pinna landmarks.
-It is inference-time post-processing only: it does not train the landmark model, change
-the loss, or change the model architecture.
-
-The prior is applied to the crop-local canonical normalized landmark prediction after the
-landmark model and `LocalLandmarkRefiner`.
-
-The purpose is to make the final 85 predicted landmarks more anatomically consistent by constraining them toward realistic ear landmark shapes observed in the labelled training data.
-
+This optional post-processing experiment constrains the 85 crop-local canonical
+landmarks to statistical ear shapes learned from labelled outer-training ears.
+It does not retrain or alter the landmark backbone.
 
 ```text
-ear landmark shapes from training samples
-        ↓
-learn mean ear shape + PCA components
-        ↓
-model prediction is projected into this valid shape space
-        ↓
-prediction becomes more globally consistent
+outer-training landmark shapes -> PCA basis
+held-out model output -> PCA blend -> exact triangle projection -> MD
 ```
 
-## Generate A Fold Prior (Split train/val)
+The fold manifest is mandatory. It verifies the exact training IDs and SHA-256
+hashes of the fold file, OOF centre predictions, crop calibration, and saved
+prior. This prevents a prior from seeing held-out landmarks or being reused on
+the wrong fold.
 
-```powershell
-python -m src.shape_prior.generate_prior `
-  --mesh-dir data/mesh `
-  --landmarks-dir data/landmarks `
-  --folds-json artifacts/folds.json `
-  --outer-fold 1 `
-  --predictions-json artifacts/fold1_crop_calibration_predictions.json `
-  --calibration-json artifacts/fold1_crop_calibration.json `
-  --components 32 `
-  --beta 1.0 `
-  --output artifacts/fold1_pca_shape_prior.npz `
-  --manifest artifacts/fold1_pca_shape_prior_manifest.json
+## Generate One Fold Prior
+
+```bash
+python train_pipeline.py generate-pca-prior \
+  --mesh-dir data/mesh \
+  --landmarks-dir data/landmarks \
+  --folds-json artifacts/folds.json \
+  --outer-fold 0 \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --components 32 \
+  --beta 1.0 \
+  --output artifacts/pca/fold0/prior.npz \
+  --manifest artifacts/pca/fold0/manifest.json
 ```
 
-## Evaluate A Fold Prior
+## Evaluate PCA Before Exact Projection
 
-```powershell
-python -m src.shape_prior.evaluate_prior `
-  --checkpoint-path runs/refinement_screen/k32/fold1_seed43/best_landmarks.pt `
-  --prior-path artifacts/fold1_pca_shape_prior.npz `
-  --mesh-dir data/mesh `
-  --landmarks-dir data/landmarks `
-  --folds-json artifacts/folds.json `
-  --predictions-json artifacts/fold1_crop_calibration_predictions.json `
-  --calibration-json artifacts/fold1_crop_calibration.json `
-  --output artifacts/fold1_pca_shape_prior_eval.json
+```bash
+python train_pipeline.py evaluate-pca-prior \
+  --checkpoint-path runs/pointnext_s/fold0_seed42/best_landmarks.pt \
+  --prior-path artifacts/pca/fold0/prior.npz \
+  --prior-manifest artifacts/pca/fold0/manifest.json \
+  --mesh-dir data/mesh \
+  --landmarks-dir data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --components 32 \
+  --beta 0.5 \
+  --run-seed 42 \
+  --output runs/pca_projection/fold0_seed42.json
 ```
 
-Expected fold-1 result:
+The report contains raw, PCA-only, projected-only, and PCA-then-projected MD;
+ear-level median, p90, p95, and maximum errors; contour errors; and every
+subject/ear result. Select components and beta only on the designated screening
+fold, then lock both values for confirmation.
 
-```text
-raw mean ~= 2.0588 mm
-PCA mean ~= 1.9475 mm
-improvement ~= 0.1113 mm
-ears improved = 80/80
-ears worsened = 0/80
+For confirmation, save all reports as
+`runs/pca_projection/confirmation/foldN_seedS.json`, where `N` is 0--4 and `S`
+is 42, 43, or 44. Enforce the registered promotion rule with:
+
+```bash
+python train_pipeline.py summarize-pca-prior \
+  --report-root runs/pca_projection/confirmation \
+  --seeds 42 43 44 \
+  --output runs/pca_projection/confirmation_summary.json
 ```
 
-## Generate The Final Prior (All training samples, no validation)
+## Final Prior and Checkpoint Embedding
 
-```powershell
-python -m src.shape_prior.generate_prior `
-  --mesh-dir data/mesh `
-  --landmarks-dir data/landmarks `
-  --folds-json artifacts/folds.json `
-  --outer-fold final `
-  --predictions-json artifacts/final_crop_calibration_predictions.json `
-  --calibration-json artifacts/final_crop_calibration.json `
-  --components 32 `
-  --beta 1.0 `
-  --output artifacts/final_pca_shape_prior.npz `
-  --manifest artifacts/final_pca_shape_prior_manifest.json
+Only after promotion, fit the same locked PCA configuration on all labelled
+training subjects using the final OOF centre predictions and final calibration.
+Embed the selected component count and beta into a copy of the final v2 bundle:
+
+```bash
+python -m src.shape_prior.embed_prior \
+  --checkpoint checkpoints/final_pipeline.pt \
+  --prior artifacts/pca/final/prior.npz \
+  --components 32 \
+  --beta 0.5 \
+  --output checkpoints/final_pipeline_pca.pt
 ```
 
-## Embed The Final Prior
-
-```powershell
-python -m src.shape_prior.embed_prior `
-  --checkpoint checkpoints/final_pipeline.pt `
-  --prior artifacts/final_pca_shape_prior.npz `
-  --output checkpoints/final_pipeline_pca.pt `
-  --beta 1.0
-```
+The estimator applies the embedded PCA blend before its configured exact surface
+projection, matching fold evaluation order.

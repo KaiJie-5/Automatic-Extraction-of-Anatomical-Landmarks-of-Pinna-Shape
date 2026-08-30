@@ -66,6 +66,7 @@ def probe_batch_size(
     candidates: Sequence[int] = (32, 16, 8, 4, 2, 1),
     amp: bool = True,
     amp_dtype: str = "auto",
+    landmark_loss_weights: Mapping[str, float] | None = None,
 ) -> int:
     """Probe model forward/backward memory without changing learned parameters."""
     if device.type != "cuda":
@@ -81,8 +82,45 @@ def probe_batch_size(
                 points = sample["points"].unsqueeze(0).expand(candidate, -1, -1).contiguous().to(device)
             model.zero_grad(set_to_none=True)
             with _autocast(device, amp, amp_dtype):
-                output = model(face_features, neighbors) if "face_features" in sample else model(points)
-                output.float().square().mean().backward()
+                if landmark_loss_weights is None:
+                    output = model(face_features, neighbors) if "face_features" in sample else model(points)
+                    probe_loss = output.float().square().mean()
+                else:
+                    target = sample["landmarks"].unsqueeze(0).expand(
+                        candidate, -1, -1
+                    ).contiguous().to(device)
+                    scale = sample["scale"].reshape(1).expand(candidate).to(device)
+                    dense = sample.get("dense_surface")
+                    dense = (
+                        dense.unsqueeze(0).expand(candidate, -1, -1).contiguous().to(device)
+                        if dense is not None
+                        else None
+                    )
+                    if float(landmark_loss_weights.get("heatmap", 0.0)):
+                        if "face_features" in sample:
+                            raise ValueError("surface heatmap loss is unavailable for MeshNet")
+                        details = model.forward_with_details(points)
+                        output = details["final"]
+                        heatmap_logits = details.get("heatmap_logits")
+                        heatmap_points = details.get("surface_candidates")
+                    else:
+                        output = model(face_features, neighbors) if "face_features" in sample else model(points)
+                        heatmap_logits = None
+                        heatmap_points = None
+                    probe_loss = proposal_landmark_loss(
+                        output.float(),
+                        target.float(),
+                        scale,
+                        dense_surface=dense,
+                        anchor_weight=float(landmark_loss_weights.get("anchor", 0.0)),
+                        spacing_weight=float(landmark_loss_weights.get("spacing", 0.0)),
+                        surface_weight=float(landmark_loss_weights.get("surface", 0.0)),
+                        heatmap_logits=heatmap_logits,
+                        heatmap_surface_points=heatmap_points,
+                        heatmap_weight=float(landmark_loss_weights.get("heatmap", 0.0)),
+                        heatmap_sigma_mm=float(landmark_loss_weights.get("heatmap_sigma_mm", 2.0)),
+                    )["total"]
+                probe_loss.backward()
             model.zero_grad(set_to_none=True)
             model.load_state_dict(original)
             torch.cuda.empty_cache()
@@ -341,7 +379,11 @@ def train_locator(
     }
     if batch_size <= 0:
         batch_size = probe_batch_size(
-            model, train_dataset[0], device, amp=amp, amp_dtype=amp_dtype
+            model,
+            train_dataset[0],
+            device,
+            amp=amp,
+            amp_dtype=amp_dtype,
         )
     accumulation = max(1, int(np.ceil(effective_batch_size / batch_size)))
     train_loader = _loader(train_dataset, batch_size, workers, True)
@@ -499,7 +541,12 @@ def train_landmarks(
     }
     if batch_size <= 0:
         batch_size = probe_batch_size(
-            model, train_dataset[0], device, amp=amp, amp_dtype=amp_dtype
+            model,
+            train_dataset[0],
+            device,
+            amp=amp,
+            amp_dtype=amp_dtype,
+            landmark_loss_weights=loss_weights,
         )
     accumulation = max(1, int(np.ceil(effective_batch_size / batch_size)))
     train_loader = _loader(train_dataset, batch_size, workers, True)
@@ -579,7 +626,14 @@ def train_landmarks(
         model.train(training)
         if training:
             optimizer.zero_grad(set_to_none=True)
-        sums = {"total": 0.0, "mean_distance": 0.0, "anchor": 0.0, "spacing": 0.0, "surface": 0.0}
+        sums = {
+            "total": 0.0,
+            "mean_distance": 0.0,
+            "anchor": 0.0,
+            "spacing": 0.0,
+            "surface": 0.0,
+            "heatmap": 0.0,
+        }
         count = 0
         for step, batch in enumerate(loader, 1):
             if "face_features" in batch:
@@ -594,12 +648,28 @@ def train_landmarks(
             dense = dense.to(device) if dense is not None else None
             with torch.set_grad_enabled(training):
                 with _autocast(device, amp, amp_dtype):
-                    prediction = model(face_features, neighbors) if "face_features" in batch else model(points)
+                    if float(loss_weights.get("heatmap", 0.0)):
+                        if "face_features" in batch:
+                            raise ValueError(
+                                "surface heatmap loss is unavailable for MeshNet"
+                            )
+                        details = model.forward_with_details(points)
+                        prediction = details["final"]
+                        heatmap_logits = details.get("heatmap_logits")
+                        heatmap_points = details.get("surface_candidates")
+                    else:
+                        prediction = model(face_features, neighbors) if "face_features" in batch else model(points)
+                        heatmap_logits = None
+                        heatmap_points = None
                     losses = proposal_landmark_loss(
                         prediction.float(), target.float(), batch["scale"].to(device), dense_surface=dense,
                         anchor_weight=float(loss_weights.get("anchor", 0.0)),
                         spacing_weight=float(loss_weights.get("spacing", 0.0)),
                         surface_weight=float(loss_weights.get("surface", 0.0)),
+                        heatmap_logits=heatmap_logits,
+                        heatmap_surface_points=heatmap_points,
+                        heatmap_weight=float(loss_weights.get("heatmap", 0.0)),
+                        heatmap_sigma_mm=float(loss_weights.get("heatmap_sigma_mm", 2.0)),
                     )
                 if training:
                     scaler.scale(losses["total"] / accumulation).backward()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Mapping, Optional, Sequence
 
 import torch
@@ -51,6 +52,56 @@ def predicted_to_surface_mm(
     return (minimum * scale).mean()
 
 
+def surface_heatmap_kl(
+    logits: torch.Tensor,
+    surface_points: torch.Tensor,
+    target: torch.Tensor,
+    scale_mm,
+    sigma_mm: float,
+) -> torch.Tensor:
+    """KL divergence to Gaussian landmark heatmaps on sampled surface points.
+
+    The target distribution is constructed in original millimetres even though
+    model coordinates are crop-local and normalized.  KL, rather than plain
+    cross entropy, removes the target entropy constant so a perfect heatmap has
+    zero auxiliary loss and its weight is easier to interpret beside MD in mm.
+    """
+    if logits.ndim != 3 or logits.shape[1] != 85:
+        raise ValueError("heatmap logits must have shape (B, 85, N)")
+    if surface_points.ndim != 3 or surface_points.shape[-1] != 3:
+        raise ValueError("surface heatmap points must have shape (B, N, 3)")
+    if target.ndim != 3 or target.shape[1:] != (85, 3):
+        raise ValueError("surface heatmap targets must have shape (B, 85, 3)")
+    if logits.shape[0] != surface_points.shape[0] or logits.shape[0] != target.shape[0]:
+        raise ValueError("surface heatmap batch dimensions must match")
+    if logits.shape[2] != surface_points.shape[1]:
+        raise ValueError("heatmap logits and candidate points must have matching N")
+    sigma_mm = float(sigma_mm)
+    if not math.isfinite(sigma_mm) or sigma_mm <= 0.0:
+        raise ValueError("surface heatmap sigma must be positive and finite")
+
+    points = surface_points.float()
+    targets = target.float()
+    scale = torch.as_tensor(scale_mm, dtype=torch.float32, device=points.device)
+    if scale.ndim == 0:
+        scale = scale.expand(points.shape[0])
+    scale = scale.reshape(points.shape[0], -1)
+    if scale.shape[1] != 1:
+        raise ValueError("surface heatmap scale must contain one value per batch item")
+    delta_mm = (
+        points[:, None, :, :] - targets[:, :, None, :]
+    ) * scale[:, None, None, :]
+    squared_mm = torch.sum(delta_mm * delta_mm, dim=-1)
+    target_logits = -squared_mm / (2.0 * sigma_mm * sigma_mm)
+    target_probabilities = torch.softmax(target_logits, dim=-1)
+    target_log_probabilities = torch.log_softmax(target_logits, dim=-1)
+    predicted_log_probabilities = torch.log_softmax(logits.float(), dim=-1)
+    return (
+        target_probabilities
+        * (target_log_probabilities - predicted_log_probabilities)
+    ).sum(dim=-1).mean()
+
+
 def proposal_landmark_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -59,6 +110,10 @@ def proposal_landmark_loss(
     anchor_weight: float = 0.0,
     spacing_weight: float = 0.0,
     surface_weight: float = 0.0,
+    heatmap_logits: Optional[torch.Tensor] = None,
+    heatmap_surface_points: Optional[torch.Tensor] = None,
+    heatmap_weight: float = 0.0,
+    heatmap_sigma_mm: float = 2.0,
 ) -> Mapping[str, torch.Tensor]:
     base = mean_distance_mm(prediction, target, scale_mm)
     anchor = anchor_distance_mm(prediction, target, scale_mm) if anchor_weight else base.new_zeros(())
@@ -69,8 +124,35 @@ def proposal_landmark_loss(
         surface = predicted_to_surface_mm(prediction, dense_surface, scale_mm)
     else:
         surface = base.new_zeros(())
-    total = base + anchor_weight * anchor + spacing_weight * spacing + surface_weight * surface
-    return {"total": total, "mean_distance": base, "anchor": anchor, "spacing": spacing, "surface": surface}
+    if heatmap_weight:
+        if heatmap_logits is None or heatmap_surface_points is None:
+            raise ValueError(
+                "heatmap_weight requires heatmap logits and sampled surface points"
+            )
+        heatmap = surface_heatmap_kl(
+            heatmap_logits,
+            heatmap_surface_points,
+            target,
+            scale_mm,
+            heatmap_sigma_mm,
+        )
+    else:
+        heatmap = base.new_zeros(())
+    total = (
+        base
+        + anchor_weight * anchor
+        + spacing_weight * spacing
+        + surface_weight * surface
+        + heatmap_weight * heatmap
+    )
+    return {
+        "total": total,
+        "mean_distance": base,
+        "anchor": anchor,
+        "spacing": spacing,
+        "surface": surface,
+        "heatmap": heatmap,
+    }
 
 
 def candidate_is_promoted(

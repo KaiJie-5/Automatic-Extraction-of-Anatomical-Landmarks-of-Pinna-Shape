@@ -28,10 +28,32 @@
     "local_refinement",
     "pointnext_s",
     "conditional_meshnet",
-    "surface_projection"
+    "surface_projection",
+    "projection_aware_pca_prior",
+    "pointnext_surface_heatmap_decoder"
   ],
   "auxiliary_weight_grid": [0.01, 0.05, 0.1],
   "local_refinement_k": [32, 64],
+  "research_extensions": {
+    "projection_aware_pca_prior": {
+      "screening_fold": 0,
+      "screening_seed": 42,
+      "coordinate_frame": "crop_local_canonical_normalized",
+      "evaluation_order": ["landmark_model", "pca_blend", "exact_surface_projection"],
+      "confirmation_reports": 15
+    },
+    "pointnext_surface_heatmap_decoder": {
+      "screening_fold": 0,
+      "screening_seed": 42,
+      "matching_projected_baseline_md_mm": 1.950345,
+      "screening_improvement_target_mm": 0.08,
+      "tail_metrics": ["p90", "p95", "maximum"],
+      "fixed_backbone": "pointnext_s_c32",
+      "heatmap_sigma_mm": 2.0,
+      "heatmap_weight": 0.1,
+      "coordinate_topk": 64
+    }
+  },
   "promotion": {
     "requires_lower_three_seed_pooled_md": true,
     "minimum_improved_outer_folds": 3,
