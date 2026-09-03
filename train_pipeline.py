@@ -109,6 +109,14 @@ def landmark_model_config(args, local_scale: float) -> dict:
     decoder = str(getattr(args, "landmark_decoder", "coordinate-regression"))
     if decoder == "surface-heatmap" and args.backbone != "pointnext":
         raise ValueError("--landmark-decoder surface-heatmap requires --backbone pointnext")
+    if decoder != "surface-heatmap" and (
+        str(args.refinement_mode) != "geometry-offset"
+        or int(args.refinement_stages) != 1
+    ):
+        raise ValueError(
+            "feature-aware or multi-stage refinement requires "
+            "--landmark-decoder surface-heatmap"
+        )
     if args.backbone == "meshnet":
         gate = read_json(args.meshnet_gate_json) if args.meshnet_gate_json else None
         if not gate or not gate.get("passed") or not gate.get("target_faces"):
@@ -138,6 +146,21 @@ def landmark_model_config(args, local_scale: float) -> dict:
     if decoder == "surface-heatmap":
         if int(args.heatmap_topk) > int(args.num_points):
             raise ValueError("--heatmap-topk cannot exceed --num-points")
+        refinement_mode = str(args.refinement_mode)
+        if refinement_mode == "feature-attention":
+            if int(args.refinement_k) == 0:
+                raise ValueError(
+                    "--refinement-mode feature-attention requires --refinement-k"
+                )
+            if str(args.refinement_anchor) != "raw":
+                raise ValueError(
+                    "--refinement-mode feature-attention requires --refinement-anchor raw"
+                )
+        elif int(args.refinement_stages) != 1:
+            raise ValueError(
+                "--refinement-stages greater than one requires "
+                "--refinement-mode feature-attention"
+            )
         return {
             "backbone": "pointnext",
             "decoder": "surface_heatmap",
@@ -151,6 +174,10 @@ def landmark_model_config(args, local_scale: float) -> dict:
             "refinement_k": int(args.refinement_k),
             "refinement_cap_normalized": 5.0 / local_scale if args.refinement_k else 0.0,
             "refinement_anchor": str(getattr(args, "refinement_anchor", "raw")),
+            "refinement_mode": refinement_mode,
+            "refinement_stages": int(args.refinement_stages),
+            "refinement_hidden_dim": int(args.refinement_hidden_dim),
+            "refinement_temperature": float(args.refinement_temperature),
         }
     config = {
         "backbone": args.backbone,
@@ -1008,6 +1035,47 @@ def command_evaluate_projection(args):
     )
 
 
+def command_analyze_heatmap_decoder(args):
+    """Re-decode one existing fold heatmap checkpoint without retraining."""
+    from src.heatmap_diagnostics import main as analyze_heatmap
+
+    values = [
+        "--checkpoint-path",
+        args.checkpoint_path,
+        "--prior-path",
+        args.prior_path,
+        "--prior-manifest",
+        args.prior_manifest,
+        "--mesh-dir",
+        args.mesh_dir,
+        "--landmarks-dir",
+        args.landmarks_dir,
+        "--folds-json",
+        args.folds_json,
+        "--predictions-json",
+        args.predictions_json,
+        "--calibration-json",
+        args.calibration_json,
+        "--top-k",
+        *(str(value) for value in args.top_k),
+        "--temperatures",
+        *(str(value) for value in args.temperatures),
+        "--components",
+        str(args.components),
+        "--beta",
+        str(args.beta),
+        "--projection-workers",
+        str(args.projection_workers),
+        "--device",
+        args.device,
+        "--output",
+        args.output,
+    ]
+    if args.run_seed is not None:
+        values.extend(["--run-seed", str(args.run_seed)])
+    analyze_heatmap(values)
+
+
 def command_generate_pca_prior(args):
     """Fit a leakage-safe PCA prior using only one outer-training fold."""
     from src.shape_prior.generate_prior import main as generate_prior
@@ -1572,6 +1640,35 @@ def add_landmark_model_arguments(parser):
             "anchors the query to the closest sampled input point"
         ),
     )
+    parser.add_argument(
+        "--refinement-mode",
+        choices=("geometry-offset", "feature-attention"),
+        default="geometry-offset",
+        help=(
+            "geometry-offset preserves the legacy KNN max-pool refiner; "
+            "feature-attention uses decoded PointNeXt features, heatmap "
+            "confidence, normals, and iterative local surface attention"
+        ),
+    )
+    parser.add_argument(
+        "--refinement-stages",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="number of feature-attention surface refinement iterations",
+    )
+    parser.add_argument(
+        "--refinement-hidden-dim",
+        type=positive_integer,
+        default=128,
+        help="hidden width of the feature-attention surface refiner",
+    )
+    parser.add_argument(
+        "--refinement-temperature",
+        type=positive_float,
+        default=1.0,
+        help="local candidate softmax temperature for feature-attention refinement",
+    )
     parser.add_argument("--anchor-weight", type=float, choices=(0.0, 0.01, 0.05, 0.1), default=0.0)
     parser.add_argument("--spacing-weight", type=float, choices=(0.0, 0.01, 0.05, 0.1), default=0.0)
     parser.add_argument("--surface-weight", type=float, choices=(0.0, 0.01, 0.05, 0.1), default=0.0)
@@ -1686,6 +1783,30 @@ def build_parser():
     projection.add_argument("--output", required=True)
     projection.add_argument("--device", default="auto")
     projection.set_defaults(function=command_evaluate_projection)
+
+    heatmap_diagnostic = subparsers.add_parser("analyze-heatmap-decoder")
+    add_data_arguments(heatmap_diagnostic)
+    heatmap_diagnostic.add_argument("--checkpoint-path", required=True)
+    heatmap_diagnostic.add_argument("--prior-path", required=True)
+    heatmap_diagnostic.add_argument("--prior-manifest", required=True)
+    heatmap_diagnostic.add_argument("--folds-json", required=True)
+    heatmap_diagnostic.add_argument("--predictions-json", required=True)
+    heatmap_diagnostic.add_argument("--calibration-json", required=True)
+    heatmap_diagnostic.add_argument(
+        "--top-k", nargs="+", type=positive_integer, required=True
+    )
+    heatmap_diagnostic.add_argument(
+        "--temperatures", nargs="+", type=positive_float, required=True
+    )
+    heatmap_diagnostic.add_argument("--components", type=positive_integer, default=32)
+    heatmap_diagnostic.add_argument("--beta", type=unit_float, default=0.5)
+    heatmap_diagnostic.add_argument("--run-seed", type=int)
+    heatmap_diagnostic.add_argument(
+        "--projection-workers", type=positive_integer, default=10
+    )
+    heatmap_diagnostic.add_argument("--device", default="auto")
+    heatmap_diagnostic.add_argument("--output", required=True)
+    heatmap_diagnostic.set_defaults(function=command_analyze_heatmap_decoder)
 
     pca_generate = subparsers.add_parser("generate-pca-prior")
     add_data_arguments(pca_generate)

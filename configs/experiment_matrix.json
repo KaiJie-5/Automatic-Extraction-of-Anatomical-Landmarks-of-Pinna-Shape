@@ -30,7 +30,10 @@
     "conditional_meshnet",
     "surface_projection",
     "projection_aware_pca_prior",
-    "pointnext_surface_heatmap_decoder"
+    "pointnext_surface_heatmap_decoder",
+    "surface_heatmap_decode_diagnostic",
+    "surface_heatmap_decoder_width",
+    "feature_aware_surface_refinement"
   ],
   "auxiliary_weight_grid": [0.01, 0.05, 0.1],
   "local_refinement_k": [32, 64],
@@ -52,6 +55,39 @@
       "heatmap_sigma_mm": 2.0,
       "heatmap_weight": 0.1,
       "coordinate_topk": 64
+    },
+    "surface_heatmap_decode_diagnostic": {
+      "screening_fold": 0,
+      "screening_seed": 42,
+      "requires_retraining": false,
+      "topk_grid": [1, 4, 8, 16, 32, 64, 128],
+      "temperature_grid": [0.1, 0.25, 0.5, 1.0],
+      "selection_metric": "pca_projected_mean_md_mm",
+      "reports_surface_oracles": true,
+      "reports_uncertainty_correlations": true
+    },
+    "surface_heatmap_decoder_width": {
+      "screening_fold": 0,
+      "screening_seed": 42,
+      "baseline_feature_dim": 128,
+      "candidate_feature_dim": 256,
+      "fixed_encoder": "pointnext_s_c32"
+    },
+    "feature_aware_surface_refinement": {
+      "screening_fold": 0,
+      "screening_seed": 42,
+      "neighbours": 32,
+      "stages": 2,
+      "hidden_dim": 128,
+      "candidate_features": [
+        "decoded_point_feature",
+        "relative_xyz",
+        "surface_normal",
+        "distance",
+        "heatmap_confidence",
+        "landmark_identity",
+        "contour_identity"
+      ]
     }
   },
   "promotion": {

@@ -181,7 +181,24 @@ baseline:
   85 ordered landmark probability maps. Coordinates are differentiable top-K
   expectations over sampled surface candidates; K=32 refinement and exact
   triangle projection remain unchanged. This decoder requires `--backbone
-  pointnext` and a positive `--heatmap-weight`.
+  pointnext` and a positive `--heatmap-weight`. `--heatmap-feature-dim` controls
+  its decoder/query width, so a wider decoder can be tested without changing the
+  PointNeXt encoder.
+- `analyze-heatmap-decoder` reuses a trained fold heatmap checkpoint and tests a
+  declared grid of Top-K values and coordinate temperatures without retraining.
+  It reproduces held-out sampling, evaluates PCA followed by exact triangle
+  projection, reports coarse/refined/PCA/projection stages, surface-candidate
+  and triangle-surface oracles, uncertainty/error correlations, per-contour
+  errors, and tail metrics. Its strict fold, calibration, prediction, and prior
+  checks are the same as `evaluate-pca-prior`.
+- `--refinement-mode feature-attention` replaces the legacy bounded XYZ-offset
+  refiner only for the PointNeXt surface decoder. Each stage gathers K nearby
+  original surface samples and scores them from decoded PointNeXt features,
+  relative XYZ, normals, distance, heatmap confidence, and learned
+  landmark/contour identity. Use `--refinement-stages 2` for the controlled
+  two-stage experiment; the saved model configuration reconstructs it for
+  evaluation and resume. The default remains `geometry-offset`, preserving old
+  checkpoints exactly.
 - `generate-pca-prior` and `evaluate-pca-prior` fit a PCA prior from only the
   outer-training landmarks and evaluate the deployment order of model output,
   PCA blend, then exact projection. The manifest binds the prior to the fold,
@@ -192,6 +209,10 @@ For PCA confirmation, place the 15 locked reports at
 `<report-root>/foldN_seedS.json` and run `summarize-pca-prior`. It promotes only
 when the ear-pooled projected MD is lower across all 15 reports and at least
 three of five fold means improve.
+
+These decoder/refiner controls are research experiments. Screen each on outer
+fold 0/seed 42, always compare the final PCA-then-projected result to the matching
+1.333987 mm reference, and do not combine individually unpromoted changes.
 
 After the registered five-fold/three-seed comparisons select a configuration, use
 the cross-validation best epochs to retrain and package one deterministic model:

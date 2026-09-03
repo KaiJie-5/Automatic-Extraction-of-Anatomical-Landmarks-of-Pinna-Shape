@@ -15,6 +15,7 @@ from .pointnext_model import PointNeXtEncoder
 
 CONTOUR_LENGTHS = (25, 30, 20, 10)
 REFINEMENT_ANCHOR_MODES = ("raw", "nearest-surface-sample")
+HEATMAP_REFINEMENT_MODES = ("geometry-offset", "feature-attention")
 
 
 def _make_encoder(backbone: str, config: Mapping[str, object]):
@@ -124,6 +125,179 @@ class LocalLandmarkRefiner(nn.Module):
         return coarse_float + offset
 
 
+class FeatureAwareSurfaceRefinementStage(nn.Module):
+    """One landmark-conditioned attention step over nearby surface samples."""
+
+    def __init__(
+        self, feature_dim: int, hidden_dim: int, update_query: bool
+    ):
+        super().__init__()
+        self.point_projection = nn.Linear(feature_dim, hidden_dim)
+        self.geometry_projection = nn.Linear(7, hidden_dim)
+        self.heatmap_projection = nn.Linear(2, hidden_dim)
+        self.candidate_norm = nn.LayerNorm(hidden_dim)
+        self.score_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.query_update = (
+            nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            if update_query
+            else None
+        )
+        # Begin as a local re-decoding of the trained heatmap.  The learned
+        # residual then specializes without an arbitrary initial displacement.
+        nn.init.zeros_(self.score_head[-1].weight)
+        nn.init.zeros_(self.score_head[-1].bias)
+
+    def forward(
+        self,
+        current: torch.Tensor,
+        xyz: torch.Tensor,
+        normals: torch.Tensor,
+        point_features: torch.Tensor,
+        heatmap_logits: torch.Tensor,
+        heatmap_entropy: torch.Tensor,
+        query_state: torch.Tensor,
+        k: int,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        indices = torch.cdist(current.float(), xyz.float()).topk(
+            min(int(k), int(xyz.shape[1])), dim=-1, largest=False, sorted=True
+        ).indices
+        neighbour_xyz = index_points(xyz, indices).float()
+        neighbour_normals = index_points(normals, indices).float()
+        neighbour_features = index_points(point_features, indices)
+        relative = neighbour_xyz - current.float().unsqueeze(2)
+        distance = torch.linalg.norm(relative, dim=-1, keepdim=True)
+        geometry = torch.cat([relative, neighbour_normals, distance], dim=-1)
+        local_logits = torch.gather(heatmap_logits.float(), 2, indices)
+        centred_logits = local_logits - local_logits.amax(dim=-1, keepdim=True)
+        entropy = heatmap_entropy.unsqueeze(-1).expand_as(centred_logits)
+        heatmap_values = torch.stack([centred_logits, entropy], dim=-1)
+
+        point_hidden = self.point_projection(neighbour_features)
+        geometry_hidden = self.geometry_projection(geometry)
+        heatmap_hidden = self.heatmap_projection(heatmap_values)
+        query_hidden = query_state.unsqueeze(2)
+        candidates = self.candidate_norm(
+            point_hidden
+            + geometry_hidden.to(point_hidden.dtype)
+            + heatmap_hidden.to(point_hidden.dtype)
+            + query_hidden.to(point_hidden.dtype)
+        )
+        learned_residual = self.score_head(torch.nn.functional.gelu(candidates)).squeeze(-1)
+        scores = centred_logits + learned_residual.float()
+        weights = torch.softmax(scores / float(temperature), dim=-1)
+        updated = (neighbour_xyz * weights.unsqueeze(-1)).sum(dim=2)
+        context = (candidates.float() * weights.unsqueeze(-1)).sum(dim=2)
+        next_query = query_state.float()
+        if self.query_update is not None:
+            next_query = self.query_update(
+                torch.cat([query_state.float(), context], dim=-1)
+            )
+        return updated.float(), next_query.float()
+
+
+class FeatureAwareSurfaceRefiner(nn.Module):
+    """Iteratively refine landmarks using decoded features and heatmap confidence."""
+
+    def __init__(
+        self,
+        k: int,
+        feature_dim: int,
+        stages: int = 2,
+        hidden_dim: int = 128,
+        temperature: float = 1.0,
+    ):
+        super().__init__()
+        if k not in {32, 64}:
+            raise ValueError("feature-aware surface refinement k must be 32 or 64")
+        if int(stages) not in {1, 2}:
+            raise ValueError("feature-aware surface refinement stages must be 1 or 2")
+        if int(hidden_dim) <= 0:
+            raise ValueError("feature-aware surface refinement hidden_dim must be positive")
+        if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+            raise ValueError("feature-aware surface refinement temperature must be positive")
+        self.k = int(k)
+        self.stage_count = int(stages)
+        self.temperature = float(temperature)
+        self.query_projection = nn.Linear(int(feature_dim), int(hidden_dim))
+        self.identity = nn.Embedding(85, int(hidden_dim))
+        self.contour_identity = nn.Embedding(4, int(hidden_dim))
+        contour_ids = torch.repeat_interleave(
+            torch.arange(4), torch.as_tensor(CONTOUR_LENGTHS)
+        )
+        self.register_buffer("contour_ids", contour_ids, persistent=False)
+        self.stages = nn.ModuleList(
+            [
+                FeatureAwareSurfaceRefinementStage(
+                    feature_dim,
+                    hidden_dim,
+                    update_query=index < self.stage_count - 1,
+                )
+                for index in range(self.stage_count)
+            ]
+        )
+
+    @staticmethod
+    def _normalized_entropy(logits: torch.Tensor) -> torch.Tensor:
+        log_probabilities = torch.log_softmax(logits.float(), dim=-1)
+        probabilities = torch.exp(log_probabilities)
+        denominator = max(math.log(max(int(logits.shape[-1]), 2)), 1.0)
+        return -(
+            probabilities * log_probabilities
+        ).sum(dim=-1) / denominator
+
+    def forward(
+        self,
+        coarse: torch.Tensor,
+        point_cloud: torch.Tensor,
+        point_features: torch.Tensor,
+        heatmap_logits: torch.Tensor,
+        query_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if point_cloud.shape[-1] != 6:
+            point_cloud = point_cloud.transpose(1, 2)
+        xyz = point_cloud[..., :3].float()
+        normals = point_cloud[..., 3:6].float()
+        if query_features.ndim == 2:
+            query_features = query_features.unsqueeze(0).expand(
+                coarse.shape[0], -1, -1
+            )
+        identities = self.identity(
+            torch.arange(85, device=coarse.device)
+        ).unsqueeze(0)
+        contours = self.contour_identity(self.contour_ids).unsqueeze(0)
+        query_state = (
+            self.query_projection(query_features)
+            + identities
+            + contours
+        ).float()
+        entropy = self._normalized_entropy(heatmap_logits)
+        current = coarse.float()
+        predictions = []
+        for stage in self.stages:
+            current, query_state = stage(
+                current,
+                xyz,
+                normals,
+                point_features,
+                heatmap_logits,
+                entropy,
+                query_state,
+                self.k,
+                self.temperature,
+            )
+            predictions.append(current)
+        return current, torch.stack(predictions, dim=1)
+
+
 def _three_neighbour_interpolate(
     fine_xyz: torch.Tensor,
     coarse_xyz: torch.Tensor,
@@ -186,8 +360,9 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
     """Surface-candidate heatmaps with PointNeXt feature propagation.
 
     All 85 outputs are weighted combinations of sampled crop-surface points
-    before the optional legacy local refiner.  Four independent query branches
-    preserve the official contour ordering when ``four_heads`` is enabled.
+    before optional geometry-offset or feature-aware surface refinement. Four
+    independent query branches preserve the official contour ordering when
+    ``four_heads`` is enabled.
     """
 
     def __init__(
@@ -200,6 +375,10 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         refinement_k: int = 0,
         refinement_cap_normalized: float = 0.0,
         refinement_anchor: str = "raw",
+        refinement_mode: str = "geometry-offset",
+        refinement_stages: int = 1,
+        refinement_hidden_dim: int = 128,
+        refinement_temperature: float = 1.0,
     ):
         super().__init__()
         heatmap_feature_dim = int(heatmap_feature_dim)
@@ -219,6 +398,24 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
             raise ValueError(
                 "non-raw refinement_anchor requires refinement_k to be enabled"
             )
+        refinement_mode = str(refinement_mode).lower()
+        if refinement_mode not in HEATMAP_REFINEMENT_MODES:
+            raise ValueError(
+                "refinement_mode must be one of "
+                f"{HEATMAP_REFINEMENT_MODES}"
+            )
+        refinement_stages = int(refinement_stages)
+        if refinement_mode == "geometry-offset" and refinement_stages != 1:
+            raise ValueError("geometry-offset refinement supports exactly one stage")
+        if refinement_mode == "feature-attention":
+            if not refinement_k:
+                raise ValueError(
+                    "feature-attention refinement requires refinement_k"
+                )
+            if refinement_anchor != "raw":
+                raise ValueError(
+                    "feature-attention refinement requires refinement_anchor='raw'"
+                )
         self.encoder = PointNeXtEncoder(**dict(encoder_config or {}))
         channels = tuple(int(value) for value in self.encoder.stage_channels)
         if len(channels) != 5:
@@ -226,6 +423,7 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         self.four_heads = bool(four_heads)
         self.heatmap_topk = heatmap_topk
         self.heatmap_coordinate_temperature = heatmap_coordinate_temperature
+        self.refinement_mode = refinement_mode
 
         # Decode the 64-point semantic level back to all original 16,384
         # sampled surface points using the exact encoder FPS hierarchy.
@@ -265,15 +463,22 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         for queries in self.query_embeddings:
             nn.init.trunc_normal_(queries, std=0.02)
         self.logit_scale = heatmap_feature_dim ** -0.5
-        self.refiner = (
-            LocalLandmarkRefiner(
+        if not refinement_k:
+            self.refiner = None
+        elif refinement_mode == "geometry-offset":
+            self.refiner = LocalLandmarkRefiner(
                 refinement_k,
                 refinement_cap_normalized,
                 anchor_mode=refinement_anchor,
             )
-            if refinement_k
-            else None
-        )
+        else:
+            self.refiner = FeatureAwareSurfaceRefiner(
+                refinement_k,
+                heatmap_feature_dim,
+                stages=refinement_stages,
+                hidden_dim=refinement_hidden_dim,
+                temperature=refinement_temperature,
+            )
 
     def _decode_point_features(self, levels: Mapping[str, object]) -> torch.Tensor:
         xyz = levels["xyz"]
@@ -285,42 +490,96 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         global_context = self.global_projection(levels["global"]).unsqueeze(1)
         return self.point_norm(self.point_projection(decoded_0) + global_context)
 
-    def _logits(self, point_features: torch.Tensor) -> torch.Tensor:
+    def _query_features(self) -> torch.Tensor:
         chunks = []
         for queries, projection in zip(
             self.query_embeddings, self.query_projections
         ):
-            query_features = projection(queries)
-            chunks.append(
-                torch.einsum("bnd,ld->bln", point_features, query_features)
-                * self.logit_scale
-            )
-        return torch.cat(chunks, dim=1)
+            chunks.append(projection(queries))
+        return torch.cat(chunks, dim=0)
 
-    def _surface_coordinates(
-        self, logits: torch.Tensor, xyz: torch.Tensor
+    def _logits(
+        self, point_features: torch.Tensor, query_features: torch.Tensor
     ) -> torch.Tensor:
-        count = min(self.heatmap_topk, int(xyz.shape[1]))
+        return (
+            torch.einsum("bnd,ld->bln", point_features, query_features)
+            * self.logit_scale
+        )
+
+    def decode_surface_coordinates(
+        self,
+        logits: torch.Tensor,
+        xyz: torch.Tensor,
+        topk: int | None = None,
+        temperature: float | None = None,
+    ) -> torch.Tensor:
+        selected_topk = self.heatmap_topk if topk is None else int(topk)
+        selected_temperature = (
+            self.heatmap_coordinate_temperature
+            if temperature is None
+            else float(temperature)
+        )
+        if selected_topk <= 0:
+            raise ValueError("surface heatmap top-k must be positive")
+        if (
+            not math.isfinite(selected_temperature)
+            or selected_temperature <= 0.0
+        ):
+            raise ValueError("surface heatmap coordinate temperature must be positive")
+        count = min(selected_topk, int(xyz.shape[1]))
         values, indices = logits.topk(count, dim=-1, largest=True, sorted=True)
         candidates = index_points(xyz, indices)
         weights = torch.softmax(
-            values.float() / self.heatmap_coordinate_temperature, dim=-1
+            values.float() / selected_temperature, dim=-1
         ).to(candidates.dtype)
         return (candidates * weights.unsqueeze(-1)).sum(dim=2).float()
+
+    def apply_refinement(
+        self,
+        coarse: torch.Tensor,
+        points: torch.Tensor,
+        point_features: torch.Tensor,
+        logits: torch.Tensor,
+        query_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.refiner is None:
+            return coarse, None
+        if self.refinement_mode == "feature-attention":
+            return self.refiner(
+                coarse,
+                points,
+                point_features,
+                logits,
+                query_features,
+            )
+        final = self.refiner(coarse, points)
+        return final, final.unsqueeze(1)
 
     def forward_with_details(self, points: torch.Tensor) -> Mapping[str, torch.Tensor]:
         levels = self.encoder.forward_features(points)
         point_features = self._decode_point_features(levels)
-        logits = self._logits(point_features)
+        query_features = self._query_features()
+        logits = self._logits(point_features, query_features)
         xyz = levels["xyz"][0]
-        coarse = self._surface_coordinates(logits, xyz)
-        final = self.refiner(coarse, points) if self.refiner is not None else coarse
-        return {
+        coarse = self.decode_surface_coordinates(logits, xyz)
+        final, refinement_predictions = self.apply_refinement(
+            coarse,
+            points,
+            point_features,
+            logits,
+            query_features,
+        )
+        details = {
             "coarse": coarse,
             "final": final,
             "heatmap_logits": logits,
             "surface_candidates": xyz,
+            "decoded_point_features": point_features,
+            "landmark_query_features": query_features,
         }
+        if refinement_predictions is not None:
+            details["refinement_stage_predictions"] = refinement_predictions
+        return details
 
     def forward(self, points: torch.Tensor) -> torch.Tensor:
         return self.forward_with_details(points)["final"]

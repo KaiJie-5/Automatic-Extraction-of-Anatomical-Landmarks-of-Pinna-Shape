@@ -34,11 +34,20 @@ Optional anchor, within-section spacing, and one-directional dense-surface losse
 are enabled independently. The optional PointNeXt surface-heatmap decoder
 propagates the encoder hierarchy to the original sampled surface and learns one
 Gaussian-supervised probability distribution per ordered landmark. Its coarse
-coordinates are top-K probability expectations, followed by the unchanged local
-refiner. Local KNN refinement supports raw-coarse or nearest sampled-surface
-query anchors. A fold-only PCA shape prior is evaluated both before and after
-the exact triangle projection, with prior artifacts cryptographically bound to
-their folds and calibration inputs. Depth/width-tunable portable PointNeXt
+coordinates are top-K probability expectations. A no-retraining diagnostic can
+rescore these heatmaps across explicit Top-K/temperature grids and reports
+surface oracles, uncertainty calibration, contour errors, and validation tails.
+The decoder/query feature width is independently configurable.
+
+The default local refiner remains the legacy bounded geometry-offset network.
+An isolated feature-attention refiner instead makes one or two landmark-specific
+surface-attention steps using decoded point features, relative geometry, normals,
+heatmap confidence, and landmark/contour identity; it always gathers from the
+original dense input samples. Local KNN refinement otherwise supports raw-coarse
+or nearest sampled-surface query anchors. A fold-only PCA shape prior is
+evaluated both before and after the exact triangle projection, with prior
+artifacts cryptographically bound to their folds and calibration inputs.
+Depth/width-tunable portable PointNeXt
 S/B/L/XL, MeshNet, statistical shape priors, and exact
 surface projection are experiments and are not promoted without the registered
 five-fold, three-seed rule in `configs/experiment_matrix.json`.
