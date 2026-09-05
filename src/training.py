@@ -59,6 +59,66 @@ def _loader(dataset, batch_size: int, workers: int, shuffle: bool):
     )
 
 
+def _flatten_landmark_batch(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    scale: torch.Tensor,
+    dense_surface: torch.Tensor | None = None,
+    heatmap_logits: torch.Tensor | None = None,
+    heatmap_points: torch.Tensor | None = None,
+):
+    """Flatten the optional paired-ear axis for unchanged per-ear losses."""
+    if prediction.ndim == 3:
+        return (
+            prediction,
+            target,
+            scale,
+            dense_surface,
+            heatmap_logits,
+            heatmap_points,
+            int(prediction.shape[0]),
+        )
+    if prediction.ndim != 4 or tuple(prediction.shape[1:3]) != (2, 85):
+        raise ValueError(
+            "landmark prediction must have shape (B, 85, 3) or "
+            "(B, 2, 85, 3)"
+        )
+    if target.shape != prediction.shape:
+        raise ValueError("paired landmark target shape does not match prediction")
+    batch, ears = prediction.shape[:2]
+    flattened_prediction = prediction.reshape(batch * ears, 85, 3)
+    flattened_target = target.reshape(batch * ears, 85, 3)
+    flattened_scale = scale.reshape(-1)
+    if flattened_scale.numel() == batch:
+        flattened_scale = flattened_scale.repeat_interleave(ears)
+    if flattened_scale.numel() != batch * ears:
+        raise ValueError("paired scale must contain one value per ear")
+    flattened_dense = (
+        dense_surface.reshape(batch * ears, *dense_surface.shape[2:])
+        if dense_surface is not None
+        else None
+    )
+    flattened_logits = (
+        heatmap_logits.reshape(batch * ears, *heatmap_logits.shape[2:])
+        if heatmap_logits is not None
+        else None
+    )
+    flattened_points = (
+        heatmap_points.reshape(batch * ears, *heatmap_points.shape[2:])
+        if heatmap_points is not None
+        else None
+    )
+    return (
+        flattened_prediction,
+        flattened_target,
+        flattened_scale,
+        flattened_dense,
+        flattened_logits,
+        flattened_points,
+        int(batch * ears),
+    )
+
+
 def probe_batch_size(
     model: torch.nn.Module,
     sample: Mapping[str, object],
@@ -79,7 +139,9 @@ def probe_batch_size(
                 face_features = sample["face_features"].unsqueeze(0).expand(candidate, -1, -1).contiguous().to(device)
                 neighbors = sample["neighbors"].unsqueeze(0).expand(candidate, -1, -1).contiguous().to(device)
             else:
-                points = sample["points"].unsqueeze(0).expand(candidate, -1, -1).contiguous().to(device)
+                points = sample["points"].unsqueeze(0).expand(
+                    candidate, *([-1] * sample["points"].ndim)
+                ).contiguous().to(device)
             model.zero_grad(set_to_none=True)
             with _autocast(device, amp, amp_dtype):
                 if landmark_loss_weights is None:
@@ -87,12 +149,21 @@ def probe_batch_size(
                     probe_loss = output.float().square().mean()
                 else:
                     target = sample["landmarks"].unsqueeze(0).expand(
-                        candidate, -1, -1
+                        candidate, *([-1] * sample["landmarks"].ndim)
                     ).contiguous().to(device)
-                    scale = sample["scale"].reshape(1).expand(candidate).to(device)
+                    sample_scale = sample["scale"]
+                    scale = (
+                        sample_scale.reshape(1).expand(candidate)
+                        if sample_scale.ndim == 0
+                        else sample_scale.unsqueeze(0).expand(
+                            candidate, *([-1] * sample_scale.ndim)
+                        )
+                    ).contiguous().to(device)
                     dense = sample.get("dense_surface")
                     dense = (
-                        dense.unsqueeze(0).expand(candidate, -1, -1).contiguous().to(device)
+                        dense.unsqueeze(0).expand(
+                            candidate, *([-1] * dense.ndim)
+                        ).contiguous().to(device)
                         if dense is not None
                         else None
                     )
@@ -107,6 +178,22 @@ def probe_batch_size(
                         output = model(face_features, neighbors) if "face_features" in sample else model(points)
                         heatmap_logits = None
                         heatmap_points = None
+                    (
+                        output,
+                        target,
+                        scale,
+                        dense,
+                        heatmap_logits,
+                        heatmap_points,
+                        _,
+                    ) = _flatten_landmark_batch(
+                        output,
+                        target,
+                        scale,
+                        dense,
+                        heatmap_logits,
+                        heatmap_points,
+                    )
                     probe_loss = proposal_landmark_loss(
                         output.float(),
                         target.float(),
@@ -539,16 +626,33 @@ def train_landmarks(
         "amp_dtype": resolved_dtype,
         "grad_scaler_enabled": grad_scaler_enabled(device, amp, amp_dtype),
     }
+    ears_per_item = int(getattr(train_dataset, "ears_per_item", 1))
+    if ears_per_item not in {1, 2}:
+        raise ValueError("landmark dataset ears_per_item must be one or two")
     if batch_size <= 0:
+        maximum_items = max(1, int(effective_batch_size) // ears_per_item)
+        probe_candidates = tuple(
+            candidate
+            for candidate in (32, 16, 8, 4, 2, 1)
+            if candidate <= maximum_items
+        )
         batch_size = probe_batch_size(
             model,
             train_dataset[0],
             device,
+            candidates=probe_candidates,
             amp=amp,
             amp_dtype=amp_dtype,
             landmark_loss_weights=loss_weights,
         )
-    accumulation = max(1, int(np.ceil(effective_batch_size / batch_size)))
+    accumulation = max(
+        1,
+        int(
+            np.ceil(
+                effective_batch_size / float(batch_size * ears_per_item)
+            )
+        ),
+    )
     train_loader = _loader(train_dataset, batch_size, workers, True)
     validation_loader = _loader(validation_dataset, batch_size, workers, False) if validation_dataset else None
     optimizer, resolved_encoder_rate = _landmark_optimizer(
@@ -581,6 +685,8 @@ def train_landmarks(
         "patience": int(patience),
         "effective_batch_size": int(effective_batch_size),
         "physical_batch_size": int(batch_size),
+        "ears_per_item": ears_per_item,
+        "physical_ear_batch_size": int(batch_size * ears_per_item),
         "gradient_accumulation": int(accumulation),
     }
     scaler = torch.cuda.amp.GradScaler(
@@ -642,7 +748,7 @@ def train_landmarks(
                 batch_count = len(face_features)
             else:
                 points = batch["points"].to(device)
-                batch_count = len(points)
+                batch_count = len(points) * ears_per_item
             target = batch["landmarks"].to(device)
             dense = batch.get("dense_surface")
             dense = dense.to(device) if dense is not None else None
@@ -661,8 +767,26 @@ def train_landmarks(
                         prediction = model(face_features, neighbors) if "face_features" in batch else model(points)
                         heatmap_logits = None
                         heatmap_points = None
+                    (
+                        prediction,
+                        target,
+                        scale,
+                        dense,
+                        heatmap_logits,
+                        heatmap_points,
+                        flattened_count,
+                    ) = _flatten_landmark_batch(
+                        prediction,
+                        target,
+                        batch["scale"].to(device),
+                        dense,
+                        heatmap_logits,
+                        heatmap_points,
+                    )
+                    if flattened_count != batch_count:
+                        raise RuntimeError("landmark batch ear count is inconsistent")
                     losses = proposal_landmark_loss(
-                        prediction.float(), target.float(), batch["scale"].to(device), dense_surface=dense,
+                        prediction.float(), target.float(), scale, dense_surface=dense,
                         anchor_weight=float(loss_weights.get("anchor", 0.0)),
                         spacing_weight=float(loss_weights.get("spacing", 0.0)),
                         surface_weight=float(loss_weights.get("surface", 0.0)),
@@ -712,6 +836,8 @@ def train_landmarks(
             "validation": validation_metrics,
             "best_md_mm": best,
             "physical_batch_size": batch_size,
+            "physical_ear_batch_size": int(batch_size * ears_per_item),
+            "ears_per_item": ears_per_item,
             "gradient_accumulation": accumulation,
             "learning_rates": epoch_learning_rates,
             "training_config": training_config,

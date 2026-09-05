@@ -37,6 +37,7 @@ from src.meshnet import run_meshnet_gate
 from src.metrics import compute_mean_landmark_distance
 from src.losses import candidate_is_promoted
 from src.pipeline_dataset import (
+    BilateralEarLandmarkDataset,
     EarLandmarkDataset,
     EarLocatorDataset,
     EarMeshLandmarkDataset,
@@ -107,6 +108,22 @@ def locator_model_config(backbone: str = "pointnet2") -> dict:
 
 def landmark_model_config(args, local_scale: float) -> dict:
     decoder = str(getattr(args, "landmark_decoder", "coordinate-regression"))
+    bilateral_mode = str(getattr(args, "bilateral_mode", "none"))
+    if bilateral_mode != "none" and (
+        args.backbone != "pointnext" or decoder != "surface-heatmap"
+    ):
+        raise ValueError(
+            "--bilateral-mode requires --backbone pointnext and "
+            "--landmark-decoder surface-heatmap"
+        )
+    if (
+        bilateral_mode == "landmark-cross-attention"
+        and int(args.heatmap_feature_dim)
+        % int(args.bilateral_attention_heads)
+    ):
+        raise ValueError(
+            "--bilateral-attention-heads must divide --heatmap-feature-dim"
+        )
     if decoder == "surface-heatmap" and args.backbone != "pointnext":
         raise ValueError("--landmark-decoder surface-heatmap requires --backbone pointnext")
     if decoder != "surface-heatmap" and (
@@ -161,7 +178,7 @@ def landmark_model_config(args, local_scale: float) -> dict:
                 "--refinement-stages greater than one requires "
                 "--refinement-mode feature-attention"
             )
-        return {
+        config = {
             "backbone": "pointnext",
             "decoder": "surface_heatmap",
             "encoder_config": encoder,
@@ -179,6 +196,20 @@ def landmark_model_config(args, local_scale: float) -> dict:
             "refinement_hidden_dim": int(args.refinement_hidden_dim),
             "refinement_temperature": float(args.refinement_temperature),
         }
+        if bilateral_mode != "none":
+            config.update(
+                {
+                    "bilateral_mode": bilateral_mode,
+                    "bilateral_attention_heads": int(
+                        args.bilateral_attention_heads
+                    ),
+                    "bilateral_attention_layers": int(
+                        args.bilateral_attention_layers
+                    ),
+                    "bilateral_dropout": float(args.bilateral_dropout),
+                }
+            )
+        return config
     config = {
         "backbone": args.backbone,
         "encoder_config": encoder,
@@ -240,6 +271,8 @@ def make_landmark_dataset(args, predictions, calibration, subject_ids, seed, tra
         return EarMeshLandmarkDataset(
             **common, target_faces=int(gate["target_faces"])
         )
+    if str(getattr(args, "bilateral_mode", "none")) != "none":
+        return BilateralEarLandmarkDataset(**common)
     return EarLandmarkDataset(**common)
 
 
@@ -650,6 +683,7 @@ def command_fit_landmarks(args):
         },
         "dense_surface_points": dense_points,
         "augmentation": args.augment,
+        "bilateral_mode": str(getattr(args, "bilateral_mode", "none")),
         "loss_weights": loss_weights,
         "amp_dtype": model_config.get("amp_dtype", "auto"),
     }
@@ -1626,6 +1660,34 @@ def add_landmark_model_arguments(parser):
         type=positive_float,
         default=2.0,
         help="Gaussian target standard deviation in original millimetres",
+    )
+    parser.add_argument(
+        "--bilateral-mode",
+        choices=("none", "shared-latent", "landmark-cross-attention"),
+        default="none",
+        help=(
+            "optional paired-ear PointNeXt heatmap experiment; 'none' keeps "
+            "the established independent-ear pipeline unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--bilateral-attention-heads",
+        type=positive_integer,
+        default=8,
+        help="cross-attention heads; used only by landmark-cross-attention",
+    )
+    parser.add_argument(
+        "--bilateral-attention-layers",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="paired landmark-token blocks; used only by landmark-cross-attention",
+    )
+    parser.add_argument(
+        "--bilateral-dropout",
+        type=unit_float,
+        default=0.0,
+        help="bilateral attention/MLP dropout; zero preserves deterministic evaluation",
     )
     parser.add_argument("--meshnet-gate-json")
     parser.add_argument("--four-heads", action=argparse.BooleanOptionalAction, default=True)

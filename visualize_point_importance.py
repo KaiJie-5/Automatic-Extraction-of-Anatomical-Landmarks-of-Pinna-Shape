@@ -152,6 +152,8 @@ class EarTrace:
     raw_errors_mm: np.ndarray
     coarse_errors_mm: np.ndarray
     projected_errors_mm: Optional[np.ndarray]
+    paired_input_features: Optional[np.ndarray] = None
+    ear_index: int = 0
 
 
 def _find_outer_fold(folds: Mapping[str, object], outer_fold: int):
@@ -340,9 +342,13 @@ def _model_details(
             details = context.model.forward_with_details(values, neighbors)
         else:
             details = context.model.forward_with_details(values)
+    bilateral = str(context.model_config.get("bilateral_mode", "none")) != "none"
+    expected = (2, 85, 3) if bilateral else (85, 3)
     for name in ("coarse", "final"):
-        if name not in details or tuple(details[name].shape[1:]) != (85, 3):
-            raise RuntimeError(f"model {name} output is not shaped (B, 85, 3)")
+        if name not in details or tuple(details[name].shape[1:]) != expected:
+            raise RuntimeError(
+                f"model {name} output is not shaped (B, {', '.join(map(str, expected))})"
+            )
         if not torch.isfinite(details[name]).all():
             raise RuntimeError(f"model {name} output contains non-finite values")
     return details
@@ -354,23 +360,64 @@ def prepare_trace(
     ear: str,
     include_projection: bool = True,
 ) -> EarTrace:
-    sample_seed = validation_sample_seed(context, subject_id, ear)
     mesh, left, right = context.dataset[context.subject_index[subject_id]]
     ground_truth = left if ear == "left" else right
-    center = context.predictions[prediction_key(subject_id, ear)]
     sample_count = 1 if context.backbone == "meshnet" else context.num_points
-    prepared = prepare_ear_geometry(
-        mesh,
-        ground_truth,
-        ear,
-        center,
-        context.calibration,
-        sample_count,
-        sample_seed,
-    )
+    bilateral = str(context.model_config.get("bilateral_mode", "none")) != "none"
+    paired_input_features = None
+    ear_index = EAR_NAMES.index(ear)
     simplified_mesh = None
     neighbors_np = None
-    if context.backbone == "meshnet":
+    if bilateral:
+        if context.backbone == "meshnet":
+            raise RuntimeError("bilateral visualization is unavailable for MeshNet")
+        prepared_pair = []
+        for pair_ear, pair_ground_truth in zip(EAR_NAMES, (left, right)):
+            pair_seed = validation_sample_seed(
+                context, subject_id, pair_ear
+            )
+            pair_center = context.predictions[
+                prediction_key(subject_id, pair_ear)
+            ]
+            prepared_pair.append(
+                prepare_ear_geometry(
+                    mesh,
+                    pair_ground_truth,
+                    pair_ear,
+                    pair_center,
+                    context.calibration,
+                    sample_count,
+                    pair_seed,
+                )
+            )
+        prepared = prepared_pair[ear_index]
+        center = prepared.center
+        sample_seed = validation_sample_seed(context, subject_id, ear)
+        paired_input_features = np.stack(
+            [item.point_features.astype(np.float32) for item in prepared_pair],
+            axis=0,
+        )
+        input_features = paired_input_features[ear_index]
+        input_xyz_canonical = prepared.sampled_canonical_features[:, :3]
+        input_tensor = (
+            torch.from_numpy(paired_input_features)
+            .unsqueeze(0)
+            .to(context.device)
+        )
+        neighbors_tensor = None
+    else:
+        sample_seed = validation_sample_seed(context, subject_id, ear)
+        center = context.predictions[prediction_key(subject_id, ear)]
+        prepared = prepare_ear_geometry(
+            mesh,
+            ground_truth,
+            ear,
+            center,
+            context.calibration,
+            sample_count,
+            sample_seed,
+        )
+    if not bilateral and context.backbone == "meshnet":
         features, neighbors_np, simplified_mesh = meshnet_inputs_with_mesh(
             prepared.crop_mesh,
             int(context.model_config["target_faces"]),
@@ -381,7 +428,7 @@ def prepare_trace(
         input_xyz_canonical = prepared.transform.denormalize_xyz(input_features[:, :3])
         input_tensor = torch.from_numpy(input_features).unsqueeze(0).to(context.device)
         neighbors_tensor = torch.from_numpy(neighbors_np).unsqueeze(0).to(context.device)
-    else:
+    elif not bilateral:
         input_features = prepared.point_features.astype(np.float32)
         input_xyz_canonical = prepared.sampled_canonical_features[:, :3]
         input_tensor = torch.from_numpy(input_features).unsqueeze(0).to(context.device)
@@ -389,8 +436,14 @@ def prepare_trace(
 
     with torch.no_grad():
         details = _model_details(context, input_tensor, neighbors_tensor)
-    coarse_local = details["coarse"].squeeze(0).float().cpu().numpy().astype(np.float32)
-    final_local = details["final"].squeeze(0).float().cpu().numpy().astype(np.float32)
+    if bilateral:
+        coarse_tensor = details["coarse"][0, ear_index]
+        final_tensor = details["final"][0, ear_index]
+    else:
+        coarse_tensor = details["coarse"].squeeze(0)
+        final_tensor = details["final"].squeeze(0)
+    coarse_local = coarse_tensor.float().cpu().numpy().astype(np.float32)
+    final_local = final_tensor.float().cpu().numpy().astype(np.float32)
     coarse_world = decanonicalize_xyz(
         prepared.transform.denormalize_xyz(coarse_local), ear
     ).astype(np.float32)
@@ -432,6 +485,8 @@ def prepare_trace(
             if projected is not None
             else None
         ),
+        paired_input_features=paired_input_features,
+        ear_index=ear_index,
     )
 
 
@@ -446,7 +501,12 @@ def official_mean_distance_torch(
 
 
 def gradient_importance(context: FoldContext, trace: EarTrace) -> Mapping[str, np.ndarray]:
-    values = torch.from_numpy(trace.input_features).unsqueeze(0).to(context.device)
+    model_features = (
+        trace.paired_input_features
+        if trace.paired_input_features is not None
+        else trace.input_features
+    )
+    values = torch.from_numpy(model_features).unsqueeze(0).to(context.device)
     values = values.clone().detach().requires_grad_(True)
     neighbors = (
         torch.from_numpy(trace.neighbors).unsqueeze(0).to(context.device)
@@ -456,11 +516,16 @@ def gradient_importance(context: FoldContext, trace: EarTrace) -> Mapping[str, n
     target = torch.from_numpy(trace.target_local).unsqueeze(0).to(context.device)
     context.model.zero_grad(set_to_none=True)
     details = _model_details(context, values, neighbors)
+    prediction = details["final"].float()
+    if trace.paired_input_features is not None:
+        prediction = prediction[:, trace.ear_index]
     score = official_mean_distance_torch(
-        details["final"].float(), target.float(), trace.prepared.transform.scale
+        prediction, target.float(), trace.prepared.transform.scale
     )
     score.backward()
     gradient = values.grad.detach()[0].float().cpu().numpy()
+    if trace.paired_input_features is not None:
+        gradient = gradient[trace.ear_index]
     if context.backbone == "meshnet":
         xyz = np.linalg.norm(gradient[:, :12], axis=1)
         normals = np.linalg.norm(gradient[:, 12:15], axis=1)
@@ -524,7 +589,12 @@ def occlusion_importance(
         raise ValueError("occlusion batch size must be positive")
     labels = deterministic_spatial_clusters(trace.input_features[:, :3], cluster_size)
     group_ids = np.unique(labels)
-    values = torch.from_numpy(trace.input_features).unsqueeze(0).to(context.device)
+    model_features = (
+        trace.paired_input_features
+        if trace.paired_input_features is not None
+        else trace.input_features
+    )
+    values = torch.from_numpy(model_features).unsqueeze(0).to(context.device)
     target = torch.from_numpy(trace.target_local).unsqueeze(0).to(context.device)
     neighbors = (
         torch.from_numpy(trace.neighbors).unsqueeze(0).to(context.device)
@@ -533,18 +603,31 @@ def occlusion_importance(
     )
     with torch.no_grad():
         baseline = _model_details(context, values, neighbors)["final"].float()
+        if trace.paired_input_features is not None:
+            baseline = baseline[:, trace.ear_index]
         baseline_md = official_mean_distance_torch(
             baseline, target.float(), trace.prepared.transform.scale
         )
-    feature_mean = values.mean(dim=1, keepdim=True)
+    if trace.paired_input_features is not None:
+        feature_mean = values[:, trace.ear_index].mean(dim=1, keepdim=True)
+    else:
+        feature_mean = values.mean(dim=1, keepdim=True)
     delta_by_group = {}
     displacement_by_group = {}
     for start in range(0, len(group_ids), int(batch_size)):
         batch_groups = group_ids[start : start + int(batch_size)]
-        occluded = values.repeat(len(batch_groups), 1, 1)
+        repeat_shape = (
+            (len(batch_groups), 1, 1, 1)
+            if trace.paired_input_features is not None
+            else (len(batch_groups), 1, 1)
+        )
+        occluded = values.repeat(*repeat_shape)
         for row, group in enumerate(batch_groups):
             mask = torch.from_numpy(labels == group).to(context.device)
-            occluded[row, mask, :] = feature_mean[0, 0]
+            if trace.paired_input_features is not None:
+                occluded[row, trace.ear_index, mask, :] = feature_mean[0, 0]
+            else:
+                occluded[row, mask, :] = feature_mean[0, 0]
         batch_neighbors = (
             neighbors.repeat(len(batch_groups), 1, 1)
             if neighbors is not None
@@ -554,6 +637,8 @@ def occlusion_importance(
             predictions = _model_details(
                 context, occluded, batch_neighbors
             )["final"].float()
+            if trace.paired_input_features is not None:
+                predictions = predictions[:, trace.ear_index]
             targets = target.repeat(len(batch_groups), 1, 1).float()
             errors = torch.linalg.norm(
                 (predictions - targets) * trace.prepared.transform.scale,

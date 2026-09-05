@@ -16,6 +16,7 @@ from .pointnext_model import PointNeXtEncoder
 CONTOUR_LENGTHS = (25, 30, 20, 10)
 REFINEMENT_ANCHOR_MODES = ("raw", "nearest-surface-sample")
 HEATMAP_REFINEMENT_MODES = ("geometry-offset", "feature-attention")
+BILATERAL_MODES = ("none", "shared-latent", "landmark-cross-attention")
 
 
 def _make_encoder(backbone: str, config: Mapping[str, object]):
@@ -585,6 +586,236 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         return self.forward_with_details(points)["final"]
 
 
+class BilateralLandmarkCrossAttentionBlock(nn.Module):
+    """Symmetric cross-attention between left/right landmark token sets."""
+
+    def __init__(self, feature_dim: int, heads: int, dropout: float = 0.0):
+        super().__init__()
+        if feature_dim % heads:
+            raise ValueError(
+                "bilateral attention heads must divide heatmap_feature_dim"
+            )
+        self.cross_attention = nn.MultiheadAttention(
+            int(feature_dim),
+            int(heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.attention_norm = nn.LayerNorm(int(feature_dim))
+        self.feed_forward = nn.Sequential(
+            nn.Linear(int(feature_dim), int(feature_dim) * 4),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(feature_dim) * 4, int(feature_dim)),
+        )
+        self.output_norm = nn.LayerNorm(int(feature_dim))
+
+    def _update(
+        self, query: torch.Tensor, opposite: torch.Tensor
+    ) -> torch.Tensor:
+        attended, _ = self.cross_attention(
+            query,
+            opposite,
+            opposite,
+            need_weights=False,
+        )
+        hidden = self.attention_norm(query + attended)
+        return self.output_norm(hidden + self.feed_forward(hidden))
+
+    def forward(
+        self, left: torch.Tensor, right: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Both updates read the same pre-update pair.  Reusing the block weights
+        # makes the fusion symmetric rather than privileging one ear.
+        return self._update(left, right), self._update(right, left)
+
+
+class BilateralPointNeXtSurfaceHeatmapRegressor(nn.Module):
+    """Paired-ear extension of the proven PointNeXt surface heatmap model.
+
+    Input and output ear order is always ``(left, mirrored-right)``.  The
+    underlying PointNeXt encoder, feature propagation, heatmap coordinate
+    decoder, and local refiner are unchanged and weight-shared between ears.
+    Only the landmark-query conditioning differs between bilateral modes.
+    """
+
+    def __init__(
+        self,
+        bilateral_mode: str,
+        bilateral_attention_heads: int = 8,
+        bilateral_attention_layers: int = 1,
+        bilateral_dropout: float = 0.0,
+        **single_ear_config,
+    ):
+        super().__init__()
+        mode = str(bilateral_mode).lower()
+        if mode not in BILATERAL_MODES[1:]:
+            raise ValueError(
+                "bilateral landmark model requires bilateral_mode to be "
+                "'shared-latent' or 'landmark-cross-attention'"
+            )
+        attention_layers = int(bilateral_attention_layers)
+        attention_heads = int(bilateral_attention_heads)
+        dropout = float(bilateral_dropout)
+        if attention_layers <= 0 or attention_heads <= 0:
+            raise ValueError("bilateral attention layers and heads must be positive")
+        if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
+            raise ValueError("bilateral dropout must be finite and in [0, 1)")
+
+        self.bilateral_mode = mode
+        self.ear_model = PointNeXtSurfaceHeatmapRegressor(
+            **single_ear_config
+        )
+        feature_dim = int(single_ear_config.get("heatmap_feature_dim", 128))
+        global_dim = int(self.ear_model.encoder.stage_channels[-1])
+        self.feature_dim = feature_dim
+
+        if mode == "shared-latent":
+            # Mean and absolute difference are invariant to swapping the two
+            # ears, while retaining both common morphology and asymmetry.
+            self.subject_projection = nn.Sequential(
+                nn.Linear(global_dim * 2, feature_dim),
+                nn.LayerNorm(feature_dim),
+                nn.GELU(),
+                nn.Linear(feature_dim, feature_dim),
+            )
+            self.query_norm = nn.LayerNorm(feature_dim)
+            self.own_token_projection = None
+            self.cross_attention_blocks = nn.ModuleList()
+        else:
+            if feature_dim % attention_heads:
+                raise ValueError(
+                    "--bilateral-attention-heads must divide "
+                    "--heatmap-feature-dim"
+                )
+            self.subject_projection = None
+            self.query_norm = nn.LayerNorm(feature_dim)
+            self.own_token_projection = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim),
+                nn.LayerNorm(feature_dim),
+                nn.GELU(),
+            )
+            self.cross_attention_blocks = nn.ModuleList(
+                [
+                    BilateralLandmarkCrossAttentionBlock(
+                        feature_dim, attention_heads, dropout
+                    )
+                    for _ in range(attention_layers)
+                ]
+            )
+
+    @property
+    def encoder(self):
+        """Expose the shared backbone for the optional encoder learning rate."""
+        return self.ear_model.encoder
+
+    @staticmethod
+    def _validate_points(points: torch.Tensor) -> tuple[int, int, int]:
+        if points.ndim != 4 or points.shape[1] != 2 or points.shape[-1] != 6:
+            raise ValueError(
+                "bilateral landmark input must have shape (B, 2, N, 6) "
+                "in (left, mirrored-right) order"
+            )
+        return int(points.shape[0]), int(points.shape[1]), int(points.shape[2])
+
+    def _condition_queries(
+        self,
+        point_features: torch.Tensor,
+        ear_globals: torch.Tensor,
+        base_queries: torch.Tensor,
+    ) -> tuple[torch.Tensor, Mapping[str, torch.Tensor]]:
+        batch = int(point_features.shape[0])
+        if self.bilateral_mode == "shared-latent":
+            mean = ear_globals.mean(dim=1)
+            absolute_difference = torch.abs(
+                ear_globals[:, 0] - ear_globals[:, 1]
+            )
+            subject_latent = self.subject_projection(
+                torch.cat([mean, absolute_difference], dim=-1)
+            )
+            queries = self.query_norm(
+                base_queries.view(1, 1, 85, -1)
+                + subject_latent[:, None, None, :]
+            ).expand(-1, 2, -1, -1)
+            return queries, {"bilateral_subject_latent": subject_latent}
+
+        base = base_queries.view(1, 1, 85, -1).expand(
+            batch, 2, -1, -1
+        )
+        preliminary_logits = torch.einsum(
+            "bend,ld->beln", point_features, base_queries
+        ) * self.ear_model.logit_scale
+        probabilities = torch.softmax(
+            preliminary_logits.float(), dim=-1
+        ).to(point_features.dtype)
+        own_surface_tokens = torch.einsum(
+            "beln,bend->beld", probabilities, point_features
+        )
+        tokens = self.query_norm(
+            base + self.own_token_projection(own_surface_tokens)
+        )
+        left, right = tokens[:, 0], tokens[:, 1]
+        for block in self.cross_attention_blocks:
+            left, right = block(left, right)
+        queries = torch.stack([left, right], dim=1)
+        return queries, {
+            "bilateral_preliminary_heatmap_logits": preliminary_logits,
+            "bilateral_own_surface_tokens": own_surface_tokens,
+        }
+
+    def forward_with_details(
+        self, points: torch.Tensor
+    ) -> Mapping[str, torch.Tensor]:
+        batch, ears, point_count = self._validate_points(points)
+        flat_points = points.reshape(batch * ears, point_count, 6)
+        levels = self.ear_model.encoder.forward_features(flat_points)
+        flat_point_features = self.ear_model._decode_point_features(levels)
+        point_features = flat_point_features.reshape(
+            batch, ears, point_count, self.feature_dim
+        )
+        ear_globals = levels["global"].reshape(batch, ears, -1)
+        base_queries = self.ear_model._query_features()
+        query_features, bilateral_details = self._condition_queries(
+            point_features, ear_globals, base_queries
+        )
+        logits = torch.einsum(
+            "bend,beld->beln", point_features, query_features
+        ) * self.ear_model.logit_scale
+        xyz = levels["xyz"][0].reshape(batch, ears, point_count, 3)
+
+        flat_logits = logits.reshape(batch * ears, 85, point_count)
+        flat_xyz = xyz.reshape(batch * ears, point_count, 3)
+        coarse_flat = self.ear_model.decode_surface_coordinates(
+            flat_logits, flat_xyz
+        )
+        final_flat, refinement_predictions = self.ear_model.apply_refinement(
+            coarse_flat,
+            flat_points,
+            flat_point_features,
+            flat_logits,
+            query_features.reshape(batch * ears, 85, self.feature_dim),
+        )
+        details = {
+            "coarse": coarse_flat.reshape(batch, ears, 85, 3),
+            "final": final_flat.reshape(batch, ears, 85, 3),
+            "heatmap_logits": logits,
+            "surface_candidates": xyz,
+            "decoded_point_features": point_features,
+            "landmark_query_features": query_features,
+            **bilateral_details,
+        }
+        if refinement_predictions is not None:
+            details["refinement_stage_predictions"] = (
+                refinement_predictions.reshape(
+                    batch, ears, *refinement_predictions.shape[1:]
+                )
+            )
+        return details
+
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_details(points)["final"]
+
+
 class ProposalLandmarkRegressor(nn.Module):
     def __init__(
         self,
@@ -668,11 +899,31 @@ def build_landmark_model(config: Mapping[str, object]) -> nn.Module:
     # argument of the landmark network itself.
     values.pop("amp_dtype", None)
     decoder = str(values.pop("decoder", "coordinate_regression"))
+    bilateral_mode = str(values.pop("bilateral_mode", "none"))
+    bilateral_attention_heads = int(
+        values.pop("bilateral_attention_heads", 8)
+    )
+    bilateral_attention_layers = int(
+        values.pop("bilateral_attention_layers", 1)
+    )
+    bilateral_dropout = float(values.pop("bilateral_dropout", 0.0))
     if decoder == "surface_heatmap":
         backbone = str(values.pop("backbone", ""))
         if backbone != "pointnext":
             raise ValueError("surface heatmap decoder requires PointNeXt")
+        if bilateral_mode != "none":
+            return BilateralPointNeXtSurfaceHeatmapRegressor(
+                bilateral_mode=bilateral_mode,
+                bilateral_attention_heads=bilateral_attention_heads,
+                bilateral_attention_layers=bilateral_attention_layers,
+                bilateral_dropout=bilateral_dropout,
+                **values,
+            )
         return PointNeXtSurfaceHeatmapRegressor(**values)
+    if bilateral_mode != "none":
+        raise ValueError(
+            "bilateral landmark modes require decoder='surface_heatmap'"
+        )
     if decoder != "coordinate_regression":
         raise ValueError(f"unsupported landmark decoder: {decoder}")
     return ProposalLandmarkRegressor(**values)

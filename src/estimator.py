@@ -174,6 +174,9 @@ class LandmarkExtractor:
         landmark_config = dict(checkpoint["landmark"]["model_config"])
         self.landmark_model_config = dict(landmark_config)
         self.landmark_backbone = landmark_config.get("backbone", "pointnet2")
+        self.bilateral_mode = str(
+            landmark_config.get("bilateral_mode", "none")
+        )
         if self.landmark_backbone == "pointtransformerv3":
             validate_pointtransformerv3_checkpoint_config(
                 self.landmark_model_config
@@ -261,12 +264,115 @@ class LandmarkExtractor:
             raise RuntimeError(f"v2 {ear} prediction is not a finite (85, 3) array")
         return prediction.astype(np.float32)
 
+    def _extract_v2_bilateral(
+        self, mesh: Trimesh
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run paired landmark inference after the unchanged per-ear locator."""
+        if self.landmark_backbone == "meshnet":
+            raise RuntimeError("bilateral inference is unavailable for MeshNet")
+        prepared = []
+        for ear_offset, ear in enumerate(("left", "right")):
+            broad_features, _, _ = sample_canonical_crop(
+                mesh,
+                self.broad_box,
+                ear,
+                self.locator_points,
+                self.seed + ear_offset,
+            )
+            broad_transform = LocalEarTransform(
+                self.broad_box.center, self.broad_scale
+            )
+            locator_input = broad_transform.normalize_features(
+                broad_features
+            )
+            locator_tensor = (
+                torch.from_numpy(locator_input).unsqueeze(0).to(self.device)
+            )
+            with torch.no_grad():
+                correction = (
+                    self.locator(locator_tensor)
+                    .squeeze(0)
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+            predicted_center = self.initial_center + correction
+            primary, backup = boxes_for_prediction(
+                predicted_center, self.crop_calibration
+            )
+            local_features, crop_mesh, _ = sample_canonical_crop(
+                mesh,
+                primary,
+                ear,
+                self.landmark_points,
+                self.seed + 100 + ear_offset,
+                fallback_box=backup,
+                thresholds=self.crop_calibration.get("fallback_thresholds"),
+            )
+            local_transform = LocalEarTransform(
+                predicted_center, self.local_scale
+            )
+            prepared.append(
+                (
+                    ear,
+                    local_transform,
+                    crop_mesh,
+                    local_transform.normalize_features(local_features),
+                )
+            )
+
+        paired_input = np.stack(
+            [item[3].astype(np.float32) for item in prepared], axis=0
+        )
+        input_tensor = (
+            torch.from_numpy(paired_input).unsqueeze(0).to(self.device)
+        )
+        with torch.no_grad(), checkpoint_autocast_context(
+            self.device, self.landmark_model_config
+        ):
+            local_predictions = (
+                self.landmark_model(input_tensor)
+                .squeeze(0)
+                .float()
+                .cpu()
+                .numpy()
+            )
+        if local_predictions.shape != (2, 85, 3):
+            raise RuntimeError(
+                "bilateral landmark model did not return shape (2, 85, 3)"
+            )
+
+        outputs = []
+        for ear_index, (ear, transform, crop_mesh, _) in enumerate(prepared):
+            local_prediction = self._apply_pca_shape_prior(
+                local_predictions[ear_index]
+            )
+            canonical_prediction = transform.denormalize_xyz(
+                local_prediction
+            )
+            prediction = decanonicalize_xyz(
+                canonical_prediction, ear
+            ).astype(np.float32)
+            if self.project_to_surface:
+                prediction = project_points_to_mesh(prediction, crop_mesh)
+            if prediction.shape != (85, 3) or not np.isfinite(
+                prediction
+            ).all():
+                raise RuntimeError(
+                    f"v2 bilateral {ear} prediction is not a finite "
+                    "(85, 3) array"
+                )
+            outputs.append(prediction.astype(np.float32))
+        return outputs[0], outputs[1]
+
     def extract(self, mesh: Trimesh) -> Tuple[np.ndarray, np.ndarray]:
         """Method to extract left and right ear landmarks from a 3D mesh. Both output arrays need to be of size (85, 3),
         and need to contain the 85 landmark coordinates for the left and right ear in the correct order.
         This function will be called during the evaluation on the hidden test dataset.
         """
         if self.schema_version == 2:
+            if getattr(self, "bilateral_mode", "none") != "none":
+                return self._extract_v2_bilateral(mesh)
             return self._extract_v2_ear(mesh, "left", 0), self._extract_v2_ear(mesh, "right", 1)
 
         transform = compute_mesh_normalization(mesh)

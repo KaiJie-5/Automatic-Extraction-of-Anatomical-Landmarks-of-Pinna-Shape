@@ -104,6 +104,9 @@ class EpochResampledDataset(TorchDataset):
         self.seed = int(seed)
         self.dynamic_sampling = bool(dynamic_sampling)
         self.epoch = 0
+        # Training counts effective batches in ears.  Ordinary datasets expose
+        # one ear per item; bilateral experiments override this with two.
+        self.ears_per_item = 1
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -241,6 +244,132 @@ class EarLandmarkDataset(EpochResampledDataset):
             dense = canonicalize_point_features(dense, ear)
             dense_local = prepared.transform.normalize_xyz(dense[:, :3]) * augmentation_scale
             result["dense_surface"] = torch.from_numpy(dense_local.astype(np.float32))
+        return result
+
+
+class BilateralEarLandmarkDataset(EpochResampledDataset):
+    """Subject-paired landmark samples for bilateral fusion experiments.
+
+    Each item contains the canonicalized left and mirrored-right ear in the
+    stable order ``(left, right)``.  Ear-specific seeds deliberately reproduce
+    the exact seeds used by :class:`EarLandmarkDataset`, so changing to paired
+    training does not silently change crop sampling or augmentation.
+    """
+
+    def __init__(
+        self,
+        mesh_dir: str,
+        landmarks_dir: str,
+        center_predictions: Mapping[str, Sequence[float]],
+        calibration: Mapping[str, object],
+        subject_ids: Optional[Sequence[str]] = None,
+        num_points: int = 16384,
+        dense_surface_points: int = 0,
+        seed: int = 42,
+        dynamic_sampling: bool = True,
+        augment: bool = False,
+    ):
+        super().__init__(seed, dynamic_sampling)
+        self.ears_per_item = 2
+        self.base = MeshLandmarkDataset(mesh_dir, landmarks_dir)
+        self.indices = _selected_indices(self.base, subject_ids)
+        self.predictions = {
+            key: np.asarray(value, dtype=np.float32)
+            for key, value in center_predictions.items()
+        }
+        self.calibration = calibration
+        self.num_points = int(num_points)
+        self.dense_surface_points = int(dense_surface_points)
+        self.local_scale = float(calibration["local_scale"])
+        self.augment = bool(augment)
+        missing = [
+            prediction_key(self.base.get_identifier(index), ear)
+            for index in self.indices
+            for ear in EAR_NAMES
+            if prediction_key(self.base.get_identifier(index), ear)
+            not in self.predictions
+        ]
+        if missing:
+            raise ValueError(
+                f"missing out-of-fold center predictions: {missing[:5]}"
+            )
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, item):
+        base_index = self.indices[item]
+        subject_id = self.base.get_identifier(base_index)
+        mesh, left, right = self.base[base_index]
+        landmark_sets = (left, right)
+        point_features = []
+        targets = []
+        centers = []
+        backups = []
+        dense_surfaces = []
+        for ear_offset, (ear, landmarks) in enumerate(
+            zip(EAR_NAMES, landmark_sets)
+        ):
+            # This is the same flattened item index used by EarLandmarkDataset.
+            ear_item = item * len(EAR_NAMES) + ear_offset
+            center = self.predictions[prediction_key(subject_id, ear)]
+            prepared = prepare_ear_geometry(
+                mesh,
+                landmarks,
+                ear,
+                center,
+                self.calibration,
+                self.num_points,
+                self.sample_seed(ear_item),
+            )
+            features = prepared.point_features.copy()
+            target = prepared.target.copy()
+            augmentation_scale = 1.0
+            if self.augment:
+                rng = np.random.default_rng(
+                    self.sample_seed(ear_item, stream=1)
+                )
+                augmentation_scale = float(rng.uniform(0.9, 1.1))
+                features[:, :3] *= augmentation_scale
+                target *= augmentation_scale
+                jitter = np.clip(
+                    rng.normal(0.0, 0.005, features[:, :3].shape),
+                    -0.02,
+                    0.02,
+                )
+                features[:, :3] += jitter.astype(np.float32)
+            point_features.append(features.astype(np.float32))
+            targets.append(target.astype(np.float32))
+            centers.append(center.astype(np.float32))
+            backups.append(bool(prepared.crop_stats["used_backup"]))
+            if self.dense_surface_points:
+                dense = sample_mesh_surface(
+                    prepared.crop_mesh,
+                    num_points=self.dense_surface_points,
+                    seed=self.sample_seed(ear_item, stream=2),
+                )
+                dense = canonicalize_point_features(dense, ear)
+                dense_local = (
+                    prepared.transform.normalize_xyz(dense[:, :3])
+                    * augmentation_scale
+                )
+                dense_surfaces.append(dense_local.astype(np.float32))
+
+        result = {
+            "points": torch.from_numpy(np.stack(point_features, axis=0)),
+            "landmarks": torch.from_numpy(np.stack(targets, axis=0)),
+            "scale": torch.full(
+                (len(EAR_NAMES),), self.local_scale, dtype=torch.float32
+            ),
+            "center": torch.from_numpy(np.stack(centers, axis=0)),
+            "identifier": subject_id,
+            "ear": EAR_NAMES,
+            "used_backup": torch.as_tensor(backups, dtype=torch.bool),
+        }
+        if self.dense_surface_points:
+            result["dense_surface"] = torch.from_numpy(
+                np.stack(dense_surfaces, axis=0)
+            )
         return result
 
 

@@ -120,6 +120,38 @@ def _predict_local(model, model_config, backbone: str, prepared, ear: str, devic
         return model.forward_with_details(values)["final"].squeeze(0).float().cpu().numpy()
 
 
+def _predict_bilateral_local(
+    model,
+    model_config,
+    prepared_by_ear: Mapping[str, object],
+    device: torch.device,
+) -> Mapping[str, np.ndarray]:
+    values = np.stack(
+        [
+            prepared_by_ear[ear].point_features.astype(np.float32)
+            for ear in EAR_NAMES
+        ],
+        axis=0,
+    )
+    tensor = torch.from_numpy(values).unsqueeze(0).to(device)
+    with torch.no_grad(), checkpoint_autocast_context(device, model_config):
+        prediction = (
+            model.forward_with_details(tensor)["final"]
+            .squeeze(0)
+            .float()
+            .cpu()
+            .numpy()
+        )
+    if prediction.shape != (2, 85, 3) or not np.isfinite(prediction).all():
+        raise RuntimeError(
+            "bilateral fold model did not return finite (2, 85, 3) output"
+        )
+    return {
+        ear: prediction[index].astype(np.float32)
+        for index, ear in enumerate(EAR_NAMES)
+    }
+
+
 def _world_from_local(prepared, ear: str, local: np.ndarray) -> np.ndarray:
     return decanonicalize_xyz(prepared.transform.denormalize_xyz(local), ear).astype(np.float32)
 
@@ -249,6 +281,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     selected_beta = float(prior.beta if args.beta is None else args.beta)
     backbone = str(model_config.get("backbone", ""))
+    bilateral_mode = str(model_config.get("bilateral_mode", "none"))
 
     ear_rows = []
     raw_errors = []
@@ -259,12 +292,41 @@ def main(argv: Sequence[str] | None = None) -> None:
     for subject_id in validation_ids:
         mesh, left, right = dataset[subject_index[subject_id]]
         subjects[subject_id] = {}
+        ground_truth_by_ear = {"left": left, "right": right}
+        prepared_by_ear = {}
         for ear in EAR_NAMES:
             item = validation_ids.index(subject_id) * 2 + EAR_NAMES.index(ear)
-            ground_truth = left if ear == "left" else right
+            ground_truth = ground_truth_by_ear[ear]
             center = predictions[prediction_key(subject_id, ear)]
-            prepared = prepare_ear_geometry(mesh, ground_truth, ear, center, calibration, num_points, run_seed + 100_000 + item * 1009)
-            raw_local = _predict_local(model, model_config, backbone, prepared, ear, device)
+            prepared_by_ear[ear] = prepare_ear_geometry(
+                mesh,
+                ground_truth,
+                ear,
+                center,
+                calibration,
+                num_points,
+                run_seed + 100_000 + item * 1009,
+            )
+        if bilateral_mode != "none":
+            raw_by_ear = _predict_bilateral_local(
+                model, model_config, prepared_by_ear, device
+            )
+        else:
+            raw_by_ear = {
+                ear: _predict_local(
+                    model,
+                    model_config,
+                    backbone,
+                    prepared_by_ear[ear],
+                    ear,
+                    device,
+                )
+                for ear in EAR_NAMES
+            }
+        for ear in EAR_NAMES:
+            ground_truth = ground_truth_by_ear[ear]
+            prepared = prepared_by_ear[ear]
+            raw_local = raw_by_ear[ear]
             pca_local = prior.blend(
                 raw_local,
                 beta=selected_beta,
@@ -320,6 +382,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "component": "fold_projection_aware_pca_evaluation",
         "outer_fold": int(data_config["outer_fold"]),
         "run_seed": int(run_seed),
+        "bilateral_mode": bilateral_mode,
         "checkpoint_path": str(args.checkpoint_path),
         "checkpoint_sha256": file_sha256(args.checkpoint_path),
         "prior_path": str(args.prior_path),
