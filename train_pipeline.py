@@ -83,10 +83,35 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _json_default(value):
+    """Convert NumPy values while keeping unsupported objects fail-fast."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(
+        f"Object of type {value.__class__.__name__} is not JSON serializable"
+    )
+
+
 def write_json(path: Path, data) -> None:
+    """Atomically write JSON without leaving a truncated target on failure."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, sort_keys=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(
+                data,
+                handle,
+                default=_json_default,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def pointnet_encoder_config() -> dict:
@@ -831,8 +856,8 @@ def command_evaluate(args):
             if not np.array_equal(left, repeated_left) or not np.array_equal(right, repeated_right):
                 raise RuntimeError("inference is not deterministic for a fixed mesh and seed")
         scores[subject_id] = {
-            "left": compute_mean_landmark_distance(left, left_target),
-            "right": compute_mean_landmark_distance(right, right_target),
+            "left": float(compute_mean_landmark_distance(left, left_target)),
+            "right": float(compute_mean_landmark_distance(right, right_target)),
         }
         landmark_errors.extend(
             [np.linalg.norm(left - left_target, axis=1), np.linalg.norm(right - right_target, axis=1)]

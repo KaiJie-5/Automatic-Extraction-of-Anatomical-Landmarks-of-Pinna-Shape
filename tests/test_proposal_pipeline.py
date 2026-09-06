@@ -37,7 +37,7 @@ from src.training import (
     _landmark_scheduler,
     _validate_landmark_resume_config,
 )
-from train_pipeline import build_parser, landmark_model_config
+from train_pipeline import build_parser, landmark_model_config, write_json
 
 
 def _write_landmarks(path, points):
@@ -58,6 +58,27 @@ def _valid_data_root(tmp_path):
         _write_landmarks(landmark_dir / f"{subject}_left_ear_landmarks.csv", points)
         _write_landmarks(landmark_dir / f"{subject}_right_ear_landmarks.csv", points)
     return mesh_dir, landmark_dir
+
+
+def test_write_json_handles_numpy_values_and_is_atomic(tmp_path):
+    output = tmp_path / "metrics.json"
+    write_json(
+        output,
+        {
+            "scalar": np.float32(1.25),
+            "array": np.asarray([1, 2, 3], dtype=np.int64),
+        },
+    )
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "array": [1, 2, 3],
+        "scalar": 1.25,
+    }
+
+    original = output.read_text(encoding="utf-8")
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        write_json(output, {"unsupported": object()})
+    assert output.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".metrics.json.tmp").exists()
 
 
 def test_audit_includes_kemar_and_corrected_p0027(tmp_path):
