@@ -199,6 +199,7 @@ class EarLandmarkDataset(EpochResampledDataset):
         dynamic_sampling: bool = True,
         augment: bool = False,
         geodesic_cache_dir: Optional[str] = None,
+        include_curve_targets: bool = False,
     ):
         super().__init__(seed, dynamic_sampling)
         self.base = MeshLandmarkDataset(mesh_dir, landmarks_dir)
@@ -213,6 +214,9 @@ class EarLandmarkDataset(EpochResampledDataset):
         self.local_scale = float(calibration["local_scale"])
         self.augment = bool(augment)
         self.geodesic_cache_dir = geodesic_cache_dir
+        self.include_curve_targets = bool(include_curve_targets)
+        if self.include_curve_targets and self.geodesic_cache_dir is None:
+            raise ValueError("continuous curve targets require a geodesic cache")
         missing = [
             prediction_key(self.base.get_identifier(index), ear)
             for index, ear in self.samples
@@ -274,6 +278,12 @@ class EarLandmarkDataset(EpochResampledDataset):
             result["geodesic_distances_mm"] = torch.from_numpy(
                 (geodesic * augmentation_scale).astype(np.float32)
             )
+        if self.include_curve_targets:
+            from .curve import landmark_arc_fractions
+
+            result["curve_landmark_fractions"] = torch.from_numpy(
+                landmark_arc_fractions(prepared.canonical_landmarks)
+            )
         if self.dense_surface_points:
             dense = sample_mesh_surface(
                 prepared.crop_mesh,
@@ -308,6 +318,7 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         dynamic_sampling: bool = True,
         augment: bool = False,
         geodesic_cache_dir: Optional[str] = None,
+        include_curve_targets: bool = False,
     ):
         super().__init__(seed, dynamic_sampling)
         self.ears_per_item = 2
@@ -323,6 +334,9 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         self.local_scale = float(calibration["local_scale"])
         self.augment = bool(augment)
         self.geodesic_cache_dir = geodesic_cache_dir
+        self.include_curve_targets = bool(include_curve_targets)
+        if self.include_curve_targets and self.geodesic_cache_dir is None:
+            raise ValueError("continuous curve targets require a geodesic cache")
         missing = [
             prediction_key(self.base.get_identifier(index), ear)
             for index in self.indices
@@ -349,6 +363,7 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         backups = []
         dense_surfaces = []
         geodesic_surfaces = []
+        curve_fractions = []
         for ear_offset, (ear, landmarks) in enumerate(
             zip(EAR_NAMES, landmark_sets)
         ):
@@ -405,6 +420,12 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
                     ).astype(np.float32)
                     * augmentation_scale
                 )
+            if self.include_curve_targets:
+                from .curve import landmark_arc_fractions
+
+                curve_fractions.append(
+                    landmark_arc_fractions(prepared.canonical_landmarks)
+                )
             if self.dense_surface_points:
                 dense = sample_mesh_surface(
                     prepared.crop_mesh,
@@ -436,6 +457,10 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         if self.geodesic_cache_dir is not None:
             result["geodesic_distances_mm"] = torch.from_numpy(
                 np.stack(geodesic_surfaces, axis=0).astype(np.float32)
+            )
+        if self.include_curve_targets:
+            result["curve_landmark_fractions"] = torch.from_numpy(
+                np.stack(curve_fractions, axis=0).astype(np.float32)
             )
         return result
 

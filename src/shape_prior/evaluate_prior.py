@@ -103,7 +103,15 @@ def _validate_context(args, data_config: Mapping[str, object], dataset: Dataset)
     return list(fold["validation"]), int(saved_seed if saved_seed is not None else args.run_seed), int(data_config["num_points"])
 
 
-def _predict_local(model, model_config, backbone: str, prepared, ear: str, device: torch.device):
+def _predict_local(
+    model,
+    model_config,
+    backbone: str,
+    prepared,
+    ear: str,
+    device: torch.device,
+    curve_path_config: Mapping[str, float] | None = None,
+):
     if backbone == "meshnet":
         features, neighbors, _ = meshnet_inputs_with_mesh(
             prepared.crop_mesh,
@@ -117,7 +125,43 @@ def _predict_local(model, model_config, backbone: str, prepared, ear: str, devic
             return model.forward_with_details(values, neighbor_values)["final"].squeeze(0).float().cpu().numpy()
     values = torch.from_numpy(prepared.point_features.astype(np.float32)).unsqueeze(0).to(device)
     with torch.no_grad(), checkpoint_autocast_context(device, model_config):
-        return model.forward_with_details(values)["final"].squeeze(0).float().cpu().numpy()
+        details = model.forward_with_details(values)
+    prediction = details["final"].squeeze(0).float().cpu().numpy()
+    if curve_path_config is None:
+        return prediction
+    required = (
+        "surface_candidates",
+        "curve_logits",
+        "curve_arc_coordinates",
+        "curve_landmark_fractions",
+    )
+    missing = [key for key in required if key not in details]
+    if missing:
+        raise ValueError(
+            "connected curve decoding requires a surface-curve checkpoint; "
+            f"missing details: {missing}"
+        )
+    return prediction, {
+        "surface_candidates": details["surface_candidates"]
+        .squeeze(0)
+        .float()
+        .cpu()
+        .numpy(),
+        "curve_logits": details["curve_logits"]
+        .squeeze(0)
+        .float()
+        .cpu()
+        .numpy(),
+        "curve_arc_coordinates": details["curve_arc_coordinates"]
+        .squeeze(0)
+        .float()
+        .cpu()
+        .numpy(),
+        "curve_landmark_fractions": details["curve_landmark_fractions"]
+        .float()
+        .cpu()
+        .numpy(),
+    }
 
 
 def _predict_bilateral_local(
@@ -218,6 +262,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-seed", type=int)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--curve-path-decode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="replace soft coordinates by four connected learned mesh paths",
+    )
+    parser.add_argument(
+        "--curve-path-field-strength", type=float, default=4.0
+    )
+    parser.add_argument(
+        "--curve-path-backtrack-weight", type=float, default=8.0
+    )
     return parser
 
 
@@ -282,6 +338,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     selected_beta = float(prior.beta if args.beta is None else args.beta)
     backbone = str(model_config.get("backbone", ""))
     bilateral_mode = str(model_config.get("bilateral_mode", "none"))
+    curve_path_config = None
+    if args.curve_path_decode:
+        if str(model_config.get("decoder", "")) != "surface_curve":
+            raise ValueError(
+                "--curve-path-decode requires a surface-curve checkpoint"
+            )
+        if args.curve_path_field_strength < 0.0:
+            raise ValueError("curve path field strength must be non-negative")
+        if args.curve_path_backtrack_weight < 0.0:
+            raise ValueError("curve path backtrack weight must be non-negative")
+        curve_path_config = {
+            "field_strength": float(args.curve_path_field_strength),
+            "backtrack_weight": float(args.curve_path_backtrack_weight),
+        }
+    curve_path_diagnostics = {}
 
     ear_rows = []
     raw_errors = []
@@ -312,17 +383,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 model, model_config, prepared_by_ear, device
             )
         else:
-            raw_by_ear = {
-                ear: _predict_local(
+            raw_by_ear = {}
+            curve_context_by_ear = {}
+            for ear in EAR_NAMES:
+                predicted = _predict_local(
                     model,
                     model_config,
                     backbone,
                     prepared_by_ear[ear],
                     ear,
                     device,
+                    curve_path_config=curve_path_config,
                 )
-                for ear in EAR_NAMES
-            }
+                if curve_path_config is None:
+                    raw_by_ear[ear] = predicted
+                else:
+                    raw_by_ear[ear], curve_context_by_ear[ear] = predicted
         for ear in EAR_NAMES:
             ground_truth = ground_truth_by_ear[ear]
             prepared = prepared_by_ear[ear]
@@ -332,6 +408,36 @@ def main(argv: Sequence[str] | None = None) -> None:
                 beta=selected_beta,
                 n_components=selected_components,
             )
+            if curve_path_config is not None:
+                from ..curve import decode_connected_curve_paths
+
+                context = curve_context_by_ear[ear]
+                raw_local, raw_path_diagnostics = decode_connected_curve_paths(
+                    prepared.crop_mesh,
+                    ear,
+                    prepared.transform,
+                    context["surface_candidates"],
+                    context["curve_logits"],
+                    context["curve_arc_coordinates"],
+                    raw_local,
+                    context["curve_landmark_fractions"],
+                    **curve_path_config,
+                )
+                pca_local, pca_path_diagnostics = decode_connected_curve_paths(
+                    prepared.crop_mesh,
+                    ear,
+                    prepared.transform,
+                    context["surface_candidates"],
+                    context["curve_logits"],
+                    context["curve_arc_coordinates"],
+                    pca_local,
+                    context["curve_landmark_fractions"],
+                    **curve_path_config,
+                )
+                curve_path_diagnostics[f"{subject_id}:{ear}"] = {
+                    "raw": raw_path_diagnostics,
+                    "pca": pca_path_diagnostics,
+                }
             raw_world = _world_from_local(prepared, ear, raw_local)
             pca_world = _world_from_local(prepared, ear, pca_local)
             projected_world = project_points_to_mesh(raw_world, prepared.crop_mesh)
@@ -383,6 +489,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "outer_fold": int(data_config["outer_fold"]),
         "run_seed": int(run_seed),
         "bilateral_mode": bilateral_mode,
+        "curve_path_decoder": (
+            {"enabled": True, **curve_path_config}
+            if curve_path_config is not None
+            else {"enabled": False}
+        ),
         "checkpoint_path": str(args.checkpoint_path),
         "checkpoint_sha256": file_sha256(args.checkpoint_path),
         "prior_path": str(args.prior_path),
@@ -425,6 +536,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "subject_level_raw_and_pca_errors": subjects,
     }
+    if curve_path_diagnostics:
+        report["curve_path_diagnostics"] = curve_path_diagnostics
     _write_json(args.output, report)
     print(
         f"Raw {report['raw_mean_md_mm']:.6f} mm, PCA {report['pca_mean_md_mm']:.6f} mm, "

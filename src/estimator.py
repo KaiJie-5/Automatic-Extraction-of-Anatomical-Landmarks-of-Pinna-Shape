@@ -23,6 +23,7 @@ from .shape_prior import (
     gate_bilateral_contours,
     normalise_contour_gate,
 )
+from .curve import decode_connected_curve_paths
 from .surface import project_points_to_mesh
 from .preprocessing import (
     compute_mesh_normalization,
@@ -53,6 +54,7 @@ class LandmarkExtractor:
         self.pca_shape_prior = None
         self.bilateral_pca_shape_prior = None
         self.bilateral_pca_contour_gate = ()
+        self.curve_path_decoder = None
 
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
@@ -299,6 +301,25 @@ class LandmarkExtractor:
             self.seed = int(checkpoint["sampling"]["seed"])
         postprocess = checkpoint["postprocess"]
         self.project_to_surface = bool(postprocess.get("project_to_surface", False))
+        curve_path = postprocess.get("curve_path_decoder", {})
+        if bool(curve_path.get("enabled", False)):
+            if str(self.landmark_model_config.get("decoder", "")) != "surface_curve":
+                raise ValueError(
+                    "v2 connected curve paths require a surface-curve model"
+                )
+            field_strength = float(curve_path.get("field_strength", 4.0))
+            backtrack_weight = float(curve_path.get("backtrack_weight", 8.0))
+            if (
+                not np.isfinite(field_strength)
+                or field_strength < 0.0
+                or not np.isfinite(backtrack_weight)
+                or backtrack_weight < 0.0
+            ):
+                raise ValueError("v2 connected curve path settings are invalid")
+            self.curve_path_decoder = {
+                "field_strength": field_strength,
+                "backtrack_weight": backtrack_weight,
+            }
         self.pca_shape_prior = self._load_pca_shape_prior(postprocess)
         self.bilateral_pca_shape_prior = self._load_bilateral_pca_shape_prior(
             postprocess
@@ -346,6 +367,7 @@ class LandmarkExtractor:
             thresholds=self.crop_calibration.get("fallback_thresholds"),
         )
         local_transform = LocalEarTransform(predicted_center, self.local_scale)
+        curve_context = None
         with torch.no_grad(), checkpoint_autocast_context(
             self.device, self.landmark_model_config
         ):
@@ -360,10 +382,59 @@ class LandmarkExtractor:
             else:
                 model_input = local_transform.normalize_features(local_features)
                 input_tensor = torch.from_numpy(model_input).unsqueeze(0).to(self.device)
-                local_prediction = (
-                    self.landmark_model(input_tensor).squeeze(0).float().cpu().numpy()
-                )
+                if self.curve_path_decoder is None:
+                    local_prediction = (
+                        self.landmark_model(input_tensor)
+                        .squeeze(0)
+                        .float()
+                        .cpu()
+                        .numpy()
+                    )
+                else:
+                    details = self.landmark_model.forward_with_details(
+                        input_tensor
+                    )
+                    local_prediction = (
+                        details["final"].squeeze(0).float().cpu().numpy()
+                    )
+                    curve_context = {
+                        "surface_candidates": details["surface_candidates"]
+                        .squeeze(0)
+                        .float()
+                        .cpu()
+                        .numpy(),
+                        "curve_logits": details["curve_logits"]
+                        .squeeze(0)
+                        .float()
+                        .cpu()
+                        .numpy(),
+                        "curve_arc_coordinates": details[
+                            "curve_arc_coordinates"
+                        ]
+                        .squeeze(0)
+                        .float()
+                        .cpu()
+                        .numpy(),
+                        "curve_landmark_fractions": details[
+                            "curve_landmark_fractions"
+                        ]
+                        .float()
+                        .cpu()
+                        .numpy(),
+                    }
         local_prediction = self._apply_pca_shape_prior(local_prediction)
+        if curve_context is not None:
+            local_prediction, _ = decode_connected_curve_paths(
+                crop_mesh,
+                ear,
+                local_transform,
+                curve_context["surface_candidates"],
+                curve_context["curve_logits"],
+                curve_context["curve_arc_coordinates"],
+                local_prediction,
+                curve_context["curve_landmark_fractions"],
+                **self.curve_path_decoder,
+            )
         canonical_prediction = local_transform.denormalize_xyz(local_prediction)
         prediction = decanonicalize_xyz(canonical_prediction, ear).astype(np.float32)
         if self.project_to_surface:
@@ -377,6 +448,7 @@ class LandmarkExtractor:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Run paired model inference and/or paired statistical post-processing."""
         prepared = []
+        curve_contexts = []
         for ear_offset, ear in enumerate(("left", "right")):
             broad_features, _, _ = sample_canonical_crop(
                 mesh,
@@ -472,11 +544,49 @@ class LandmarkExtractor:
                             .to(self.device),
                         )
                     else:
-                        prediction = self.landmark_model(
+                        input_tensor = (
                             torch.from_numpy(model_input)
                             .unsqueeze(0)
                             .to(self.device)
                         )
+                        if self.curve_path_decoder is None:
+                            prediction = self.landmark_model(input_tensor)
+                        else:
+                            details = self.landmark_model.forward_with_details(
+                                input_tensor
+                            )
+                            prediction = details["final"]
+                            curve_contexts.append(
+                                {
+                                    "surface_candidates": details[
+                                        "surface_candidates"
+                                    ]
+                                    .squeeze(0)
+                                    .float()
+                                    .cpu()
+                                    .numpy(),
+                                    "curve_logits": details["curve_logits"]
+                                    .squeeze(0)
+                                    .float()
+                                    .cpu()
+                                    .numpy(),
+                                    "curve_arc_coordinates": details[
+                                        "curve_arc_coordinates"
+                                    ]
+                                    .squeeze(0)
+                                    .float()
+                                    .cpu()
+                                    .numpy(),
+                                    "curve_landmark_fractions": details[
+                                        "curve_landmark_fractions"
+                                    ]
+                                    .float()
+                                    .cpu()
+                                    .numpy(),
+                                }
+                            )
+                        if self.curve_path_decoder is None:
+                            curve_contexts.append(None)
                 predictions.append(
                     prediction.squeeze(0).float().cpu().numpy()
                 )
@@ -487,6 +597,23 @@ class LandmarkExtractor:
             )
 
         local_predictions = self._apply_pca_postprocess_pair(local_predictions)
+        if self.curve_path_decoder is not None:
+            decoded_predictions = []
+            for ear_index, (ear, transform, crop_mesh, _) in enumerate(prepared):
+                context = curve_contexts[ear_index]
+                decoded, _ = decode_connected_curve_paths(
+                    crop_mesh,
+                    ear,
+                    transform,
+                    context["surface_candidates"],
+                    context["curve_logits"],
+                    context["curve_arc_coordinates"],
+                    local_predictions[ear_index],
+                    context["curve_landmark_fractions"],
+                    **self.curve_path_decoder,
+                )
+                decoded_predictions.append(decoded)
+            local_predictions = np.stack(decoded_predictions, axis=0)
 
         outputs = []
         for ear_index, (ear, transform, crop_mesh, _) in enumerate(prepared):

@@ -342,6 +342,111 @@ sbatch submit_job_train_pointnet2.slurm evaluate-pca-prior \
   --output runs/pca_projection/geodesic_vector_voting/fold0_seed42.json
 ```
 
+### Continuous anatomical-curve screen
+
+The opt-in `surface-curve` decoder retains the proven PointNeXt-S D256 unary
+landmark heatmaps and adds four shared geodesic contour fields plus four
+normalized arc-coordinate fields. Each landmark heatmap is conditioned on its
+contour identity and training-fold median arc position. Per-ear arc targets are
+derived from ordered annotation chord lengths, while the serialized inference
+fractions are medians calculated from outer-training ears only. The existing
+geodesic cache is therefore required; baseline checkpoint behaviour is
+unchanged.
+
+Train the first Fold-0/seed-42 candidate:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm fit-landmarks \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --outer-fold 0 \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --output-dir runs/continuous_curve/fold0_seed42 \
+  --backbone pointnext \
+  --pointnext-variant s \
+  --landmark-decoder surface-curve \
+  --heatmap-feature-dim 256 \
+  --heatmap-topk 64 \
+  --heatmap-coordinate-temperature 1 \
+  --heatmap-weight 0.1 \
+  --heatmap-sigma-mm 2 \
+  --heatmap-distance geodesic \
+  --geodesic-cache-dir artifacts/geodesic/fold0 \
+  --curve-weight 0.1 \
+  --curve-arc-weight 0.1 \
+  --curve-sigma-mm 3 \
+  --curve-arc-radius-mm 4 \
+  --curve-logit-weight 0.5 \
+  --curve-arc-logit-weight 0.25 \
+  --curve-arc-temperature 0.1 \
+  --no-surface-voting \
+  --four-heads \
+  --no-augment \
+  --refinement-k 32 \
+  --refinement-anchor raw \
+  --refinement-mode geometry-offset \
+  --anchor-weight 0 \
+  --spacing-weight 0.01 \
+  --surface-weight 0 \
+  --num-points 16384 \
+  --seed 42 \
+  --epochs 200 \
+  --patience 30 \
+  --workers 10 \
+  --amp
+```
+
+First evaluate the differentiable structured coordinates with the unchanged PCA
+and exact projection path:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm evaluate-pca-prior \
+  --checkpoint-path runs/continuous_curve/fold0_seed42/best_landmarks.pt \
+  --prior-path artifacts/pca_projection/fold0/prior.npz \
+  --prior-manifest artifacts/pca_projection/fold0/manifest.json \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --components 32 \
+  --beta 0.5 \
+  --run-seed 42 \
+  --device auto \
+  --output runs/pca_projection/continuous_curve/soft/fold0_seed42.json
+```
+
+Then evaluate the same checkpoint with genuinely connected, oriented paths on
+the exact cropped triangle mesh. The data term comes from the learned contour
+field and backwards movement in learned arc position is penalized:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm evaluate-pca-prior \
+  --checkpoint-path runs/continuous_curve/fold0_seed42/best_landmarks.pt \
+  --prior-path artifacts/pca_projection/fold0/prior.npz \
+  --prior-manifest artifacts/pca_projection/fold0/manifest.json \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --components 32 \
+  --beta 0.5 \
+  --curve-path-decode \
+  --curve-path-field-strength 4 \
+  --curve-path-backtrack-weight 8 \
+  --run-seed 42 \
+  --device auto \
+  --output runs/pca_projection/continuous_curve/connected/fold0_seed42.json
+```
+
+Compare both reports against the matching D256 Fold-0 PCA+projection reference
+of `1.316753 mm`, including P95, maximum ear error, per-contour MD, and the
+connected-path fallback records. Do not continue to all folds merely because a
+rounded mean is lower.
+
 After the registered five-fold/three-seed comparisons select a configuration, use
 the cross-validation best epochs to retrain and package one deterministic model:
 

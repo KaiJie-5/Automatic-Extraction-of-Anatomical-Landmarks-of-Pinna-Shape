@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 import torch
 import torch.nn as nn
 
+from .curve import contour_ids, validate_landmark_arc_fractions
 from .pointnet2_model import PointNet2FeatureEncoder, PointNet2LandmarkRegressor
 from .pointnet2_utils import index_points, square_distance
 from .pointnext_model import PointNeXtEncoder
@@ -377,6 +378,11 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         vote_cap_normalized: float = 0.0,
         vote_fusion_iterations: int = 3,
         vote_fusion_epsilon_normalized: float = 0.0,
+        curve_enabled: bool = False,
+        curve_landmark_fractions: Sequence[float] | None = None,
+        curve_logit_weight: float = 0.5,
+        curve_arc_logit_weight: float = 0.25,
+        curve_arc_temperature: float = 0.1,
         refinement_k: int = 0,
         refinement_cap_normalized: float = 0.0,
         refinement_anchor: str = "raw",
@@ -452,6 +458,50 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
                 "surface voting requires positive robust-fusion settings"
             )
         self.refinement_mode = refinement_mode
+        self.curve_enabled = bool(curve_enabled)
+        self.curve_logit_weight = float(curve_logit_weight)
+        self.curve_arc_logit_weight = float(curve_arc_logit_weight)
+        self.curve_arc_temperature = float(curve_arc_temperature)
+        if self.curve_enabled:
+            if self.surface_voting:
+                raise ValueError(
+                    "continuous curve decoding and surface voting are separate experiments"
+                )
+            if curve_landmark_fractions is None:
+                raise ValueError(
+                    "continuous curve decoding requires training-fold landmark fractions"
+                )
+            fractions = validate_landmark_arc_fractions(
+                curve_landmark_fractions
+            )
+            if (
+                not math.isfinite(self.curve_logit_weight)
+                or self.curve_logit_weight < 0.0
+                or not math.isfinite(self.curve_arc_logit_weight)
+                or self.curve_arc_logit_weight < 0.0
+                or not math.isfinite(self.curve_arc_temperature)
+                or self.curve_arc_temperature <= 0.0
+            ):
+                raise ValueError(
+                    "continuous curve decoder weights must be non-negative and "
+                    "its arc temperature must be positive"
+                )
+            self.register_buffer(
+                "curve_landmark_fractions",
+                torch.from_numpy(fractions),
+            )
+            self.register_buffer(
+                "curve_contour_ids",
+                torch.from_numpy(contour_ids()),
+                persistent=False,
+            )
+        else:
+            if curve_landmark_fractions is not None:
+                raise ValueError(
+                    "curve landmark fractions are only valid for curve decoding"
+                )
+            self.curve_landmark_fractions = None
+            self.curve_contour_ids = None
 
         # Decode the 64-point semantic level back to all original 16,384
         # sampled surface points using the exact encoder FPS hierarchy.
@@ -474,6 +524,12 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         )
         self.global_projection = nn.Linear(channels[4], heatmap_feature_dim)
         self.point_norm = nn.LayerNorm(heatmap_feature_dim)
+        if self.curve_enabled:
+            self.curve_field_head = nn.Linear(heatmap_feature_dim, 4)
+            self.curve_arc_head = nn.Linear(heatmap_feature_dim, 4)
+        else:
+            self.curve_field_head = None
+            self.curve_arc_head = None
 
         lengths = CONTOUR_LENGTHS if self.four_heads else (sum(CONTOUR_LENGTHS),)
         self.query_embeddings = nn.ParameterList(
@@ -546,6 +602,47 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         return (
             torch.einsum("bnd,ld->bln", point_features, query_features)
             * self.logit_scale
+        )
+
+    def _curve_fields(
+        self, point_features: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.curve_field_head is None or self.curve_arc_head is None:
+            return None, None
+        curve_logits = self.curve_field_head(point_features).transpose(1, 2)
+        arc_coordinates = torch.sigmoid(
+            self.curve_arc_head(point_features).transpose(1, 2).float()
+        )
+        return curve_logits, arc_coordinates
+
+    def _apply_curve_structure(
+        self,
+        unary_logits: torch.Tensor,
+        curve_logits: torch.Tensor | None,
+        arc_coordinates: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Intersect semantic landmark evidence with curve membership/order."""
+
+        if not self.curve_enabled:
+            return unary_logits
+        if curve_logits is None or arc_coordinates is None:
+            raise RuntimeError("continuous curve fields were not produced")
+        contour_indices = self.curve_contour_ids.to(unary_logits.device)
+        contour_log_probability = torch.log_softmax(
+            curve_logits.float(), dim=-1
+        ).index_select(1, contour_indices)
+        landmark_arc = arc_coordinates.index_select(1, contour_indices)
+        fractions = self.curve_landmark_fractions.to(
+            device=unary_logits.device, dtype=torch.float32
+        ).view(1, 85, 1)
+        arc_penalty = -(
+            (landmark_arc - fractions).square()
+            / (2.0 * self.curve_arc_temperature**2)
+        )
+        return (
+            unary_logits.float()
+            + self.curve_logit_weight * contour_log_probability
+            + self.curve_arc_logit_weight * arc_penalty
         )
 
     def _vote_offsets(
@@ -652,7 +749,11 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         levels = self.encoder.forward_features(points)
         point_features = self._decode_point_features(levels)
         query_features = self._query_features()
-        logits = self._logits(point_features, query_features)
+        unary_logits = self._logits(point_features, query_features)
+        curve_logits, curve_arc_coordinates = self._curve_fields(point_features)
+        logits = self._apply_curve_structure(
+            unary_logits, curve_logits, curve_arc_coordinates
+        )
         vote_offsets = self._vote_offsets(point_features, query_features)
         xyz = levels["xyz"][0]
         coarse = self.decode_surface_coordinates(logits, xyz, vote_offsets)
@@ -667,6 +768,7 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
             "coarse": coarse,
             "final": final,
             "heatmap_logits": logits,
+            "unary_heatmap_logits": unary_logits,
             "surface_candidates": xyz,
             "decoded_point_features": point_features,
             "landmark_query_features": query_features,
@@ -675,6 +777,12 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
             details["refinement_stage_predictions"] = refinement_predictions
         if vote_offsets is not None:
             details["surface_vote_offsets"] = vote_offsets
+        if curve_logits is not None and curve_arc_coordinates is not None:
+            details["curve_logits"] = curve_logits
+            details["curve_arc_coordinates"] = curve_arc_coordinates
+            details["curve_landmark_fractions"] = (
+                self.curve_landmark_fractions
+            )
         return details
 
     def forward(self, points: torch.Tensor) -> torch.Tensor:
@@ -1012,11 +1120,17 @@ def build_landmark_model(config: Mapping[str, object]) -> nn.Module:
         values.pop("bilateral_attention_layers", 1)
     )
     bilateral_dropout = float(values.pop("bilateral_dropout", 0.0))
-    if decoder == "surface_heatmap":
+    if decoder in {"surface_heatmap", "surface_curve"}:
         backbone = str(values.pop("backbone", ""))
         if backbone != "pointnext":
-            raise ValueError("surface heatmap decoder requires PointNeXt")
+            raise ValueError("surface heatmap/curve decoder requires PointNeXt")
+        if decoder == "surface_curve":
+            values["curve_enabled"] = True
         if bilateral_mode != "none":
+            if decoder == "surface_curve":
+                raise ValueError(
+                    "continuous curve decoding does not support bilateral neural modes"
+                )
             return BilateralPointNeXtSurfaceHeatmapRegressor(
                 bilateral_mode=bilateral_mode,
                 bilateral_attention_heads=bilateral_attention_heads,

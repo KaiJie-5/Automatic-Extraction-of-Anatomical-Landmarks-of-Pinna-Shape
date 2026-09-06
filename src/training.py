@@ -68,6 +68,9 @@ def _flatten_landmark_batch(
     heatmap_points: torch.Tensor | None = None,
     geodesic_distances: torch.Tensor | None = None,
     vote_offsets: torch.Tensor | None = None,
+    curve_logits: torch.Tensor | None = None,
+    curve_arc_coordinates: torch.Tensor | None = None,
+    curve_landmark_fractions: torch.Tensor | None = None,
 ):
     """Flatten the optional paired-ear axis for unchanged per-ear losses."""
     if prediction.ndim == 3:
@@ -80,6 +83,9 @@ def _flatten_landmark_batch(
             heatmap_points,
             geodesic_distances,
             vote_offsets,
+            curve_logits,
+            curve_arc_coordinates,
+            curve_landmark_fractions,
             int(prediction.shape[0]),
         )
     if prediction.ndim != 4 or tuple(prediction.shape[1:3]) != (2, 85):
@@ -122,6 +128,25 @@ def _flatten_landmark_batch(
         if vote_offsets is not None
         else None
     )
+    flattened_curve_logits = (
+        curve_logits.reshape(batch * ears, *curve_logits.shape[2:])
+        if curve_logits is not None
+        else None
+    )
+    flattened_curve_arc = (
+        curve_arc_coordinates.reshape(
+            batch * ears, *curve_arc_coordinates.shape[2:]
+        )
+        if curve_arc_coordinates is not None
+        else None
+    )
+    flattened_curve_fractions = (
+        curve_landmark_fractions.reshape(
+            batch * ears, *curve_landmark_fractions.shape[2:]
+        )
+        if curve_landmark_fractions is not None
+        else None
+    )
     return (
         flattened_prediction,
         flattened_target,
@@ -131,6 +156,9 @@ def _flatten_landmark_batch(
         flattened_points,
         flattened_geodesic,
         flattened_votes,
+        flattened_curve_logits,
+        flattened_curve_arc,
+        flattened_curve_fractions,
         int(batch * ears),
     )
 
@@ -191,6 +219,14 @@ def probe_batch_size(
                         if geodesic is not None
                         else None
                     )
+                    curve_fractions = sample.get("curve_landmark_fractions")
+                    curve_fractions = (
+                        curve_fractions.unsqueeze(0).expand(
+                            candidate, *([-1] * curve_fractions.ndim)
+                        ).contiguous().to(device)
+                        if curve_fractions is not None
+                        else None
+                    )
                     if float(landmark_loss_weights.get("heatmap", 0.0)):
                         if "face_features" in sample:
                             raise ValueError("surface heatmap loss is unavailable for MeshNet")
@@ -199,11 +235,17 @@ def probe_batch_size(
                         heatmap_logits = details.get("heatmap_logits")
                         heatmap_points = details.get("surface_candidates")
                         vote_offsets = details.get("surface_vote_offsets")
+                        curve_logits = details.get("curve_logits")
+                        curve_arc_coordinates = details.get(
+                            "curve_arc_coordinates"
+                        )
                     else:
                         output = model(face_features, neighbors) if "face_features" in sample else model(points)
                         heatmap_logits = None
                         heatmap_points = None
                         vote_offsets = None
+                        curve_logits = None
+                        curve_arc_coordinates = None
                     (
                         output,
                         target,
@@ -213,6 +255,9 @@ def probe_batch_size(
                         heatmap_points,
                         geodesic,
                         vote_offsets,
+                        curve_logits,
+                        curve_arc_coordinates,
+                        curve_fractions,
                         _,
                     ) = _flatten_landmark_batch(
                         output,
@@ -223,6 +268,9 @@ def probe_batch_size(
                         heatmap_points,
                         geodesic,
                         vote_offsets,
+                        curve_logits,
+                        curve_arc_coordinates,
+                        curve_fractions,
                     )
                     probe_loss = proposal_landmark_loss(
                         output.float(),
@@ -240,6 +288,13 @@ def probe_batch_size(
                         vote_offsets=vote_offsets,
                         vote_weight=float(landmark_loss_weights.get("vote", 0.0)),
                         vote_radius_mm=float(landmark_loss_weights.get("vote_radius_mm", 6.0)),
+                        curve_logits=curve_logits,
+                        curve_arc_coordinates=curve_arc_coordinates,
+                        curve_landmark_fractions=curve_fractions,
+                        curve_weight=float(landmark_loss_weights.get("curve", 0.0)),
+                        curve_arc_weight=float(landmark_loss_weights.get("curve_arc", 0.0)),
+                        curve_sigma_mm=float(landmark_loss_weights.get("curve_sigma_mm", 3.0)),
+                        curve_arc_radius_mm=float(landmark_loss_weights.get("curve_arc_radius_mm", 4.0)),
                     )["total"]
                 probe_loss.backward()
             model.zero_grad(set_to_none=True)
@@ -774,6 +829,8 @@ def train_landmarks(
             "surface": 0.0,
             "heatmap": 0.0,
             "vote": 0.0,
+            "curve": 0.0,
+            "curve_arc": 0.0,
         }
         count = 0
         for step, batch in enumerate(loader, 1):
@@ -789,6 +846,12 @@ def train_landmarks(
             dense = dense.to(device) if dense is not None else None
             geodesic = batch.get("geodesic_distances_mm")
             geodesic = geodesic.to(device) if geodesic is not None else None
+            curve_fractions = batch.get("curve_landmark_fractions")
+            curve_fractions = (
+                curve_fractions.to(device)
+                if curve_fractions is not None
+                else None
+            )
             with torch.set_grad_enabled(training):
                 with _autocast(device, amp, amp_dtype):
                     if float(loss_weights.get("heatmap", 0.0)):
@@ -801,11 +864,17 @@ def train_landmarks(
                         heatmap_logits = details.get("heatmap_logits")
                         heatmap_points = details.get("surface_candidates")
                         vote_offsets = details.get("surface_vote_offsets")
+                        curve_logits = details.get("curve_logits")
+                        curve_arc_coordinates = details.get(
+                            "curve_arc_coordinates"
+                        )
                     else:
                         prediction = model(face_features, neighbors) if "face_features" in batch else model(points)
                         heatmap_logits = None
                         heatmap_points = None
                         vote_offsets = None
+                        curve_logits = None
+                        curve_arc_coordinates = None
                     (
                         prediction,
                         target,
@@ -815,6 +884,9 @@ def train_landmarks(
                         heatmap_points,
                         geodesic,
                         vote_offsets,
+                        curve_logits,
+                        curve_arc_coordinates,
+                        curve_fractions,
                         flattened_count,
                     ) = _flatten_landmark_batch(
                         prediction,
@@ -825,6 +897,9 @@ def train_landmarks(
                         heatmap_points,
                         geodesic,
                         vote_offsets,
+                        curve_logits,
+                        curve_arc_coordinates,
+                        curve_fractions,
                     )
                     if flattened_count != batch_count:
                         raise RuntimeError("landmark batch ear count is inconsistent")
@@ -841,6 +916,13 @@ def train_landmarks(
                         vote_offsets=vote_offsets,
                         vote_weight=float(loss_weights.get("vote", 0.0)),
                         vote_radius_mm=float(loss_weights.get("vote_radius_mm", 6.0)),
+                        curve_logits=curve_logits,
+                        curve_arc_coordinates=curve_arc_coordinates,
+                        curve_landmark_fractions=curve_fractions,
+                        curve_weight=float(loss_weights.get("curve", 0.0)),
+                        curve_arc_weight=float(loss_weights.get("curve_arc", 0.0)),
+                        curve_sigma_mm=float(loss_weights.get("curve_sigma_mm", 3.0)),
+                        curve_arc_radius_mm=float(loss_weights.get("curve_arc_radius_mm", 4.0)),
                     )
                 if training:
                     scaler.scale(losses["total"] / accumulation).backward()

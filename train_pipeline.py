@@ -131,8 +131,13 @@ def locator_model_config(backbone: str = "pointnet2") -> dict:
     }
 
 
-def landmark_model_config(args, local_scale: float) -> dict:
+def landmark_model_config(
+    args,
+    local_scale: float,
+    curve_landmark_fractions=None,
+) -> dict:
     decoder = str(getattr(args, "landmark_decoder", "coordinate-regression"))
+    surface_decoder = decoder in {"surface-heatmap", "surface-curve"}
     bilateral_mode = str(getattr(args, "bilateral_mode", "none"))
     if bilateral_mode != "none" and (
         args.backbone != "pointnext" or decoder != "surface-heatmap"
@@ -149,9 +154,12 @@ def landmark_model_config(args, local_scale: float) -> dict:
         raise ValueError(
             "--bilateral-attention-heads must divide --heatmap-feature-dim"
         )
-    if decoder == "surface-heatmap" and args.backbone != "pointnext":
-        raise ValueError("--landmark-decoder surface-heatmap requires --backbone pointnext")
-    if decoder != "surface-heatmap" and (
+    if surface_decoder and args.backbone != "pointnext":
+        raise ValueError(
+            "--landmark-decoder surface-heatmap/surface-curve requires "
+            "--backbone pointnext"
+        )
+    if not surface_decoder and (
         str(args.refinement_mode) != "geometry-offset"
         or int(args.refinement_stages) != 1
     ):
@@ -185,7 +193,7 @@ def landmark_model_config(args, local_scale: float) -> dict:
         encoder = default_pointtransformerv3_config(args.ptv3_grid_size)
     else:
         raise ValueError(f"unsupported landmark backbone: {args.backbone}")
-    if decoder == "surface-heatmap":
+    if surface_decoder:
         if int(args.heatmap_topk) > int(args.num_points):
             raise ValueError("--heatmap-topk cannot exceed --num-points")
         refinement_mode = str(args.refinement_mode)
@@ -205,7 +213,7 @@ def landmark_model_config(args, local_scale: float) -> dict:
             )
         config = {
             "backbone": "pointnext",
-            "decoder": "surface_heatmap",
+            "decoder": decoder.replace("-", "_"),
             "encoder_config": encoder,
             "four_heads": bool(args.four_heads),
             "heatmap_feature_dim": int(args.heatmap_feature_dim),
@@ -236,6 +244,25 @@ def landmark_model_config(args, local_scale: float) -> dict:
             "refinement_hidden_dim": int(args.refinement_hidden_dim),
             "refinement_temperature": float(args.refinement_temperature),
         }
+        if decoder == "surface-curve":
+            if curve_landmark_fractions is None:
+                raise ValueError(
+                    "surface-curve requires training-fold landmark fractions"
+                )
+            config.update(
+                {
+                    "curve_landmark_fractions": [
+                        float(value) for value in curve_landmark_fractions
+                    ],
+                    "curve_logit_weight": float(args.curve_logit_weight),
+                    "curve_arc_logit_weight": float(
+                        args.curve_arc_logit_weight
+                    ),
+                    "curve_arc_temperature": float(
+                        args.curve_arc_temperature
+                    ),
+                }
+            )
         if bilateral_mode != "none":
             config.update(
                 {
@@ -270,14 +297,15 @@ def landmark_model_config(args, local_scale: float) -> dict:
 
 def landmark_loss_config(args) -> dict:
     decoder = str(getattr(args, "landmark_decoder", "coordinate-regression"))
+    surface_decoder = decoder in {"surface-heatmap", "surface-curve"}
     heatmap_weight = float(getattr(args, "heatmap_weight", 0.0))
-    if decoder == "surface-heatmap" and heatmap_weight <= 0.0:
+    if surface_decoder and heatmap_weight <= 0.0:
         raise ValueError(
-            "surface-heatmap training requires a positive --heatmap-weight"
+            "surface heatmap/curve training requires a positive --heatmap-weight"
         )
-    if decoder != "surface-heatmap" and heatmap_weight != 0.0:
+    if not surface_decoder and heatmap_weight != 0.0:
         raise ValueError(
-            "--heatmap-weight is only valid with --landmark-decoder surface-heatmap"
+            "--heatmap-weight is only valid with a surface heatmap/curve decoder"
         )
     heatmap_distance = str(getattr(args, "heatmap_distance", "euclidean"))
     geodesic_cache_dir = getattr(args, "geodesic_cache_dir", None)
@@ -285,9 +313,9 @@ def landmark_loss_config(args) -> dict:
     vote_weight = float(getattr(args, "vote_weight", 0.0))
     vote_radius_mm = float(getattr(args, "vote_radius_mm", 6.0))
     vote_cap_mm = float(getattr(args, "vote_cap_mm", 6.0))
-    if decoder != "surface-heatmap" and heatmap_distance != "euclidean":
+    if not surface_decoder and heatmap_distance != "euclidean":
         raise ValueError(
-            "--heatmap-distance geodesic requires the surface-heatmap decoder"
+            "--heatmap-distance geodesic requires a surface heatmap/curve decoder"
         )
     if heatmap_distance == "geodesic" and not geodesic_cache_dir:
         raise ValueError(
@@ -305,6 +333,27 @@ def landmark_loss_config(args) -> dict:
         raise ValueError("--vote-weight requires --surface-voting")
     if surface_voting and vote_cap_mm < vote_radius_mm:
         raise ValueError("--vote-cap-mm must be at least --vote-radius-mm")
+    curve_weight = float(getattr(args, "curve_weight", 0.0))
+    curve_arc_weight = float(getattr(args, "curve_arc_weight", 0.0))
+    if decoder == "surface-curve":
+        if heatmap_distance != "geodesic":
+            raise ValueError(
+                "--landmark-decoder surface-curve requires "
+                "--heatmap-distance geodesic"
+            )
+        if curve_weight <= 0.0 or curve_arc_weight <= 0.0:
+            raise ValueError(
+                "surface-curve training requires positive --curve-weight and "
+                "--curve-arc-weight"
+            )
+        if surface_voting:
+            raise ValueError(
+                "surface-curve and --surface-voting are separate controlled experiments"
+            )
+    elif curve_weight != 0.0 or curve_arc_weight != 0.0:
+        raise ValueError(
+            "curve loss weights require --landmark-decoder surface-curve"
+        )
     return {
         "anchor": float(args.anchor_weight),
         "spacing": float(args.spacing_weight),
@@ -315,6 +364,12 @@ def landmark_loss_config(args) -> dict:
         "vote": vote_weight,
         "vote_radius_mm": vote_radius_mm,
         "vote_cap_mm": vote_cap_mm,
+        "curve": curve_weight,
+        "curve_arc": curve_arc_weight,
+        "curve_sigma_mm": float(getattr(args, "curve_sigma_mm", 3.0)),
+        "curve_arc_radius_mm": float(
+            getattr(args, "curve_arc_radius_mm", 4.0)
+        ),
     }
 
 
@@ -340,6 +395,10 @@ def make_landmark_dataset(args, predictions, calibration, subject_ids, seed, tra
             if str(getattr(args, "heatmap_distance", "euclidean")) == "geodesic"
             else None
         ),
+        include_curve_targets=(
+            str(getattr(args, "landmark_decoder", "coordinate-regression"))
+            == "surface-curve"
+        ),
     )
     if args.backbone == "meshnet":
         gate = read_json(args.meshnet_gate_json)
@@ -349,6 +408,23 @@ def make_landmark_dataset(args, predictions, calibration, subject_ids, seed, tra
     if str(getattr(args, "bilateral_mode", "none")) != "none":
         return BilateralEarLandmarkDataset(**common)
     return EarLandmarkDataset(**common)
+
+
+def training_curve_landmark_fractions(dataset: Dataset, subject_ids: Sequence[str]):
+    """Fit the inference arc-fraction template using training ears only."""
+
+    from src.curve import median_landmark_arc_fractions
+
+    id_to_index = {
+        dataset.get_identifier(index): index for index in range(len(dataset))
+    }
+    ears = []
+    for subject_id in subject_ids:
+        if subject_id not in id_to_index:
+            raise ValueError(f"unknown curve-training subject: {subject_id}")
+        _, left, right = dataset[id_to_index[subject_id]]
+        ears.extend((left, right))
+    return median_landmark_arc_fractions(ears)
 
 
 def subject_ears(dataset: Dataset, subject_ids: Sequence[str]):
@@ -764,7 +840,8 @@ def command_fit_landmarks(args):
     outer = select_outer_fold(folds, args.outer_fold)
     calibration = read_json(args.calibration_json)
     predictions = _load_prediction_map(args.predictions_json)
-    validate_fold_dataset(Dataset(args.mesh_dir, args.landmarks_dir), folds)
+    source_dataset = Dataset(args.mesh_dir, args.landmarks_dir)
+    validate_fold_dataset(source_dataset, folds)
     geodesic_manifest = None
     if str(getattr(args, "heatmap_distance", "euclidean")) == "geodesic":
         from src.geodesic import validate_geodesic_manifest
@@ -784,7 +861,17 @@ def command_fit_landmarks(args):
     validation_data = make_landmark_dataset(
         args, predictions, calibration, outer["validation"], args.seed + 100_000, False
     )
-    model_config = landmark_model_config(args, float(calibration["local_scale"]))
+    curve_fractions = (
+        training_curve_landmark_fractions(source_dataset, outer["train"])
+        if str(getattr(args, "landmark_decoder", "coordinate-regression"))
+        == "surface-curve"
+        else None
+    )
+    model_config = landmark_model_config(
+        args,
+        float(calibration["local_scale"]),
+        curve_landmark_fractions=curve_fractions,
+    )
     model = make_landmark_model(model_config)
     loss_weights = landmark_loss_config(args)
     data_config = {
@@ -846,6 +933,13 @@ def _final_broad_config(locator_root: str, dataset: Dataset):
 
 def _bundle_v2(locator_checkpoint, landmark_checkpoint, broad, calibration, args, subject_ids):
     subject_checksum = hashlib.sha256("\n".join(sorted(subject_ids)).encode("utf-8")).hexdigest()
+    curve_path_enabled = bool(getattr(args, "curve_path_decode", False))
+    if curve_path_enabled and str(
+        landmark_checkpoint["model_config"].get("decoder", "")
+    ) != "surface_curve":
+        raise ValueError(
+            "--curve-path-decode requires a final surface-curve landmark model"
+        )
     return {
         "schema_version": 2,
         "pipeline": "proposal_coarse_to_fine",
@@ -866,7 +960,18 @@ def _bundle_v2(locator_checkpoint, landmark_checkpoint, broad, calibration, args
             "local_scale": float(calibration["local_scale"]),
         },
         "sampling": {"locator_points": args.num_points, "landmark_points": args.num_points, "seed": args.seed},
-        "postprocess": {"project_to_surface": bool(args.project_to_surface)},
+        "postprocess": {
+            "project_to_surface": bool(args.project_to_surface),
+            "curve_path_decoder": {
+                "enabled": curve_path_enabled,
+                "field_strength": float(
+                    getattr(args, "curve_path_field_strength", 4.0)
+                ),
+                "backtrack_weight": float(
+                    getattr(args, "curve_path_backtrack_weight", 8.0)
+                ),
+            },
+        },
         "training": {
             "subject_ids": subject_ids,
             "subject_count": len(subject_ids),
@@ -902,7 +1007,17 @@ def command_fit_final(args):
     )
     locator_checkpoint = torch.load(output / "locator" / "best_locator.pt", map_location="cpu")
 
-    landmark_config = landmark_model_config(args, float(calibration["local_scale"]))
+    curve_fractions = (
+        training_curve_landmark_fractions(dataset, subject_ids)
+        if str(getattr(args, "landmark_decoder", "coordinate-regression"))
+        == "surface-curve"
+        else None
+    )
+    landmark_config = landmark_model_config(
+        args,
+        float(calibration["local_scale"]),
+        curve_landmark_fractions=curve_fractions,
+    )
     landmark_model = make_landmark_model(landmark_config)
     dense = 32768 if args.surface_weight else 0
     landmark_data = make_landmark_dataset(
@@ -1322,6 +1437,16 @@ def command_evaluate_pca_prior(args):
     ]
     if args.run_seed is not None:
         values.extend(["--run-seed", str(args.run_seed)])
+    if args.curve_path_decode:
+        values.extend(
+            [
+                "--curve-path-decode",
+                "--curve-path-field-strength",
+                str(args.curve_path_field_strength),
+                "--curve-path-backtrack-weight",
+                str(args.curve_path_backtrack_weight),
+            ]
+        )
     evaluate_prior(values)
 
 
@@ -1878,12 +2003,13 @@ def add_landmark_model_arguments(parser):
     )
     parser.add_argument(
         "--landmark-decoder",
-        choices=("coordinate-regression", "surface-heatmap"),
+        choices=("coordinate-regression", "surface-heatmap", "surface-curve"),
         default="coordinate-regression",
         help=(
             "coordinate-regression preserves the legacy global XYZ heads; "
             "surface-heatmap retains PointNeXt spatial features and predicts "
-            "85 distributions over sampled crop-surface points"
+            "85 distributions over sampled crop-surface points; surface-curve "
+            "adds shared contour-membership and ordered arc-coordinate fields"
         ),
     )
     parser.add_argument(
@@ -1964,6 +2090,48 @@ def add_landmark_model_arguments(parser):
         type=positive_float,
         default=0.25,
         help="minimum residual in robust vote reweighting",
+    )
+    parser.add_argument(
+        "--curve-weight",
+        type=nonnegative_float,
+        default=0.0,
+        help="weight of four dense geodesic contour-field KL losses",
+    )
+    parser.add_argument(
+        "--curve-arc-weight",
+        type=nonnegative_float,
+        default=0.0,
+        help="weight of normalized within-contour arc-coordinate supervision",
+    )
+    parser.add_argument(
+        "--curve-sigma-mm",
+        type=positive_float,
+        default=3.0,
+        help="Gaussian width of dense anatomical-contour targets",
+    )
+    parser.add_argument(
+        "--curve-arc-radius-mm",
+        type=positive_float,
+        default=4.0,
+        help="geodesic tube radius supervised by the arc-coordinate loss",
+    )
+    parser.add_argument(
+        "--curve-logit-weight",
+        type=nonnegative_float,
+        default=0.5,
+        help="contour-field contribution to structured landmark logits",
+    )
+    parser.add_argument(
+        "--curve-arc-logit-weight",
+        type=nonnegative_float,
+        default=0.25,
+        help="ordered arc-coordinate contribution to structured landmark logits",
+    )
+    parser.add_argument(
+        "--curve-arc-temperature",
+        type=positive_float,
+        default=0.1,
+        help="normalized arc-coordinate Gaussian width during landmark decoding",
     )
     parser.add_argument(
         "--bilateral-mode",
@@ -2139,6 +2307,18 @@ def build_parser():
     final.add_argument("--locator-epochs", type=int, required=True)
     final.add_argument("--landmark-epochs", type=int, required=True)
     final.add_argument("--project-to-surface", action=argparse.BooleanOptionalAction, default=False)
+    final.add_argument(
+        "--curve-path-decode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="embed deterministic connected-curve mesh-path decoding",
+    )
+    final.add_argument(
+        "--curve-path-field-strength", type=nonnegative_float, default=4.0
+    )
+    final.add_argument(
+        "--curve-path-backtrack-weight", type=nonnegative_float, default=8.0
+    )
     final.add_argument("--output-dir", default="checkpoints")
     final.set_defaults(function=command_fit_final)
 
@@ -2234,6 +2414,17 @@ def build_parser():
     pca_evaluate.add_argument("--run-seed", type=int)
     pca_evaluate.add_argument("--output", required=True)
     pca_evaluate.add_argument("--device", default="auto")
+    pca_evaluate.add_argument(
+        "--curve-path-decode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    pca_evaluate.add_argument(
+        "--curve-path-field-strength", type=nonnegative_float, default=4.0
+    )
+    pca_evaluate.add_argument(
+        "--curve-path-backtrack-weight", type=nonnegative_float, default=8.0
+    )
     pca_evaluate.set_defaults(function=command_evaluate_pca_prior)
 
     pca_summary = subparsers.add_parser("summarize-pca-prior")

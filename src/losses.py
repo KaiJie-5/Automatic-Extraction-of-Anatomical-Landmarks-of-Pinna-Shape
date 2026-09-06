@@ -6,6 +6,9 @@ import math
 from typing import Mapping, Optional, Sequence
 
 import torch
+import torch.nn.functional as F
+
+from .curve import CONTOUR_RANGES
 
 
 ANCHOR_INDICES = (0, 6, 22, 24, 25, 33, 42, 46, 50, 54, 55, 64, 74, 75, 84)
@@ -198,6 +201,119 @@ def surface_vote_offset_loss(
     return per_landmark.mean()
 
 
+def surface_curve_field_kl(
+    curve_logits: torch.Tensor,
+    geodesic_distances_mm: torch.Tensor,
+    sigma_mm: float,
+) -> torch.Tensor:
+    """KL supervision for four dense anatomical-contour surface fields."""
+
+    if curve_logits.ndim != 3 or curve_logits.shape[1] != len(CONTOUR_RANGES):
+        raise ValueError("curve logits must have shape (B, 4, N)")
+    if (
+        geodesic_distances_mm.ndim != 3
+        or geodesic_distances_mm.shape[1] != 85
+        or geodesic_distances_mm.shape[0] != curve_logits.shape[0]
+        or geodesic_distances_mm.shape[2] != curve_logits.shape[2]
+    ):
+        raise ValueError("curve fields require geodesic distances with shape (B, 85, N)")
+    sigma_mm = float(sigma_mm)
+    if not math.isfinite(sigma_mm) or sigma_mm <= 0.0:
+        raise ValueError("curve field sigma must be positive and finite")
+
+    distances = geodesic_distances_mm.float()
+    contour_distances = torch.stack(
+        [distances[:, start:end].amin(dim=1) for start, end in CONTOUR_RANGES],
+        dim=1,
+    )
+    if not torch.isfinite(contour_distances).any(dim=-1).all():
+        raise ValueError("every contour requires at least one finite surface candidate")
+    target_logits = -contour_distances.square() / (2.0 * sigma_mm * sigma_mm)
+    target_probabilities = torch.softmax(target_logits, dim=-1)
+    target_logs = torch.log_softmax(target_logits, dim=-1)
+    predicted_logs = torch.log_softmax(curve_logits.float(), dim=-1)
+    finite_target_logs = torch.where(
+        target_probabilities > 0.0,
+        target_logs,
+        torch.zeros_like(target_logs),
+    )
+    divergence = (
+        target_probabilities * (finite_target_logs - predicted_logs)
+    ).sum(dim=-1).mean()
+    return divergence.clamp_min(0.0)
+
+
+def surface_curve_arc_loss(
+    arc_coordinates: torch.Tensor,
+    geodesic_distances_mm: torch.Tensor,
+    landmark_fractions: torch.Tensor,
+    sigma_mm: float,
+    radius_mm: float,
+) -> torch.Tensor:
+    """Regress normalized position along each curve near its annotated trace.
+
+    A sample's target coordinate is the Gaussian-weighted interpolation of the
+    arc fractions of nearby ordered landmarks.  Only samples inside the
+    geodesic supervision radius contribute, preventing unrelated surface sheets
+    from corrupting the intrinsic coordinate.
+    """
+
+    if arc_coordinates.ndim != 3 or arc_coordinates.shape[1] != len(CONTOUR_RANGES):
+        raise ValueError("curve arc coordinates must have shape (B, 4, N)")
+    if (
+        geodesic_distances_mm.ndim != 3
+        or geodesic_distances_mm.shape[1] != 85
+        or geodesic_distances_mm.shape[0] != arc_coordinates.shape[0]
+        or geodesic_distances_mm.shape[2] != arc_coordinates.shape[2]
+    ):
+        raise ValueError("curve arc loss requires geodesic shape (B, 85, N)")
+    if landmark_fractions.shape != geodesic_distances_mm.shape[:2]:
+        raise ValueError("curve landmark fractions must have shape (B, 85)")
+    sigma_mm = float(sigma_mm)
+    radius_mm = float(radius_mm)
+    if not math.isfinite(sigma_mm) or sigma_mm <= 0.0:
+        raise ValueError("curve arc sigma must be positive and finite")
+    if not math.isfinite(radius_mm) or radius_mm <= 0.0:
+        raise ValueError("curve arc radius must be positive and finite")
+
+    distances = geodesic_distances_mm.float()
+    fractions = landmark_fractions.float()
+    weighted_error = arc_coordinates.new_zeros((), dtype=torch.float32)
+    total_weight = arc_coordinates.new_zeros((), dtype=torch.float32)
+    for contour, (start, end) in enumerate(CONTOUR_RANGES):
+        contour_distances = distances[:, start:end]
+        mask = torch.isfinite(contour_distances) & (
+            contour_distances <= radius_mm
+        )
+        weights = torch.where(
+            mask,
+            torch.exp(
+                -contour_distances.square() / (2.0 * sigma_mm * sigma_mm)
+            ),
+            torch.zeros_like(contour_distances),
+        )
+        denominator = weights.sum(dim=1)
+        valid = denominator > 0.0
+        if not valid.any():
+            raise ValueError("curve arc radius contains no candidate for a contour")
+        target = (
+            weights
+            * fractions[:, start:end, None]
+        ).sum(dim=1) / denominator.clamp_min(1e-12)
+        # Confidence saturates at one in overlap regions and tapers smoothly at
+        # the edge of the supervised tube around the annotated curve.
+        confidence = denominator.clamp(max=1.0) * valid
+        error = F.smooth_l1_loss(
+            arc_coordinates[:, contour].float(),
+            target,
+            reduction="none",
+            beta=0.05,
+        )
+        weighted_error = weighted_error + (error * confidence).sum()
+        total_weight = total_weight + confidence.sum()
+    return weighted_error / total_weight.clamp_min(1.0)
+
+
 def proposal_landmark_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -214,6 +330,13 @@ def proposal_landmark_loss(
     vote_offsets: Optional[torch.Tensor] = None,
     vote_weight: float = 0.0,
     vote_radius_mm: float = 6.0,
+    curve_logits: Optional[torch.Tensor] = None,
+    curve_arc_coordinates: Optional[torch.Tensor] = None,
+    curve_landmark_fractions: Optional[torch.Tensor] = None,
+    curve_weight: float = 0.0,
+    curve_arc_weight: float = 0.0,
+    curve_sigma_mm: float = 3.0,
+    curve_arc_radius_mm: float = 4.0,
 ) -> Mapping[str, torch.Tensor]:
     base = mean_distance_mm(prediction, target, scale_mm)
     anchor = anchor_distance_mm(prediction, target, scale_mm) if anchor_weight else base.new_zeros(())
@@ -265,6 +388,37 @@ def proposal_landmark_loss(
         )
     else:
         vote = base.new_zeros(())
+    if curve_weight:
+        if curve_logits is None or heatmap_geodesic_distances_mm is None:
+            raise ValueError(
+                "curve_weight requires curve logits and geodesic distances"
+            )
+        curve = surface_curve_field_kl(
+            curve_logits,
+            heatmap_geodesic_distances_mm,
+            curve_sigma_mm,
+        )
+    else:
+        curve = base.new_zeros(())
+    if curve_arc_weight:
+        if (
+            curve_arc_coordinates is None
+            or curve_landmark_fractions is None
+            or heatmap_geodesic_distances_mm is None
+        ):
+            raise ValueError(
+                "curve_arc_weight requires arc coordinates, landmark fractions, "
+                "and geodesic distances"
+            )
+        curve_arc = surface_curve_arc_loss(
+            curve_arc_coordinates,
+            heatmap_geodesic_distances_mm,
+            curve_landmark_fractions,
+            curve_sigma_mm,
+            curve_arc_radius_mm,
+        )
+    else:
+        curve_arc = base.new_zeros(())
     total = (
         base
         + anchor_weight * anchor
@@ -272,6 +426,8 @@ def proposal_landmark_loss(
         + surface_weight * surface
         + heatmap_weight * heatmap
         + vote_weight * vote
+        + curve_weight * curve
+        + curve_arc_weight * curve_arc
     )
     return {
         "total": total,
@@ -281,6 +437,8 @@ def proposal_landmark_loss(
         "surface": surface,
         "heatmap": heatmap,
         "vote": vote,
+        "curve": curve,
+        "curve_arc": curve_arc,
     }
 
 
