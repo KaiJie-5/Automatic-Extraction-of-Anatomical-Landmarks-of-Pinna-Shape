@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from ..canonical import decanonicalize_xyz
+from ..curve import contour_anchor_manifest, decode_connected_curve_paths
 from ..dataset import Dataset
 from ..meshnet import meshnet_inputs_with_mesh
 from ..pipeline_dataset import EAR_NAMES, prediction_key, prepare_ear_geometry
@@ -409,8 +410,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 n_components=selected_components,
             )
             if curve_path_config is not None:
-                from ..curve import decode_connected_curve_paths
-
                 context = curve_context_by_ear[ear]
                 raw_local, raw_path_diagnostics = decode_connected_curve_paths(
                     prepared.crop_mesh,
@@ -490,7 +489,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "run_seed": int(run_seed),
         "bilateral_mode": bilateral_mode,
         "curve_path_decoder": (
-            {"enabled": True, **curve_path_config}
+            {
+                "enabled": True,
+                "routing": "section_anchors",
+                "anchor_indices": contour_anchor_manifest(),
+                **curve_path_config,
+            }
             if curve_path_config is not None
             else {"enabled": False}
         ),

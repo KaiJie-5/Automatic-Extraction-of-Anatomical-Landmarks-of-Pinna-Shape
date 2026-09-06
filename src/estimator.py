@@ -23,7 +23,7 @@ from .shape_prior import (
     gate_bilateral_contours,
     normalise_contour_gate,
 )
-from .curve import decode_connected_curve_paths
+from .curve import contour_anchor_manifest, decode_connected_curve_paths
 from .surface import project_points_to_mesh
 from .preprocessing import (
     compute_mesh_normalization,
@@ -307,6 +307,14 @@ class LandmarkExtractor:
                 raise ValueError(
                     "v2 connected curve paths require a surface-curve model"
                 )
+            if curve_path.get("routing", "section_anchors") != "section_anchors":
+                raise ValueError("unsupported v2 connected curve routing mode")
+            saved_anchors = curve_path.get("anchor_indices")
+            if (
+                saved_anchors is not None
+                and saved_anchors != contour_anchor_manifest()
+            ):
+                raise ValueError("v2 connected curve anchor indices do not match")
             field_strength = float(curve_path.get("field_strength", 4.0))
             backtrack_weight = float(curve_path.get("backtrack_weight", 8.0))
             if (

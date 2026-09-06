@@ -4,7 +4,9 @@ import torch
 import trimesh
 
 from src.curve import (
+    CONTOUR_ANCHORS,
     CONTOUR_RANGES,
+    contour_anchor_manifest,
     decode_connected_curve_paths,
     landmark_arc_fractions,
     median_landmark_arc_fractions,
@@ -133,22 +135,21 @@ class _IdentityTransform:
 
 def test_connected_curve_decoder_returns_ordered_mesh_edge_paths():
     vertices = np.asarray(
-        [[x, y, 0.0] for x in range(6) for y in (0.0, 1.0)],
+        [[x, y, 0.0] for x in range(101) for y in (0.0, 1.0)],
         dtype=np.float64,
     )
     faces = []
-    for x in range(5):
+    for x in range(100):
         a, b = x * 2, x * 2 + 1
         c, d = (x + 1) * 2, (x + 1) * 2 + 1
         faces.extend([[a, c, b], [b, c, d]])
     mesh = trimesh.Trimesh(vertices=vertices, faces=np.asarray(faces), process=False)
     sample_xyz = vertices.copy()
     curve_logits = np.tile(np.where(vertices[:, 1] == 0.0, 8.0, -8.0), (4, 1))
-    curve_arc = np.tile((vertices[:, 0] / 5.0), (4, 1))
+    curve_arc = np.tile((vertices[:, 0] / 100.0), (4, 1))
     initial = np.zeros((85, 3), dtype=np.float32)
     for start, end in CONTOUR_RANGES:
-        initial[start, 0] = 0.0
-        initial[end - 1, 0] = 5.0
+        initial[start:end, 0] = _fractions()[start:end] * 100.0
     decoded, diagnostics = decode_connected_curve_paths(
         mesh,
         "left",
@@ -164,6 +165,18 @@ def test_connected_curve_decoder_returns_ordered_mesh_edge_paths():
         assert np.allclose(decoded[start:end, 1:], 0.0)
         assert np.all(np.diff(decoded[start:end, 0]) >= 0.0)
     assert all(not item["fallback"] for item in diagnostics.values())
+    assert contour_anchor_manifest() == {
+        "outer_helix": [0, 6, 22, 24],
+        "concha": [25, 33, 42, 46, 50, 54],
+        "inner_helix": [55, 64, 74],
+        "superior_antihelix": [75, 84],
+    }
+    for name, anchors in zip(contour_anchor_manifest(), CONTOUR_ANCHORS):
+        record = diagnostics[name]
+        assert record["anchor_indices"] == list(anchors)
+        assert record["section_count"] == len(anchors) - 1
+        assert record["successful_section_count"] == len(anchors) - 1
+        assert len(record["sections"]) == len(anchors) - 1
 
 
 def test_surface_curve_cli_requires_explicit_geodesic_losses_and_reconstructs():

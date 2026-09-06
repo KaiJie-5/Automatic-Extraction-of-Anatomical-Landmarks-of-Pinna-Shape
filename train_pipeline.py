@@ -940,6 +940,24 @@ def _bundle_v2(locator_checkpoint, landmark_checkpoint, broad, calibration, args
         raise ValueError(
             "--curve-path-decode requires a final surface-curve landmark model"
         )
+    curve_path_config = {
+        "enabled": curve_path_enabled,
+        "field_strength": float(
+            getattr(args, "curve_path_field_strength", 4.0)
+        ),
+        "backtrack_weight": float(
+            getattr(args, "curve_path_backtrack_weight", 8.0)
+        ),
+    }
+    if curve_path_enabled:
+        from src.curve import contour_anchor_manifest
+
+        curve_path_config.update(
+            {
+                "routing": "section_anchors",
+                "anchor_indices": contour_anchor_manifest(),
+            }
+        )
     return {
         "schema_version": 2,
         "pipeline": "proposal_coarse_to_fine",
@@ -962,15 +980,7 @@ def _bundle_v2(locator_checkpoint, landmark_checkpoint, broad, calibration, args
         "sampling": {"locator_points": args.num_points, "landmark_points": args.num_points, "seed": args.seed},
         "postprocess": {
             "project_to_surface": bool(args.project_to_surface),
-            "curve_path_decoder": {
-                "enabled": curve_path_enabled,
-                "field_strength": float(
-                    getattr(args, "curve_path_field_strength", 4.0)
-                ),
-                "backtrack_weight": float(
-                    getattr(args, "curve_path_backtrack_weight", 8.0)
-                ),
-            },
+            "curve_path_decoder": curve_path_config,
         },
         "training": {
             "subject_ids": subject_ids,

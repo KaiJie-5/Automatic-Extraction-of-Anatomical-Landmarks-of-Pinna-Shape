@@ -21,6 +21,21 @@ CONTOUR_NAMES = (
     "superior_antihelix",
 )
 CONTOUR_RANGES = ((0, 25), (25, 55), (55, 75), (75, 85))
+CONTOUR_ANCHORS = (
+    (0, 6, 22, 24),
+    (25, 33, 42, 46, 50, 54),
+    (55, 64, 74),
+    (75, 84),
+)
+
+
+def contour_anchor_manifest() -> dict[str, list[int]]:
+    """Return the fixed semantic waypoints used by connected path decoding."""
+
+    return {
+        name: [int(index) for index in anchors]
+        for name, anchors in zip(CONTOUR_NAMES, CONTOUR_ANCHORS)
+    }
 
 
 def landmark_arc_fractions(landmarks: np.ndarray) -> np.ndarray:
@@ -154,12 +169,14 @@ def decode_connected_curve_paths(
     field_strength: float = 4.0,
     backtrack_weight: float = 8.0,
 ) -> tuple[np.ndarray, dict]:
-    """Decode four oriented connected paths on the exact cropped mesh.
+    """Decode ordered, anchor-routed paths on the exact cropped mesh.
 
     The neural curve field supplies the data term.  Mesh edges enforce surface
     connectivity, and decreasing predicted arc coordinates receive an
-    asymmetric cost from each known start endpoint towards its end endpoint.
-    Outputs are interpolated on path edges at training-fold median fractions.
+    asymmetric cost. Each anatomical contour is split at its known semantic
+    section anchors so a closed or folded contour cannot take the geometrically
+    short route directly from its first landmark to its last. Outputs inside
+    each section are interpolated using section-local training-fold fractions.
     """
 
     from scipy.sparse import coo_matrix
@@ -212,20 +229,23 @@ def decode_connected_curve_paths(
     vertex_tree = cKDTree(vertex_local)
     output = initial.copy()
     diagnostics = {}
-    for contour, ((start, end), name) in enumerate(
-        zip(CONTOUR_RANGES, CONTOUR_NAMES)
+    for contour, ((start, end), anchors, name) in enumerate(
+        zip(CONTOUR_RANGES, CONTOUR_ANCHORS, CONTOUR_NAMES)
     ):
-        start_vertex = int(vertex_tree.query(initial[start], k=1)[1])
-        end_vertex = int(vertex_tree.query(initial[end - 1], k=1)[1])
+        if anchors[0] != start or anchors[-1] != end - 1:
+            raise RuntimeError("curve anchor definitions do not match contour ranges")
+        anchor_vertices = [
+            int(vertex_tree.query(initial[index], k=1)[1])
+            for index in anchors
+        ]
         record = {
-            "start_vertex": start_vertex,
-            "end_vertex": end_vertex,
+            "anchor_indices": [int(index) for index in anchors],
+            "anchor_vertices": anchor_vertices,
+            "section_count": int(len(anchors) - 1),
+            "successful_section_count": 0,
+            "sections": [],
             "fallback": False,
         }
-        if start_vertex == end_vertex:
-            record.update({"fallback": True, "reason": "identical_endpoints"})
-            diagnostics[name] = record
-            continue
 
         field = vertex_logits[contour]
         low, high = np.percentile(field, [5.0, 95.0])
@@ -255,51 +275,113 @@ def decode_connected_curve_paths(
         distance, predecessors = dijkstra(
             graph,
             directed=True,
-            indices=start_vertex,
+            indices=np.asarray(anchor_vertices[:-1], dtype=np.int64),
             return_predecessors=True,
         )
-        if not np.isfinite(distance[end_vertex]):
-            record.update({"fallback": True, "reason": "disconnected_endpoints"})
-            diagnostics[name] = record
-            continue
-        reversed_path = [end_vertex]
-        current = end_vertex
-        while current != start_vertex and len(reversed_path) <= len(vertex_local):
-            current = int(predecessors[current])
-            if current < 0:
-                break
-            reversed_path.append(current)
-        if not reversed_path or reversed_path[-1] != start_vertex:
-            record.update({"fallback": True, "reason": "invalid_predecessors"})
-            diagnostics[name] = record
-            continue
-        path_indices = np.asarray(reversed_path[::-1], dtype=np.int64)
-        path = vertex_local[path_indices]
-        segment_lengths = np.linalg.norm(np.diff(path, axis=0), axis=1)
-        cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
-        total = float(cumulative[-1])
-        if total <= 1e-8:
-            record.update({"fallback": True, "reason": "zero_length_path"})
-            diagnostics[name] = record
-            continue
-        targets = fractions[start:end] * total
-        segment = np.searchsorted(cumulative, targets, side="right") - 1
-        segment = np.clip(segment, 0, len(path) - 2)
-        denominator = np.maximum(
-            cumulative[segment + 1] - cumulative[segment], 1e-12
-        )
-        alpha = (targets - cumulative[segment]) / denominator
-        output[start:end] = (
-            path[segment] * (1.0 - alpha[:, None])
-            + path[segment + 1] * alpha[:, None]
-        )
+        distance = np.atleast_2d(np.asarray(distance, dtype=np.float64))
+        predecessors = np.atleast_2d(np.asarray(predecessors))
+        total_length = 0.0
+        total_cost = 0.0
+        total_vertices = 0
+        for section_index, (section_start, section_end) in enumerate(
+            zip(anchors[:-1], anchors[1:])
+        ):
+            start_vertex = anchor_vertices[section_index]
+            end_vertex = anchor_vertices[section_index + 1]
+            section_record = {
+                "start_index": int(section_start),
+                "end_index": int(section_end),
+                "start_vertex": int(start_vertex),
+                "end_vertex": int(end_vertex),
+                "fallback": False,
+            }
+            if start_vertex == end_vertex:
+                section_record.update(
+                    {"fallback": True, "reason": "identical_anchor_vertices"}
+                )
+                record["fallback"] = True
+                record["sections"].append(section_record)
+                continue
+            if not np.isfinite(distance[section_index, end_vertex]):
+                section_record.update(
+                    {"fallback": True, "reason": "disconnected_anchors"}
+                )
+                record["fallback"] = True
+                record["sections"].append(section_record)
+                continue
+
+            reversed_path = [end_vertex]
+            current = end_vertex
+            while (
+                current != start_vertex
+                and len(reversed_path) <= len(vertex_local)
+            ):
+                current = int(predecessors[section_index, current])
+                if current < 0:
+                    break
+                reversed_path.append(current)
+            if not reversed_path or reversed_path[-1] != start_vertex:
+                section_record.update(
+                    {"fallback": True, "reason": "invalid_predecessors"}
+                )
+                record["fallback"] = True
+                record["sections"].append(section_record)
+                continue
+
+            path_indices = np.asarray(reversed_path[::-1], dtype=np.int64)
+            path = vertex_local[path_indices]
+            segment_lengths = np.linalg.norm(np.diff(path, axis=0), axis=1)
+            cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+            section_length = float(cumulative[-1])
+            if section_length <= 1e-8:
+                section_record.update(
+                    {"fallback": True, "reason": "zero_length_path"}
+                )
+                record["fallback"] = True
+                record["sections"].append(section_record)
+                continue
+
+            fraction_start = float(fractions[section_start])
+            fraction_end = float(fractions[section_end])
+            fraction_span = fraction_end - fraction_start
+            if fraction_span <= 1e-8:
+                raise RuntimeError("curve section fractions are not increasing")
+            section_fractions = (
+                fractions[section_start : section_end + 1] - fraction_start
+            ) / fraction_span
+            targets = section_fractions * section_length
+            segment = np.searchsorted(cumulative, targets, side="right") - 1
+            segment = np.clip(segment, 0, len(path) - 2)
+            denominator = np.maximum(
+                cumulative[segment + 1] - cumulative[segment], 1e-12
+            )
+            alpha = (targets - cumulative[segment]) / denominator
+            output[section_start : section_end + 1] = (
+                path[segment] * (1.0 - alpha[:, None])
+                + path[segment + 1] * alpha[:, None]
+            )
+            weighted_cost = float(distance[section_index, end_vertex])
+            section_record.update(
+                {
+                    "vertex_count": int(len(path_indices)),
+                    "path_length_local": section_length,
+                    "weighted_path_cost": weighted_cost,
+                }
+            )
+            record["successful_section_count"] += 1
+            record["sections"].append(section_record)
+            total_length += section_length
+            total_cost += weighted_cost
+            total_vertices += int(len(path_indices))
         record.update(
             {
-                "vertex_count": int(len(path_indices)),
-                "path_length_local": total,
-                "weighted_path_cost": float(distance[end_vertex]),
+                "vertex_count": total_vertices,
+                "path_length_local": total_length,
+                "weighted_path_cost": total_cost,
             }
         )
+        if record["fallback"]:
+            record["reason"] = "one_or_more_sections_failed"
         diagnostics[name] = record
     if not np.isfinite(output).all():
         raise RuntimeError("connected curve decoder produced non-finite landmarks")

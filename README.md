@@ -419,8 +419,11 @@ sbatch submit_job_train_pointnet2.slurm evaluate-pca-prior \
 ```
 
 Then evaluate the same checkpoint with genuinely connected, oriented paths on
-the exact cropped triangle mesh. The data term comes from the learned contour
-field and backwards movement in learned arc position is penalized:
+the exact cropped triangle mesh. Paths are routed section-by-section through
+the semantic anchors `0→6→22→24`, `25→33→42→46→50→54`, `55→64→74`, and
+`75→84`; this prevents closed or folded contours from taking a short endpoint
+route. The data term comes from the learned contour field and backwards
+movement in learned arc position is penalized:
 
 ```bash
 sbatch submit_job_train_pointnet2.slurm evaluate-pca-prior \
