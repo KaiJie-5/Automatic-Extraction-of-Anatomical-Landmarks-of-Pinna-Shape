@@ -107,3 +107,29 @@ def build_training_shapes(
             transform = LocalEarTransform(center, local_scale)
             shapes.append(transform.normalize_xyz(canonicalize_xyz(landmarks, ear)))
     return np.asarray(shapes, dtype=np.float32)
+
+
+def build_training_shape_pairs(
+    dataset: Dataset,
+    subject_ids: Sequence[str],
+    center_predictions: Mapping[str, Sequence[float]],
+    calibration: Mapping[str, object],
+) -> np.ndarray:
+    """Return canonical ``(left, mirrored-right)`` pairs.
+
+    Pairing is performed by subject before any statistical fitting.  This is
+    intentionally separate from :func:`build_training_shapes`: reshaping an
+    arbitrary ear collection later could silently pair different subjects.
+    """
+    ear_shapes = build_training_shapes(
+        dataset,
+        subject_ids,
+        center_predictions,
+        calibration,
+    )
+    expected = (len(subject_ids) * len(EAR_NAMES), 85, 3)
+    if ear_shapes.shape != expected:
+        raise RuntimeError(
+            f"unexpected training-ear array {ear_shapes.shape}; expected {expected}"
+        )
+    return ear_shapes.reshape(len(subject_ids), len(EAR_NAMES), 85, 3)

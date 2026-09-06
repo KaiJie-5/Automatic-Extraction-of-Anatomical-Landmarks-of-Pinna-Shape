@@ -17,7 +17,7 @@ from .precision import checkpoint_autocast_context
 from .pointtransformerv3_model import validate_pointtransformerv3_checkpoint_config
 from .proposal_models import build_landmark_model, build_locator
 from .meshnet import MeshNetLandmarkRegressor, meshnet_inputs
-from .shape_prior import PCAShapePrior
+from .shape_prior import BilateralMeanAsymmetryPCAPrior, PCAShapePrior
 from .surface import project_points_to_mesh
 from .preprocessing import (
     compute_mesh_normalization,
@@ -46,6 +46,7 @@ class LandmarkExtractor:
             "cuda" if device == "auto" and torch.cuda.is_available() else "cpu" if device == "auto" else device
         )
         self.pca_shape_prior = None
+        self.bilateral_pca_shape_prior = None
 
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
@@ -142,6 +143,47 @@ class LandmarkExtractor:
             raise RuntimeError("PCA shape prior returned an invalid (85, 3) prediction")
         return refined
 
+    @staticmethod
+    def _load_bilateral_pca_shape_prior(postprocess):
+        config = postprocess.get("bilateral_mean_asymmetry_pca_prior")
+        if not isinstance(config, dict) or not bool(config.get("enabled", False)):
+            return None
+        if config.get("ear_order") != ["left", "mirrored_right"]:
+            raise ValueError(
+                "bilateral PCA ear_order must be ['left', 'mirrored_right']"
+            )
+        prior = config.get("prior")
+        if not isinstance(prior, dict):
+            raise ValueError(
+                "bilateral_mean_asymmetry_pca_prior.prior must be embedded "
+                "in the checkpoint"
+            )
+        return BilateralMeanAsymmetryPCAPrior(
+            common_mean=prior["common_mean"],
+            common_components=prior["common_components"],
+            common_n_components=int(prior["common_n_components"]),
+            asymmetry_mean=prior["asymmetry_mean"],
+            asymmetry_components=prior["asymmetry_components"],
+            asymmetry_n_components=int(prior["asymmetry_n_components"]),
+            common_beta=float(config["common_beta"]),
+            asymmetry_beta=float(config["asymmetry_beta"]),
+            landmark_count=int(prior.get("landmark_count", 85)),
+            coordinate_frame=str(prior.get("coordinate_frame", "")),
+            normalization=str(prior.get("normalization", "")),
+        )
+
+    def _apply_bilateral_pca_shape_prior(
+        self, local_predictions: np.ndarray
+    ) -> np.ndarray:
+        if self.bilateral_pca_shape_prior is None:
+            return local_predictions
+        refined = self.bilateral_pca_shape_prior.blend_pair(local_predictions)
+        if refined.shape != (2, 85, 3) or not np.isfinite(refined).all():
+            raise RuntimeError(
+                "bilateral PCA prior returned an invalid (2, 85, 3) prediction"
+            )
+        return refined
+
     def _load_v2(self, checkpoint: dict) -> None:
         required = {
             "locator",
@@ -212,6 +254,17 @@ class LandmarkExtractor:
         postprocess = checkpoint["postprocess"]
         self.project_to_surface = bool(postprocess.get("project_to_surface", False))
         self.pca_shape_prior = self._load_pca_shape_prior(postprocess)
+        self.bilateral_pca_shape_prior = self._load_bilateral_pca_shape_prior(
+            postprocess
+        )
+        if (
+            self.pca_shape_prior is not None
+            and self.bilateral_pca_shape_prior is not None
+        ):
+            raise ValueError(
+                "v2 bundle cannot enable independent and bilateral PCA priors "
+                "simultaneously"
+            )
 
     def _extract_v2_ear(self, mesh: Trimesh, ear: str, ear_offset: int) -> np.ndarray:
         broad_features, _, _ = sample_canonical_crop(
@@ -267,9 +320,7 @@ class LandmarkExtractor:
     def _extract_v2_bilateral(
         self, mesh: Trimesh
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Run paired landmark inference after the unchanged per-ear locator."""
-        if self.landmark_backbone == "meshnet":
-            raise RuntimeError("bilateral inference is unavailable for MeshNet")
+        """Run paired model inference and/or paired statistical post-processing."""
         prepared = []
         for ear_offset, ear in enumerate(("left", "right")):
             broad_features, _, _ = sample_canonical_crop(
@@ -321,32 +372,81 @@ class LandmarkExtractor:
                 )
             )
 
-        paired_input = np.stack(
-            [item[3].astype(np.float32) for item in prepared], axis=0
-        )
-        input_tensor = (
-            torch.from_numpy(paired_input).unsqueeze(0).to(self.device)
-        )
-        with torch.no_grad(), checkpoint_autocast_context(
-            self.device, self.landmark_model_config
-        ):
-            local_predictions = (
-                self.landmark_model(input_tensor)
-                .squeeze(0)
-                .float()
-                .cpu()
-                .numpy()
+        if self.bilateral_mode != "none":
+            if self.landmark_backbone == "meshnet":
+                raise RuntimeError(
+                    "bilateral neural inference is unavailable for MeshNet"
+                )
+            paired_input = np.stack(
+                [item[3].astype(np.float32) for item in prepared], axis=0
             )
+            input_tensor = (
+                torch.from_numpy(paired_input).unsqueeze(0).to(self.device)
+            )
+            with torch.no_grad(), checkpoint_autocast_context(
+                self.device, self.landmark_model_config
+            ):
+                local_predictions = (
+                    self.landmark_model(input_tensor)
+                    .squeeze(0)
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+        else:
+            # Preserve the established batch-one numerical path for an
+            # independent-ear model; only its post-processing is paired.
+            predictions = []
+            for ear, transform, crop_mesh, model_input in prepared:
+                with torch.no_grad(), checkpoint_autocast_context(
+                    self.device, self.landmark_model_config
+                ):
+                    if self.landmark_backbone == "meshnet":
+                        face_features, neighbors = meshnet_inputs(
+                            crop_mesh,
+                            self.meshnet_target_faces,
+                            ear,
+                            transform,
+                        )
+                        prediction = self.landmark_model(
+                            torch.from_numpy(face_features)
+                            .unsqueeze(0)
+                            .to(self.device),
+                            torch.from_numpy(neighbors)
+                            .unsqueeze(0)
+                            .to(self.device),
+                        )
+                    else:
+                        prediction = self.landmark_model(
+                            torch.from_numpy(model_input)
+                            .unsqueeze(0)
+                            .to(self.device)
+                        )
+                predictions.append(
+                    prediction.squeeze(0).float().cpu().numpy()
+                )
+            local_predictions = np.stack(predictions, axis=0)
         if local_predictions.shape != (2, 85, 3):
             raise RuntimeError(
                 "bilateral landmark model did not return shape (2, 85, 3)"
             )
 
+        if self.bilateral_pca_shape_prior is not None:
+            local_predictions = self._apply_bilateral_pca_shape_prior(
+                local_predictions
+            )
+        elif self.pca_shape_prior is not None:
+            local_predictions = np.stack(
+                [
+                    self._apply_pca_shape_prior(local_predictions[index])
+                    for index in range(2)
+                ],
+                axis=0,
+            )
+
         outputs = []
         for ear_index, (ear, transform, crop_mesh, _) in enumerate(prepared):
-            local_prediction = self._apply_pca_shape_prior(
-                local_predictions[ear_index]
-            )
+            local_prediction = local_predictions[ear_index]
             canonical_prediction = transform.denormalize_xyz(
                 local_prediction
             )
@@ -371,7 +471,10 @@ class LandmarkExtractor:
         This function will be called during the evaluation on the hidden test dataset.
         """
         if self.schema_version == 2:
-            if getattr(self, "bilateral_mode", "none") != "none":
+            if (
+                getattr(self, "bilateral_mode", "none") != "none"
+                or self.bilateral_pca_shape_prior is not None
+            ):
                 return self._extract_v2_bilateral(mesh)
             return self._extract_v2_ear(mesh, "left", 0), self._extract_v2_ear(mesh, "right", 1)
 

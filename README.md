@@ -204,6 +204,11 @@ baseline:
   PCA blend, then exact projection. The manifest binds the prior to the fold,
   calibration, centre predictions, and training subject IDs. Never reuse one
   fold's prior on another fold.
+- `generate-bilateral-pca-prior` and `evaluate-bilateral-pca-prior` provide an
+  opt-in paired-ear prior that models common morphology and signed asymmetry in
+  separate PCA spaces. Its manifest binds complete subject pairs to the outer
+  training fold, and its reference report compares directly with the promoted
+  independent-ear PCA pipeline.
 
 For PCA confirmation, place the 15 locked reports at
 `<report-root>/foldN_seedS.json` and run `summarize-pca-prior`. It promotes only

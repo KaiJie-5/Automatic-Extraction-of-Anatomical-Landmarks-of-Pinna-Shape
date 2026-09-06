@@ -1190,6 +1190,98 @@ def command_summarize_pca_prior(args):
     )
 
 
+def command_generate_bilateral_pca_prior(args):
+    """Fit paired common-morphology and signed-asymmetry PCA bases."""
+    from src.shape_prior.generate_bilateral_prior import main as generate_prior
+
+    generate_prior(
+        [
+            "--mesh-dir",
+            args.mesh_dir,
+            "--landmarks-dir",
+            args.landmarks_dir,
+            "--folds-json",
+            args.folds_json,
+            "--outer-fold",
+            str(args.outer_fold),
+            "--predictions-json",
+            args.predictions_json,
+            "--calibration-json",
+            args.calibration_json,
+            "--common-components",
+            str(args.common_components),
+            "--asymmetry-components",
+            str(args.asymmetry_components),
+            "--common-beta",
+            str(args.common_beta),
+            "--asymmetry-beta",
+            str(args.asymmetry_beta),
+            "--output",
+            args.output,
+            "--manifest",
+            args.manifest,
+        ]
+    )
+
+
+def command_evaluate_bilateral_pca_prior(args):
+    """Screen paired PCA settings or run one exact projected confirmation."""
+    from src.shape_prior.evaluate_bilateral_prior import main as evaluate_prior
+
+    values = [
+        "--checkpoint-path",
+        args.checkpoint_path,
+        "--prior-path",
+        args.prior_path,
+        "--prior-manifest",
+        args.prior_manifest,
+        "--reference-report",
+        args.reference_report,
+        "--mesh-dir",
+        args.mesh_dir,
+        "--landmarks-dir",
+        args.landmarks_dir,
+        "--folds-json",
+        args.folds_json,
+        "--predictions-json",
+        args.predictions_json,
+        "--calibration-json",
+        args.calibration_json,
+        "--common-components",
+        *(str(value) for value in args.common_components),
+        "--asymmetry-components",
+        *(str(value) for value in args.asymmetry_components),
+        "--common-betas",
+        *(str(value) for value in args.common_betas),
+        "--asymmetry-betas",
+        *(str(value) for value in args.asymmetry_betas),
+        "--output",
+        args.output,
+        "--device",
+        args.device,
+    ]
+    if args.skip_projection:
+        values.append("--skip-projection")
+    if args.run_seed is not None:
+        values.extend(["--run-seed", str(args.run_seed)])
+    evaluate_prior(values)
+
+
+def command_summarize_bilateral_pca_prior(args):
+    from src.shape_prior.summarize_bilateral_prior import main as summarize_prior
+
+    summarize_prior(
+        [
+            "--report-root",
+            args.report_root,
+            "--seeds",
+            *(str(seed) for seed in args.seeds),
+            "--output",
+            args.output,
+        ]
+    )
+
+
 def _installed_version(distribution: str) -> str | None:
     try:
         return importlib.metadata.version(distribution)
@@ -1902,6 +1994,85 @@ def build_parser():
     pca_summary.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
     pca_summary.add_argument("--output", required=True)
     pca_summary.set_defaults(function=command_summarize_pca_prior)
+
+    bilateral_pca_generate = subparsers.add_parser(
+        "generate-bilateral-pca-prior"
+    )
+    add_data_arguments(bilateral_pca_generate)
+    bilateral_pca_generate.add_argument("--folds-json", required=True)
+    bilateral_pca_generate.add_argument(
+        "--outer-fold", required=True, help="0-4 or final"
+    )
+    bilateral_pca_generate.add_argument("--predictions-json", required=True)
+    bilateral_pca_generate.add_argument("--calibration-json", required=True)
+    bilateral_pca_generate.add_argument(
+        "--common-components", type=positive_integer, default=64
+    )
+    bilateral_pca_generate.add_argument(
+        "--asymmetry-components", type=positive_integer, default=32
+    )
+    bilateral_pca_generate.add_argument(
+        "--common-beta", type=unit_float, default=1.0
+    )
+    bilateral_pca_generate.add_argument(
+        "--asymmetry-beta", type=unit_float, default=1.0
+    )
+    bilateral_pca_generate.add_argument("--output", required=True)
+    bilateral_pca_generate.add_argument("--manifest", required=True)
+    bilateral_pca_generate.set_defaults(
+        function=command_generate_bilateral_pca_prior
+    )
+
+    bilateral_pca_evaluate = subparsers.add_parser(
+        "evaluate-bilateral-pca-prior"
+    )
+    add_data_arguments(bilateral_pca_evaluate)
+    bilateral_pca_evaluate.add_argument("--checkpoint-path", required=True)
+    bilateral_pca_evaluate.add_argument("--prior-path", required=True)
+    bilateral_pca_evaluate.add_argument("--prior-manifest", required=True)
+    bilateral_pca_evaluate.add_argument("--reference-report", required=True)
+    bilateral_pca_evaluate.add_argument("--folds-json", required=True)
+    bilateral_pca_evaluate.add_argument("--predictions-json", required=True)
+    bilateral_pca_evaluate.add_argument("--calibration-json", required=True)
+    bilateral_pca_evaluate.add_argument(
+        "--common-components",
+        nargs="+",
+        type=positive_integer,
+        required=True,
+    )
+    bilateral_pca_evaluate.add_argument(
+        "--asymmetry-components",
+        nargs="+",
+        type=positive_integer,
+        required=True,
+    )
+    bilateral_pca_evaluate.add_argument(
+        "--common-betas", nargs="+", type=unit_float, required=True
+    )
+    bilateral_pca_evaluate.add_argument(
+        "--asymmetry-betas", nargs="+", type=unit_float, required=True
+    )
+    bilateral_pca_evaluate.add_argument(
+        "--skip-projection", action="store_true"
+    )
+    bilateral_pca_evaluate.add_argument("--run-seed", type=int)
+    bilateral_pca_evaluate.add_argument("--output", required=True)
+    bilateral_pca_evaluate.add_argument("--device", default="auto")
+    bilateral_pca_evaluate.set_defaults(
+        function=command_evaluate_bilateral_pca_prior
+    )
+
+    bilateral_pca_summary = subparsers.add_parser(
+        "summarize-bilateral-pca-prior"
+    )
+    bilateral_pca_summary.add_argument("--report-root", required=True)
+    bilateral_pca_summary.add_argument(
+        "--seeds", nargs="+", type=int, default=[42, 43, 44]
+    )
+    bilateral_pca_summary.add_argument("--output", required=True)
+    bilateral_pca_summary.set_defaults(
+        function=command_summarize_bilateral_pca_prior
+    )
 
     gate = subparsers.add_parser("meshnet-gate")
     add_data_arguments(gate)
