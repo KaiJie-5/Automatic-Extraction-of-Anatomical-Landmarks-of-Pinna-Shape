@@ -208,7 +208,9 @@ baseline:
   opt-in paired-ear prior that models common morphology and signed asymmetry in
   separate PCA spaces. Its manifest binds complete subject pairs to the outer
   training fold, and its reference report compares directly with the promoted
-  independent-ear PCA pipeline.
+  independent-ear PCA pipeline. `--contour-gate` can retain that independent
+  prior outside explicitly selected contours; it requires the exact
+  `--independent-prior-path` whose SHA-256 is recorded in the reference report.
 
 For PCA confirmation, place the 15 locked reports at
 `<report-root>/foldN_seedS.json` and run `summarize-pca-prior`. It promotes only

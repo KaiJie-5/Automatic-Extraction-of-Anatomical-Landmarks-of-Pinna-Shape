@@ -8,7 +8,11 @@ from typing import Sequence
 
 import torch
 
-from .bilateral_pca import BilateralMeanAsymmetryPCAPrior
+from .bilateral_pca import (
+    CONTOUR_RANGES,
+    BilateralMeanAsymmetryPCAPrior,
+    normalise_contour_gate,
+)
 from .embed_prior import _torch_load
 
 
@@ -44,6 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--common-beta", type=float, required=True)
     parser.add_argument("--asymmetry-beta", type=float, required=True)
     parser.add_argument(
+        "--contour-gate",
+        nargs="+",
+        choices=tuple(CONTOUR_RANGES),
+        help=(
+            "retain the existing independent PCA outside these contours and "
+            "use bilateral PCA inside them"
+        ),
+    )
+    parser.add_argument(
         "--replace-independent-pca",
         action="store_true",
         help="remove an enabled independent-ear PCA prior from the output copy",
@@ -65,6 +78,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("asymmetry component count exceeds the saved prior")
     common_beta = float(args.common_beta)
     asymmetry_beta = float(args.asymmetry_beta)
+    contour_gate = normalise_contour_gate(args.contour_gate)
     if not 0.0 <= common_beta <= 1.0 or not 0.0 <= asymmetry_beta <= 1.0:
         raise ValueError("bilateral PCA blend strengths must be in [0, 1]")
 
@@ -72,17 +86,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     postprocess = dict(output_checkpoint.get("postprocess", {}))
     independent = postprocess.get("pca_shape_prior")
     if isinstance(independent, dict) and bool(independent.get("enabled", False)):
-        if not args.replace_independent_pca:
+        if contour_gate and args.replace_independent_pca:
+            raise ValueError(
+                "--contour-gate cannot be combined with "
+                "--replace-independent-pca"
+            )
+        if not contour_gate and not args.replace_independent_pca:
             raise ValueError(
                 "checkpoint already enables independent PCA; pass "
-                "--replace-independent-pca to replace it in the output copy"
+                "--replace-independent-pca to replace it, or pass "
+                "--contour-gate to retain it outside selected contours"
             )
-        postprocess.pop("pca_shape_prior", None)
+        if args.replace_independent_pca:
+            postprocess.pop("pca_shape_prior", None)
+    elif contour_gate:
+        raise ValueError(
+            "--contour-gate requires an enabled independent PCA prior in "
+            "the input checkpoint"
+        )
     postprocess["bilateral_mean_asymmetry_pca_prior"] = {
         "enabled": True,
         "common_beta": common_beta,
         "asymmetry_beta": asymmetry_beta,
         "ear_order": ["left", "mirrored_right"],
+        "contour_gate": list(contour_gate),
         "prior": _prior_dict(
             prior, common_components, asymmetry_components
         ),
@@ -98,6 +125,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"Setting: common={common_components}, beta={common_beta:g}; "
         f"asymmetry={asymmetry_components}, beta={asymmetry_beta:g}"
     )
+    if contour_gate:
+        print("Bilateral contour gate: " + ", ".join(contour_gate))
 
 
 if __name__ == "__main__":

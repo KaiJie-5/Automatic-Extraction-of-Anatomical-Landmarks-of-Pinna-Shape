@@ -13,6 +13,54 @@ from .pca import COORDINATE_FRAME, LANDMARK_COUNT, _normalise_shape
 BILATERAL_NORMALIZATION = "per_ear_centroid_rms_then_mean_asymmetry"
 PAIR_SHAPE = (2, LANDMARK_COUNT, 3)
 FLAT_DIMENSION = LANDMARK_COUNT * 3
+CONTOUR_RANGES = {
+    "outer_helix": (0, 25),
+    "concha": (25, 55),
+    "inner_helix": (55, 75),
+    "superior_antihelix": (75, 85),
+}
+
+
+def normalise_contour_gate(contours) -> tuple[str, ...]:
+    """Validate and canonicalise an optional bilateral-PCA contour gate."""
+    if contours is None:
+        return ()
+    values = tuple(str(value) for value in contours)
+    unknown = sorted(set(values) - set(CONTOUR_RANGES))
+    if unknown:
+        raise ValueError(
+            "unknown bilateral PCA contour gate: " + ", ".join(unknown)
+        )
+    if len(values) != len(set(values)):
+        raise ValueError("bilateral PCA contour gate contains duplicates")
+    selected = set(values)
+    return tuple(name for name in CONTOUR_RANGES if name in selected)
+
+
+def gate_bilateral_contours(
+    independent_predictions: np.ndarray,
+    bilateral_predictions: np.ndarray,
+    contours,
+) -> np.ndarray:
+    """Use bilateral predictions only on selected anatomical contours."""
+    independent = np.asarray(independent_predictions, dtype=np.float32)
+    bilateral = np.asarray(bilateral_predictions, dtype=np.float32)
+    if (
+        independent.shape != PAIR_SHAPE
+        or bilateral.shape != PAIR_SHAPE
+        or not np.isfinite(independent).all()
+        or not np.isfinite(bilateral).all()
+    ):
+        raise ValueError(
+            "contour gating needs two finite prediction pairs with shape "
+            "(2, 85, 3)"
+        )
+    names = normalise_contour_gate(contours)
+    output = independent.copy()
+    for name in names:
+        start, end = CONTOUR_RANGES[name]
+        output[:, start:end] = bilateral[:, start:end]
+    return output
 
 
 def _fit_basis(matrix: np.ndarray, requested: int) -> tuple[np.ndarray, np.ndarray]:

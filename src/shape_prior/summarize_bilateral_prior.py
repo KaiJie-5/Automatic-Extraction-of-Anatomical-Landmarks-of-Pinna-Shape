@@ -79,6 +79,17 @@ def summarize(report_root: str | Path, seeds: Sequence[int]) -> dict:
                     int(setting["asymmetry_components"]),
                     float(setting["common_beta"]),
                     float(setting["asymmetry_beta"]),
+                    tuple(str(value) for value in report.get("contour_gate", [])),
+                    (
+                        int(report["independent_components"])
+                        if report.get("contour_gate")
+                        else None
+                    ),
+                    (
+                        float(report["independent_beta"])
+                        if report.get("contour_gate")
+                        else None
+                    ),
                 )
             )
             reference, candidate = _ear_values(report)
@@ -101,11 +112,18 @@ def summarize(report_root: str | Path, seeds: Sequence[int]) -> dict:
             reports.append(str(path))
     if len(configurations) != 1:
         raise ValueError(
-            "all bilateral PCA reports must use one locked four-value setting"
+            "all bilateral PCA reports must use one locked PCA setting and "
+            "contour gate"
         )
-    common_components, asymmetry_components, common_beta, asymmetry_beta = next(
-        iter(configurations)
-    )
+    (
+        common_components,
+        asymmetry_components,
+        common_beta,
+        asymmetry_beta,
+        contour_gate,
+        independent_components,
+        independent_beta,
+    ) = next(iter(configurations))
     reference_pooled = np.concatenate(all_reference)
     candidate_pooled = np.concatenate(all_candidate)
     per_fold = {}
@@ -129,6 +147,14 @@ def summarize(report_root: str | Path, seeds: Sequence[int]) -> dict:
         "asymmetry_components": asymmetry_components,
         "common_beta": common_beta,
         "asymmetry_beta": asymmetry_beta,
+        "contour_gate": list(contour_gate),
+        "postprocess_mode": (
+            "contour_gated_bilateral_over_independent_pca"
+            if contour_gate
+            else "full_bilateral_pca"
+        ),
+        "independent_components": independent_components,
+        "independent_beta": independent_beta,
         "folds": list(FOLDS),
         "seeds": [int(seed) for seed in seeds],
         "report_count": len(reports),

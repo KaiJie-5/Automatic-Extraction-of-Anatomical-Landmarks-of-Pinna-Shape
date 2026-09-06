@@ -1260,6 +1260,12 @@ def command_evaluate_bilateral_pca_prior(args):
         "--device",
         args.device,
     ]
+    if args.independent_prior_path is not None:
+        values.extend(
+            ["--independent-prior-path", args.independent_prior_path]
+        )
+    if args.contour_gate:
+        values.extend(["--contour-gate", *args.contour_gate])
     if args.skip_projection:
         values.append("--skip-projection")
     if args.run_seed is not None:
@@ -2031,6 +2037,7 @@ def build_parser():
     bilateral_pca_evaluate.add_argument("--prior-path", required=True)
     bilateral_pca_evaluate.add_argument("--prior-manifest", required=True)
     bilateral_pca_evaluate.add_argument("--reference-report", required=True)
+    bilateral_pca_evaluate.add_argument("--independent-prior-path")
     bilateral_pca_evaluate.add_argument("--folds-json", required=True)
     bilateral_pca_evaluate.add_argument("--predictions-json", required=True)
     bilateral_pca_evaluate.add_argument("--calibration-json", required=True)
@@ -2051,6 +2058,16 @@ def build_parser():
     )
     bilateral_pca_evaluate.add_argument(
         "--asymmetry-betas", nargs="+", type=unit_float, required=True
+    )
+    bilateral_pca_evaluate.add_argument(
+        "--contour-gate",
+        nargs="+",
+        choices=(
+            "outer_helix",
+            "concha",
+            "inner_helix",
+            "superior_antihelix",
+        ),
     )
     bilateral_pca_evaluate.add_argument(
         "--skip-projection", action="store_true"

@@ -143,6 +143,36 @@ After inspecting the screen, rerun only its leading settings without
 confirmation. Each confirmation report must contain exactly one setting, then
 run:
 
+To evaluate a contour-gated salvage setting, add the exact independent prior
+recorded by the reference report and name every contour that should use the
+bilateral result. All unlisted contours reproduce the independent-PCA path:
+
+```bash
+python train_pipeline.py evaluate-bilateral-pca-prior \
+  --checkpoint-path runs/pointnext_surface_heatmap_d256/fold0_seed42/best_landmarks.pt \
+  --prior-path artifacts/bilateral_pca/fold0/prior.npz \
+  --prior-manifest artifacts/bilateral_pca/fold0/manifest.json \
+  --reference-report runs/pca_projection/heatmap_d256/fold0_seed42.json \
+  --independent-prior-path artifacts/pca_projection/fold0/prior.npz \
+  --mesh-dir data/mesh \
+  --landmarks-dir data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --common-components 64 \
+  --asymmetry-components 32 \
+  --common-betas 0.625 \
+  --asymmetry-betas 0.5 \
+  --contour-gate concha superior_antihelix \
+  --run-seed 42 \
+  --output runs/bilateral_pca/contour_gate/fold0_seed42.json \
+  --device auto
+```
+
+The evaluator verifies the independent-prior hash and reproduces its reported
+raw and projected MD before evaluating the gate. Projection is applied only
+after the two prior outputs have been combined.
+
 ```bash
 python train_pipeline.py summarize-bilateral-pca-prior \
   --report-root runs/bilateral_pca/confirmation \
@@ -171,3 +201,9 @@ python -m src.shape_prior.embed_bilateral_prior \
 
 The numerical setting above is illustrative; use only the setting locked by
 the confirmation experiment.
+
+For a promoted contour gate, start from the final checkpoint that already
+contains the independent PCA prior, omit `--replace-independent-pca`, and add
+`--contour-gate concha superior_antihelix`. The v2 estimator then runs paired
+post-processing, retains independent PCA on all unlisted indices, and performs
+surface projection after gating.

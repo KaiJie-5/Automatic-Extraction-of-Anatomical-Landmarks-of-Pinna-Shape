@@ -17,7 +17,12 @@ from .precision import checkpoint_autocast_context
 from .pointtransformerv3_model import validate_pointtransformerv3_checkpoint_config
 from .proposal_models import build_landmark_model, build_locator
 from .meshnet import MeshNetLandmarkRegressor, meshnet_inputs
-from .shape_prior import BilateralMeanAsymmetryPCAPrior, PCAShapePrior
+from .shape_prior import (
+    BilateralMeanAsymmetryPCAPrior,
+    PCAShapePrior,
+    gate_bilateral_contours,
+    normalise_contour_gate,
+)
 from .surface import project_points_to_mesh
 from .preprocessing import (
     compute_mesh_normalization,
@@ -47,6 +52,7 @@ class LandmarkExtractor:
         )
         self.pca_shape_prior = None
         self.bilateral_pca_shape_prior = None
+        self.bilateral_pca_contour_gate = ()
 
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
@@ -172,6 +178,13 @@ class LandmarkExtractor:
             normalization=str(prior.get("normalization", "")),
         )
 
+    @staticmethod
+    def _load_bilateral_pca_contour_gate(postprocess):
+        config = postprocess.get("bilateral_mean_asymmetry_pca_prior")
+        if not isinstance(config, dict) or not bool(config.get("enabled", False)):
+            return ()
+        return normalise_contour_gate(config.get("contour_gate"))
+
     def _apply_bilateral_pca_shape_prior(
         self, local_predictions: np.ndarray
     ) -> np.ndarray:
@@ -183,6 +196,39 @@ class LandmarkExtractor:
                 "bilateral PCA prior returned an invalid (2, 85, 3) prediction"
             )
         return refined
+
+    def _apply_pca_postprocess_pair(
+        self, local_predictions: np.ndarray
+    ) -> np.ndarray:
+        values = np.asarray(local_predictions, dtype=np.float32)
+        if values.shape != (2, 85, 3) or not np.isfinite(values).all():
+            raise RuntimeError(
+                "paired PCA post-processing needs a finite (2, 85, 3) input"
+            )
+        if self.bilateral_pca_shape_prior is not None:
+            bilateral = self._apply_bilateral_pca_shape_prior(values)
+            if self.bilateral_pca_contour_gate:
+                if self.pca_shape_prior is None:
+                    raise RuntimeError(
+                        "bilateral PCA contour gating requires an independent "
+                        "PCA prior"
+                    )
+                independent = np.stack(
+                    [self._apply_pca_shape_prior(values[index]) for index in range(2)],
+                    axis=0,
+                )
+                return gate_bilateral_contours(
+                    independent,
+                    bilateral,
+                    self.bilateral_pca_contour_gate,
+                )
+            return bilateral
+        if self.pca_shape_prior is not None:
+            return np.stack(
+                [self._apply_pca_shape_prior(values[index]) for index in range(2)],
+                axis=0,
+            )
+        return values
 
     def _load_v2(self, checkpoint: dict) -> None:
         required = {
@@ -257,13 +303,22 @@ class LandmarkExtractor:
         self.bilateral_pca_shape_prior = self._load_bilateral_pca_shape_prior(
             postprocess
         )
+        self.bilateral_pca_contour_gate = (
+            self._load_bilateral_pca_contour_gate(postprocess)
+        )
         if (
             self.pca_shape_prior is not None
             and self.bilateral_pca_shape_prior is not None
+            and not self.bilateral_pca_contour_gate
         ):
             raise ValueError(
                 "v2 bundle cannot enable independent and bilateral PCA priors "
-                "simultaneously"
+                "simultaneously unless an explicit bilateral contour gate is set"
+            )
+        if self.bilateral_pca_contour_gate and self.pca_shape_prior is None:
+            raise ValueError(
+                "bilateral PCA contour gating requires an enabled independent "
+                "PCA prior"
             )
 
     def _extract_v2_ear(self, mesh: Trimesh, ear: str, ear_offset: int) -> np.ndarray:
@@ -431,18 +486,7 @@ class LandmarkExtractor:
                 "bilateral landmark model did not return shape (2, 85, 3)"
             )
 
-        if self.bilateral_pca_shape_prior is not None:
-            local_predictions = self._apply_bilateral_pca_shape_prior(
-                local_predictions
-            )
-        elif self.pca_shape_prior is not None:
-            local_predictions = np.stack(
-                [
-                    self._apply_pca_shape_prior(local_predictions[index])
-                    for index in range(2)
-                ],
-                axis=0,
-            )
+        local_predictions = self._apply_pca_postprocess_pair(local_predictions)
 
         outputs = []
         for ear_index, (ear, transform, crop_mesh, _) in enumerate(prepared):

@@ -11,7 +11,12 @@ import numpy as np
 from ..dataset import Dataset
 from ..pipeline_dataset import EAR_NAMES, prediction_key, prepare_ear_geometry
 from ..surface import project_points_to_mesh
-from .bilateral_pca import BilateralMeanAsymmetryPCAPrior
+from .bilateral_pca import (
+    CONTOUR_RANGES,
+    BilateralMeanAsymmetryPCAPrior,
+    gate_bilateral_contours,
+    normalise_contour_gate,
+)
 from .evaluate_prior import (
     _device,
     _distribution,
@@ -25,21 +30,53 @@ from .evaluate_prior import (
 )
 from .fitting import file_sha256, load_center_predictions, read_json
 from .generate_prior import positive_int, unit_float
+from .pca import PCAShapePrior
 
 
 def _unique(values: Sequence[int | float]) -> list[int | float]:
     return list(dict.fromkeys(values))
 
 
-def _setting_id(setting: Mapping[str, int | float]) -> str:
+def _setting_id(
+    setting: Mapping[str, int | float], contour_gate: Sequence[str] = ()
+) -> str:
     def number(value: float) -> str:
         return f"{float(value):g}".replace(".", "p")
 
-    return (
+    identifier = (
         f"common_c{setting['common_components']}_b{number(setting['common_beta'])}_"
         f"asym_c{setting['asymmetry_components']}_b"
         f"{number(setting['asymmetry_beta'])}"
     )
+    if contour_gate:
+        identifier += "_gate_" + "+".join(contour_gate)
+    return identifier
+
+
+def _load_independent_reference_prior(args, reference) -> PCAShapePrior | None:
+    if not args.contour_gate:
+        if args.independent_prior_path is not None:
+            raise ValueError(
+                "--independent-prior-path is only valid with --contour-gate"
+            )
+        return None
+    if args.independent_prior_path is None:
+        raise ValueError(
+            "--contour-gate requires --independent-prior-path so the unchanged "
+            "contours exactly reproduce the reference pipeline"
+        )
+    if reference.get("prior_sha256") != file_sha256(args.independent_prior_path):
+        raise ValueError(
+            "independent prior hash does not match the reference report"
+        )
+    prior = PCAShapePrior.load(args.independent_prior_path)
+    components = int(reference.get("components", -1))
+    beta = float(reference.get("beta", float("nan")))
+    if components <= 0 or components > len(prior.components):
+        raise ValueError("reference report has an invalid independent PCA component count")
+    if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
+        raise ValueError("reference report has an invalid independent PCA beta")
+    return prior
 
 
 def _validate_prior_manifest(
@@ -195,6 +232,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-path", required=True)
     parser.add_argument("--prior-manifest", required=True)
     parser.add_argument("--reference-report", required=True)
+    parser.add_argument(
+        "--independent-prior-path",
+        help=(
+            "independent-ear PCA artifact recorded by the reference report; "
+            "required only for contour-gated evaluation"
+        ),
+    )
     parser.add_argument("--mesh-dir", required=True)
     parser.add_argument("--landmarks-dir", required=True)
     parser.add_argument("--folds-json", required=True)
@@ -209,6 +253,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--common-betas", nargs="+", type=unit_float, required=True)
     parser.add_argument(
         "--asymmetry-betas", nargs="+", type=unit_float, required=True
+    )
+    parser.add_argument(
+        "--contour-gate",
+        nargs="+",
+        choices=tuple(CONTOUR_RANGES),
+        help=(
+            "use bilateral PCA only for these contours and retain the exact "
+            "independent-PCA reference prediction elsewhere"
+        ),
     )
     parser.add_argument(
         "--skip-projection",
@@ -229,6 +282,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
     args.common_betas = [float(v) for v in _unique(args.common_betas)]
     args.asymmetry_betas = [float(v) for v in _unique(args.asymmetry_betas)]
+    args.contour_gate = normalise_contour_gate(args.contour_gate)
     settings = [
         {
             "common_components": common_components,
@@ -274,11 +328,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         run_seed,
         validation_ids,
     )
+    independent_prior = _load_independent_reference_prior(args, reference)
 
     candidates = [
         {
             "setting": setting,
-            "setting_id": _setting_id(setting),
+            "setting_id": _setting_id(setting, args.contour_gate),
             "pca_errors": [],
             "projected_errors": [],
             "subjects": {},
@@ -323,10 +378,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 for ear in EAR_NAMES
             }
         raw_pair = np.stack([raw_by_ear[ear] for ear in EAR_NAMES], axis=0)
-        candidate_pairs = [
+        bilateral_pairs = [
             prior.blend_pair(raw_pair, **candidate["setting"])
             for candidate in candidates
         ]
+        independent_pair = None
+        if independent_prior is not None:
+            independent_pair = independent_prior.blend(
+                raw_pair,
+                beta=float(reference["beta"]),
+                n_components=int(reference["components"]),
+            )
+            candidate_pairs = [
+                gate_bilateral_contours(
+                    independent_pair, bilateral_pair, args.contour_gate
+                )
+                for bilateral_pair in bilateral_pairs
+            ]
+        else:
+            candidate_pairs = bilateral_pairs
 
         for ear_index, ear in enumerate(EAR_NAMES):
             prepared = prepared_by_ear[ear]
@@ -346,6 +416,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raise ValueError(
                     f"reproduced raw MD does not match reference for {subject_id}:{ear}"
                 )
+            independent_world = None
+            if independent_pair is not None:
+                independent_world = _world_from_local(
+                    prepared, ear, independent_pair[ear_index]
+                )
+                independent_error = np.linalg.norm(
+                    independent_world - ground_truth, axis=1
+                ).astype(np.float32)
+                if not np.isclose(
+                    float(independent_error.mean()),
+                    float(reference_row["pca_md_mm"]),
+                    atol=1e-4,
+                    rtol=0.0,
+                ):
+                    raise ValueError(
+                        "reproduced independent PCA MD does not match reference "
+                        f"for {subject_id}:{ear}"
+                    )
             raw_projected_error = None
             if not args.skip_projection:
                 raw_projected = project_points_to_mesh(
@@ -365,6 +453,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "reproduced projected MD does not match reference for "
                         f"{subject_id}:{ear}"
                     )
+                if independent_world is not None:
+                    independent_projected = project_points_to_mesh(
+                        independent_world, prepared.crop_mesh
+                    )
+                    independent_projected_error = np.linalg.norm(
+                        independent_projected - ground_truth, axis=1
+                    ).astype(np.float32)
+                    if not np.isclose(
+                        float(independent_projected_error.mean()),
+                        float(reference_row["pca_projected_md_mm"]),
+                        atol=1e-4,
+                        rtol=0.0,
+                    ):
+                        raise ValueError(
+                            "reproduced independent PCA projected MD does not "
+                            f"match reference for {subject_id}:{ear}"
+                        )
 
             for candidate_index, candidate in enumerate(candidates):
                 local = candidate_pairs[candidate_index][ear_index]
@@ -430,6 +535,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "prior_manifest_path": str(args.prior_manifest),
         "reference_report": str(args.reference_report),
         "reference_report_sha256": file_sha256(args.reference_report),
+        "contour_gate": list(args.contour_gate),
+        "postprocess_mode": (
+            "contour_gated_bilateral_over_independent_pca"
+            if args.contour_gate
+            else "full_bilateral_pca"
+        ),
         "subject_count": len(validation_ids),
         "ear_count": len(raw_errors),
         "candidate_count": len(candidates),
@@ -447,6 +558,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         "subject_level_raw_and_pca_errors": selected_candidate["subjects"],
         **selected,
     }
+    if independent_prior is not None:
+        report.update(
+            independent_prior_path=str(args.independent_prior_path),
+            independent_prior_sha256=file_sha256(args.independent_prior_path),
+            independent_components=int(reference["components"]),
+            independent_beta=float(reference["beta"]),
+        )
     if projected:
         projected_stack = np.stack(raw_projected_errors)
         projected_ear = projected_stack.mean(axis=1)
