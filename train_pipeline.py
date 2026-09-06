@@ -213,6 +213,21 @@ def landmark_model_config(args, local_scale: float) -> dict:
             "heatmap_coordinate_temperature": float(
                 args.heatmap_coordinate_temperature
             ),
+            "surface_voting": bool(getattr(args, "surface_voting", False)),
+            "vote_cap_normalized": (
+                float(getattr(args, "vote_cap_mm", 6.0)) / local_scale
+                if bool(getattr(args, "surface_voting", False))
+                else 0.0
+            ),
+            "vote_fusion_iterations": int(
+                getattr(args, "vote_fusion_iterations", 3)
+            ),
+            "vote_fusion_epsilon_normalized": (
+                float(getattr(args, "vote_fusion_epsilon_mm", 0.25))
+                / local_scale
+                if bool(getattr(args, "surface_voting", False))
+                else 0.0
+            ),
             "refinement_k": int(args.refinement_k),
             "refinement_cap_normalized": 5.0 / local_scale if args.refinement_k else 0.0,
             "refinement_anchor": str(getattr(args, "refinement_anchor", "raw")),
@@ -264,12 +279,42 @@ def landmark_loss_config(args) -> dict:
         raise ValueError(
             "--heatmap-weight is only valid with --landmark-decoder surface-heatmap"
         )
+    heatmap_distance = str(getattr(args, "heatmap_distance", "euclidean"))
+    geodesic_cache_dir = getattr(args, "geodesic_cache_dir", None)
+    surface_voting = bool(getattr(args, "surface_voting", False))
+    vote_weight = float(getattr(args, "vote_weight", 0.0))
+    vote_radius_mm = float(getattr(args, "vote_radius_mm", 6.0))
+    vote_cap_mm = float(getattr(args, "vote_cap_mm", 6.0))
+    if decoder != "surface-heatmap" and heatmap_distance != "euclidean":
+        raise ValueError(
+            "--heatmap-distance geodesic requires the surface-heatmap decoder"
+        )
+    if heatmap_distance == "geodesic" and not geodesic_cache_dir:
+        raise ValueError(
+            "--heatmap-distance geodesic requires --geodesic-cache-dir"
+        )
+    if heatmap_distance != "geodesic" and geodesic_cache_dir:
+        raise ValueError(
+            "--geodesic-cache-dir is only valid with --heatmap-distance geodesic"
+        )
+    if surface_voting and (heatmap_distance != "geodesic" or vote_weight <= 0.0):
+        raise ValueError(
+            "--surface-voting requires geodesic heatmaps and positive --vote-weight"
+        )
+    if not surface_voting and vote_weight != 0.0:
+        raise ValueError("--vote-weight requires --surface-voting")
+    if surface_voting and vote_cap_mm < vote_radius_mm:
+        raise ValueError("--vote-cap-mm must be at least --vote-radius-mm")
     return {
         "anchor": float(args.anchor_weight),
         "spacing": float(args.spacing_weight),
         "surface": float(args.surface_weight),
         "heatmap": heatmap_weight,
         "heatmap_sigma_mm": float(getattr(args, "heatmap_sigma_mm", 2.0)),
+        "heatmap_distance": heatmap_distance,
+        "vote": vote_weight,
+        "vote_radius_mm": vote_radius_mm,
+        "vote_cap_mm": vote_cap_mm,
     }
 
 
@@ -290,6 +335,11 @@ def make_landmark_dataset(args, predictions, calibration, subject_ids, seed, tra
         seed=seed,
         dynamic_sampling=training,
         augment=args.augment if training else False,
+        geodesic_cache_dir=(
+            getattr(args, "geodesic_cache_dir", None)
+            if str(getattr(args, "heatmap_distance", "euclidean")) == "geodesic"
+            else None
+        ),
     )
     if args.backbone == "meshnet":
         gate = read_json(args.meshnet_gate_json)
@@ -676,6 +726,37 @@ def _load_prediction_map(path: str):
     return data.get("center_predictions", data)
 
 
+def command_prepare_geodesic_targets(args):
+    """Precompute fold-bound mesh-geodesic fields outside the training loop."""
+    from src.geodesic import prepare_geodesic_cache
+
+    folds = read_json(args.folds_json)
+    dataset = Dataset(args.mesh_dir, args.landmarks_dir)
+    validate_fold_dataset(dataset, folds)
+    if str(args.outer_fold) == "final":
+        subject_ids = [
+            dataset.get_identifier(index) for index in range(len(dataset))
+        ]
+    else:
+        outer = select_outer_fold(folds, int(args.outer_fold))
+        subject_ids = list(outer["train"]) + list(outer["validation"])
+    manifest = prepare_geodesic_cache(
+        dataset,
+        subject_ids,
+        _load_prediction_map(args.predictions_json),
+        read_json(args.calibration_json),
+        args.output_dir,
+        args.folds_json,
+        args.predictions_json,
+        args.calibration_json,
+        args.outer_fold,
+    )
+    print(
+        f"Prepared {manifest['ear_count']} geodesic ear caches at "
+        f"{args.output_dir}"
+    )
+
+
 def command_fit_landmarks(args):
     seed_everything(args.seed)
     device = resolve_device(args.device)
@@ -684,6 +765,18 @@ def command_fit_landmarks(args):
     calibration = read_json(args.calibration_json)
     predictions = _load_prediction_map(args.predictions_json)
     validate_fold_dataset(Dataset(args.mesh_dir, args.landmarks_dir), folds)
+    geodesic_manifest = None
+    if str(getattr(args, "heatmap_distance", "euclidean")) == "geodesic":
+        from src.geodesic import validate_geodesic_manifest
+
+        geodesic_manifest = validate_geodesic_manifest(
+            args.geodesic_cache_dir,
+            args.outer_fold,
+            list(outer["train"]) + list(outer["validation"]),
+            args.folds_json,
+            args.predictions_json,
+            args.calibration_json,
+        )
     dense_points = 32768 if args.surface_weight else 0
     train_data = make_landmark_dataset(
         args, predictions, calibration, outer["train"], args.seed, True
@@ -712,6 +805,14 @@ def command_fit_landmarks(args):
         "loss_weights": loss_weights,
         "amp_dtype": model_config.get("amp_dtype", "auto"),
     }
+    if geodesic_manifest is not None:
+        data_config["geodesic_cache"] = {
+            "path": str(args.geodesic_cache_dir),
+            "manifest_sha256": file_sha256(
+                Path(args.geodesic_cache_dir) / "manifest.json"
+            ),
+            "method": geodesic_manifest["method"],
+        }
     metrics = train_landmarks(
         model, train_data, validation_data, args.output_dir, model_config, data_config,
         loss_weights, device,
@@ -1133,6 +1234,30 @@ def command_analyze_heatmap_decoder(args):
     if args.run_seed is not None:
         values.extend(["--run-seed", str(args.run_seed)])
     analyze_heatmap(values)
+
+
+def command_analyze_geodesic_candidates(args):
+    """Measure whether the existing heatmap retrieves correct surface candidates."""
+    from src.geodesic_diagnostics import main as analyze_geodesic
+
+    values = [
+        "--checkpoint-path", args.checkpoint_path,
+        "--mesh-dir", args.mesh_dir,
+        "--landmarks-dir", args.landmarks_dir,
+        "--folds-json", args.folds_json,
+        "--predictions-json", args.predictions_json,
+        "--calibration-json", args.calibration_json,
+        "--geodesic-cache-dir", args.geodesic_cache_dir,
+        "--top-k", *(str(value) for value in args.top_k),
+        "--euclidean-close-mm", str(args.euclidean_close_mm),
+        "--geodesic-far-mm", str(args.geodesic_far_mm),
+        "--normal-dot-threshold", str(args.normal_dot_threshold),
+        "--device", args.device,
+        "--output", args.output,
+    ]
+    if args.run_seed is not None:
+        values.extend(["--run-seed", str(args.run_seed)])
+    analyze_geodesic(values)
 
 
 def command_generate_pca_prior(args):
@@ -1669,6 +1794,13 @@ def unit_float(value: str) -> float:
     return parsed
 
 
+def signed_unit_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or not -1.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be finite and in [-1, 1]")
+    return parsed
+
+
 def add_landmark_training_arguments(parser):
     parser.add_argument(
         "--learning-rate",
@@ -1783,6 +1915,55 @@ def add_landmark_model_arguments(parser):
         type=positive_float,
         default=2.0,
         help="Gaussian target standard deviation in original millimetres",
+    )
+    parser.add_argument(
+        "--heatmap-distance",
+        choices=("euclidean", "geodesic"),
+        default="euclidean",
+        help=(
+            "distance used to construct heatmap targets; geodesic requires a "
+            "fold-bound cache prepared with prepare-geodesic-targets"
+        ),
+    )
+    parser.add_argument(
+        "--geodesic-cache-dir",
+        help="directory containing the exact fold geodesic manifest and ear caches",
+    )
+    parser.add_argument(
+        "--surface-voting",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="decode heatmap candidates after bounded learned surface-vector votes",
+    )
+    parser.add_argument(
+        "--vote-weight",
+        type=nonnegative_float,
+        default=0.0,
+        help="weight of local candidate-to-landmark vector supervision",
+    )
+    parser.add_argument(
+        "--vote-radius-mm",
+        type=positive_float,
+        default=6.0,
+        help="maximum mesh-geodesic distance of candidates supervised as voters",
+    )
+    parser.add_argument(
+        "--vote-cap-mm",
+        type=positive_float,
+        default=6.0,
+        help="tanh bound on the norm of each predicted candidate vote offset",
+    )
+    parser.add_argument(
+        "--vote-fusion-iterations",
+        type=positive_integer,
+        default=3,
+        help="deterministic weighted geometric-median iterations over Top-K votes",
+    )
+    parser.add_argument(
+        "--vote-fusion-epsilon-mm",
+        type=positive_float,
+        default=0.25,
+        help="minimum residual in robust vote reweighting",
     )
     parser.add_argument(
         "--bilateral-mode",
@@ -1925,6 +2106,17 @@ def build_parser():
     validate_calibration.add_argument("--output")
     validate_calibration.set_defaults(function=command_validate_calibration)
 
+    geodesic_targets = subparsers.add_parser("prepare-geodesic-targets")
+    add_data_arguments(geodesic_targets)
+    geodesic_targets.add_argument("--folds-json", required=True)
+    geodesic_targets.add_argument(
+        "--outer-fold", required=True, help="0-4 for a fold cache or final"
+    )
+    geodesic_targets.add_argument("--predictions-json", required=True)
+    geodesic_targets.add_argument("--calibration-json", required=True)
+    geodesic_targets.add_argument("--output-dir", required=True)
+    geodesic_targets.set_defaults(function=command_prepare_geodesic_targets)
+
     landmarks = subparsers.add_parser("fit-landmarks")
     add_data_arguments(landmarks)
     add_runtime_arguments(landmarks)
@@ -1992,6 +2184,30 @@ def build_parser():
     heatmap_diagnostic.add_argument("--device", default="auto")
     heatmap_diagnostic.add_argument("--output", required=True)
     heatmap_diagnostic.set_defaults(function=command_analyze_heatmap_decoder)
+
+    geodesic_diagnostic = subparsers.add_parser("analyze-geodesic-candidates")
+    add_data_arguments(geodesic_diagnostic)
+    geodesic_diagnostic.add_argument("--checkpoint-path", required=True)
+    geodesic_diagnostic.add_argument("--folds-json", required=True)
+    geodesic_diagnostic.add_argument("--predictions-json", required=True)
+    geodesic_diagnostic.add_argument("--calibration-json", required=True)
+    geodesic_diagnostic.add_argument("--geodesic-cache-dir", required=True)
+    geodesic_diagnostic.add_argument(
+        "--top-k", nargs="+", type=positive_integer, default=[1, 8, 32, 64]
+    )
+    geodesic_diagnostic.add_argument(
+        "--euclidean-close-mm", type=positive_float, default=4.0
+    )
+    geodesic_diagnostic.add_argument(
+        "--geodesic-far-mm", type=positive_float, default=8.0
+    )
+    geodesic_diagnostic.add_argument(
+        "--normal-dot-threshold", type=signed_unit_float, default=0.0
+    )
+    geodesic_diagnostic.add_argument("--run-seed", type=int)
+    geodesic_diagnostic.add_argument("--device", default="auto")
+    geodesic_diagnostic.add_argument("--output", required=True)
+    geodesic_diagnostic.set_defaults(function=command_analyze_geodesic_candidates)
 
     pca_generate = subparsers.add_parser("generate-pca-prior")
     add_data_arguments(pca_generate)

@@ -24,6 +24,20 @@ class MeshNormalization:
         return xyz * self.scale + self.centroid
 
 
+@dataclass(frozen=True)
+class SurfaceSamples:
+    """Deterministic surface samples plus their source mesh faces.
+
+    ``sample_mesh_surface`` intentionally keeps its historical array-only API.
+    Geodesic supervision uses this detailed form to map every resampled point
+    back to the exact triangle on which it was generated.
+    """
+
+    features: np.ndarray
+    face_indices: np.ndarray
+    barycentric: np.ndarray
+
+
 def compute_mesh_normalization(mesh: Trimesh) -> MeshNormalization:
     """Normalize around the full mesh centroid using max vertex radius."""
     vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -70,12 +84,31 @@ def sample_mesh_surface(
     """
     if num_points <= 0:
         raise ValueError("num_points must be positive")
+    try:
+        return sample_mesh_surface_with_metadata(mesh, num_points, seed).features
+    except ValueError as error:
+        if "surface sampling metadata requires" not in str(error):
+            raise
+        return _sample_vertices(mesh, num_points, np.random.default_rng(seed))
+
+
+def sample_mesh_surface_with_metadata(
+    mesh: Trimesh, num_points: int = 16384, seed: Optional[int] = None
+) -> SurfaceSamples:
+    """Sample faces exactly as :func:`sample_mesh_surface` and retain mapping.
+
+    Face indices are indices into ``mesh.faces`` and barycentric rows correspond
+    to those faces.  A valid triangular surface is required because vertex-only
+    sampling has no unambiguous surface-geodesic mapping.
+    """
+    if num_points <= 0:
+        raise ValueError("num_points must be positive")
 
     rng = np.random.default_rng(seed)
     vertices = np.asarray(mesh.vertices, dtype=np.float32)
     faces = np.asarray(mesh.faces, dtype=np.int64)
     if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
-        return _sample_vertices(mesh, num_points, rng)
+        raise ValueError("surface sampling metadata requires triangular faces")
 
     triangles = vertices[faces]
     edge1 = triangles[:, 1] - triangles[:, 0]
@@ -84,7 +117,7 @@ def sample_mesh_surface(
     areas = 0.5 * np.linalg.norm(cross, axis=1)
     valid = areas > EPSILON
     if not np.any(valid):
-        return _sample_vertices(mesh, num_points, rng)
+        raise ValueError("surface sampling metadata requires nondegenerate faces")
 
     probabilities = areas / areas.sum()
     face_indices = rng.choice(len(faces), size=num_points, replace=True, p=probabilities)
@@ -103,7 +136,13 @@ def sample_mesh_surface(
     )
 
     normals = _normalize_vectors(cross[face_indices].astype(np.float32))
-    return np.concatenate([xyz, normals], axis=1).astype(np.float32)
+    features = np.concatenate([xyz, normals], axis=1).astype(np.float32)
+    barycentric = np.stack([bary0, bary1, bary2], axis=1).astype(np.float32)
+    return SurfaceSamples(
+        features=features,
+        face_indices=face_indices.astype(np.int64),
+        barycentric=barycentric,
+    )
 
 
 def normalize_point_features(

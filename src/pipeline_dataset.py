@@ -40,6 +40,8 @@ class PreparedEarGeometry:
     backup_box: WorldCropBox
     crop_mesh: object
     crop_stats: Mapping[str, object]
+    sample_face_indices: Optional[np.ndarray] = None
+    sample_barycentric: Optional[np.ndarray] = None
 
 
 def prepare_ear_geometry(
@@ -50,6 +52,7 @@ def prepare_ear_geometry(
     calibration: Mapping[str, object],
     num_points: int,
     seed: int,
+    include_sampling_metadata: bool = False,
 ) -> PreparedEarGeometry:
     """Prepare one proposal ear exactly as landmark validation/inference expects."""
     if ear not in EAR_NAMES:
@@ -58,7 +61,7 @@ def prepare_ear_geometry(
     if canonical_center.shape != (3,) or not np.isfinite(canonical_center).all():
         raise ValueError("predicted ear centre must be a finite three-value vector")
     primary, backup = boxes_for_prediction(canonical_center, calibration)
-    sampled, crop_mesh, stats = sample_canonical_crop(
+    sampled_result = sample_canonical_crop(
         mesh,
         primary,
         ear,
@@ -66,7 +69,10 @@ def prepare_ear_geometry(
         int(seed),
         fallback_box=backup,
         thresholds=calibration.get("fallback_thresholds"),
+        return_sampling_metadata=include_sampling_metadata,
     )
+    sampled, crop_mesh, stats = sampled_result[:3]
+    sampling_metadata = sampled_result[3] if include_sampling_metadata else None
     transform = LocalEarTransform(canonical_center, float(calibration["local_scale"]))
     canonical_landmarks = canonicalize_xyz(landmarks, ear).astype(np.float32)
     point_features = transform.normalize_features(sampled).astype(np.float32)
@@ -82,6 +88,16 @@ def prepare_ear_geometry(
         backup_box=backup,
         crop_mesh=crop_mesh,
         crop_stats=dict(stats),
+        sample_face_indices=(
+            np.asarray(sampling_metadata["face_indices"], dtype=np.int64)
+            if sampling_metadata is not None
+            else None
+        ),
+        sample_barycentric=(
+            np.asarray(sampling_metadata["barycentric"], dtype=np.float32)
+            if sampling_metadata is not None
+            else None
+        ),
     )
 
 
@@ -182,6 +198,7 @@ class EarLandmarkDataset(EpochResampledDataset):
         seed: int = 42,
         dynamic_sampling: bool = True,
         augment: bool = False,
+        geodesic_cache_dir: Optional[str] = None,
     ):
         super().__init__(seed, dynamic_sampling)
         self.base = MeshLandmarkDataset(mesh_dir, landmarks_dir)
@@ -195,6 +212,7 @@ class EarLandmarkDataset(EpochResampledDataset):
         self.dense_surface_points = int(dense_surface_points)
         self.local_scale = float(calibration["local_scale"])
         self.augment = bool(augment)
+        self.geodesic_cache_dir = geodesic_cache_dir
         missing = [
             prediction_key(self.base.get_identifier(index), ear)
             for index, ear in self.samples
@@ -215,6 +233,7 @@ class EarLandmarkDataset(EpochResampledDataset):
         prepared = prepare_ear_geometry(
             mesh, landmarks, ear, center, self.calibration, self.num_points,
             self.sample_seed(item),
+            include_sampling_metadata=self.geodesic_cache_dir is not None,
         )
         features = prepared.point_features.copy()
         target = prepared.target.copy()
@@ -235,6 +254,26 @@ class EarLandmarkDataset(EpochResampledDataset):
             "ear": ear,
             "used_backup": prepared.crop_stats["used_backup"],
         }
+        if self.geodesic_cache_dir is not None:
+            from .geodesic import (
+                cache_path,
+                load_geodesic_cache_entry,
+                sample_geodesic_distances_from_barycentric,
+            )
+
+            cached = load_geodesic_cache_entry(
+                cache_path(self.geodesic_cache_dir, subject_id, ear),
+                prepared.crop_mesh,
+            )
+            geodesic = sample_geodesic_distances_from_barycentric(
+                prepared.crop_mesh,
+                prepared.sample_face_indices,
+                prepared.sample_barycentric,
+                cached,
+            )
+            result["geodesic_distances_mm"] = torch.from_numpy(
+                (geodesic * augmentation_scale).astype(np.float32)
+            )
         if self.dense_surface_points:
             dense = sample_mesh_surface(
                 prepared.crop_mesh,
@@ -268,6 +307,7 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         seed: int = 42,
         dynamic_sampling: bool = True,
         augment: bool = False,
+        geodesic_cache_dir: Optional[str] = None,
     ):
         super().__init__(seed, dynamic_sampling)
         self.ears_per_item = 2
@@ -282,6 +322,7 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         self.dense_surface_points = int(dense_surface_points)
         self.local_scale = float(calibration["local_scale"])
         self.augment = bool(augment)
+        self.geodesic_cache_dir = geodesic_cache_dir
         missing = [
             prediction_key(self.base.get_identifier(index), ear)
             for index in self.indices
@@ -307,6 +348,7 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         centers = []
         backups = []
         dense_surfaces = []
+        geodesic_surfaces = []
         for ear_offset, (ear, landmarks) in enumerate(
             zip(EAR_NAMES, landmark_sets)
         ):
@@ -321,6 +363,7 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
                 self.calibration,
                 self.num_points,
                 self.sample_seed(ear_item),
+                include_sampling_metadata=self.geodesic_cache_dir is not None,
             )
             features = prepared.point_features.copy()
             target = prepared.target.copy()
@@ -342,6 +385,26 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
             targets.append(target.astype(np.float32))
             centers.append(center.astype(np.float32))
             backups.append(bool(prepared.crop_stats["used_backup"]))
+            if self.geodesic_cache_dir is not None:
+                from .geodesic import (
+                    cache_path,
+                    load_geodesic_cache_entry,
+                    sample_geodesic_distances_from_barycentric,
+                )
+
+                cached = load_geodesic_cache_entry(
+                    cache_path(self.geodesic_cache_dir, subject_id, ear),
+                    prepared.crop_mesh,
+                )
+                geodesic_surfaces.append(
+                    sample_geodesic_distances_from_barycentric(
+                        prepared.crop_mesh,
+                        prepared.sample_face_indices,
+                        prepared.sample_barycentric,
+                        cached,
+                    ).astype(np.float32)
+                    * augmentation_scale
+                )
             if self.dense_surface_points:
                 dense = sample_mesh_surface(
                     prepared.crop_mesh,
@@ -369,6 +432,10 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         if self.dense_surface_points:
             result["dense_surface"] = torch.from_numpy(
                 np.stack(dense_surfaces, axis=0)
+            )
+        if self.geodesic_cache_dir is not None:
+            result["geodesic_distances_mm"] = torch.from_numpy(
+                np.stack(geodesic_surfaces, axis=0).astype(np.float32)
             )
         return result
 

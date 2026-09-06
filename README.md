@@ -199,6 +199,25 @@ baseline:
   two-stage experiment; the saved model configuration reconstructs it for
   evaluation and resume. The default remains `geometry-offset`, preserving old
   checkpoints exactly.
+- `prepare-geodesic-targets` projects each annotation to its exact crop
+  triangle and precomputes topology-respecting shortest-path fields from
+  virtual triangle sources. The generated manifest is bound to the fold,
+  centre predictions, calibration, crop-mesh hashes, and annotation hashes.
+  Training resamples points normally and maps each point back to its source
+  face; source data are never modified.
+- `analyze-geodesic-candidates` is the mandatory no-retraining diagnostic for
+  the geodesic/voting experiment. It reports the heatmap rank and recall of the
+  nearest correct sample, Top-K candidate oracle errors, Euclidean-close but
+  geodesically-far probability mass, opposite-normal probability mass, and
+  annotation-to-crop projection error.
+- `--heatmap-distance geodesic --geodesic-cache-dir ...` replaces only the
+  Euclidean Gaussian target with the cached mesh-geodesic target.
+  `--surface-voting` additionally predicts a bounded three-dimensional
+  candidate-to-landmark vote at every sampled surface point. Only candidates
+  within `--vote-radius-mm` receive vector supervision; the heatmap Top-K votes
+  are robustly weighted before the unchanged K=32 refiner, PCA prior, and exact
+  surface projection. All controls are opt-in, so old checkpoints and the
+  promoted D256 pipeline reconstruct unchanged.
 - `generate-pca-prior` and `evaluate-pca-prior` fit a PCA prior from only the
   outer-training landmarks and evaluate the deployment order of model output,
   PCA blend, then exact projection. The manifest binds the prior to the fold,
@@ -220,6 +239,108 @@ three of five fold means improve.
 These decoder/refiner controls are research experiments. Screen each on outer
 fold 0/seed 42, always compare the final PCA-then-projected result to the matching
 1.333987 mm reference, and do not combine individually unpromoted changes.
+
+### Geodesic heatmap and surface-vector voting screen
+
+Prepare the Fold-0 cache once. The command is resumable and reuses only entries
+whose crop-mesh and annotation hashes still match:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm prepare-geodesic-targets \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --outer-fold 0 \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --output-dir artifacts/geodesic/fold0
+```
+
+Run the mandatory diagnostic on the established D256 checkpoint before
+training. Thresholds are serialized in the report rather than hidden in code:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm analyze-geodesic-candidates \
+  --checkpoint-path runs/pointnext_surface_heatmap_d256/fold0_seed42/best_landmarks.pt \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --geodesic-cache-dir artifacts/geodesic/fold0 \
+  --top-k 1 8 32 64 \
+  --euclidean-close-mm 4 \
+  --geodesic-far-mm 8 \
+  --normal-dot-threshold 0 \
+  --run-seed 42 \
+  --device auto \
+  --output runs/geodesic_heatmap/candidate_diagnostic/fold0_seed42.json
+```
+
+The controlled voting candidate retains the proven PointNeXt-S C32, D256
+decoder, four contours, no augmentation, spacing weight 0.01, K=32 refiner,
+16,384 points, and all optimizer settings:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm fit-landmarks \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --outer-fold 0 \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --output-dir runs/geodesic_heatmap/vector_voting/fold0_seed42 \
+  --backbone pointnext \
+  --pointnext-variant s \
+  --landmark-decoder surface-heatmap \
+  --heatmap-feature-dim 256 \
+  --heatmap-topk 64 \
+  --heatmap-coordinate-temperature 1 \
+  --heatmap-weight 0.1 \
+  --heatmap-sigma-mm 2 \
+  --heatmap-distance geodesic \
+  --geodesic-cache-dir artifacts/geodesic/fold0 \
+  --surface-voting \
+  --vote-weight 0.1 \
+  --vote-radius-mm 6 \
+  --vote-cap-mm 6 \
+  --vote-fusion-iterations 3 \
+  --vote-fusion-epsilon-mm 0.25 \
+  --four-heads \
+  --no-augment \
+  --refinement-k 32 \
+  --refinement-anchor raw \
+  --refinement-mode geometry-offset \
+  --anchor-weight 0 \
+  --spacing-weight 0.01 \
+  --surface-weight 0 \
+  --num-points 16384 \
+  --seed 42 \
+  --epochs 200 \
+  --patience 30 \
+  --workers 10 \
+  --amp
+```
+
+Use the existing leakage-safe Fold-0 PCA prior to evaluate the exact deployment
+order (model, PCA, triangle projection):
+
+```bash
+sbatch submit_job_train_pointnet2.slurm evaluate-pca-prior \
+  --checkpoint-path runs/geodesic_heatmap/vector_voting/fold0_seed42/best_landmarks.pt \
+  --prior-path artifacts/pca_projection/fold0/prior.npz \
+  --prior-manifest artifacts/pca_projection/fold0/manifest.json \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --components 32 \
+  --beta 0.5 \
+  --run-seed 42 \
+  --device auto \
+  --output runs/pca_projection/geodesic_vector_voting/fold0_seed42.json
+```
 
 After the registered five-fold/three-seed comparisons select a configuration, use
 the cross-validation best epochs to retrain and package one deterministic model:

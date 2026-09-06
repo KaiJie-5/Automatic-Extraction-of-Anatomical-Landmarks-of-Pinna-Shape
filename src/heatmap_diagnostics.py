@@ -261,12 +261,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 details = model.forward_with_details(points)
                 logits = details["heatmap_logits"]
                 candidates = details["surface_candidates"]
+                vote_offsets = details.get("surface_vote_offsets")
                 point_features = details["decoded_point_features"]
                 query_features = details["landmark_query_features"]
                 uncertainty = heatmap_uncertainty(logits)
                 for k, temperature in grid:
                     coarse = model.decode_surface_coordinates(
-                        logits, candidates, topk=k, temperature=temperature
+                        logits,
+                        candidates,
+                        vote_offsets=vote_offsets,
+                        topk=k,
+                        temperature=temperature,
                     )
                     final, _ = model.apply_refinement(
                         coarse,

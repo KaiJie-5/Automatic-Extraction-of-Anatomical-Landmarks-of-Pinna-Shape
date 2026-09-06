@@ -96,14 +96,106 @@ def surface_heatmap_kl(
     target_probabilities = torch.softmax(target_logits, dim=-1)
     target_log_probabilities = torch.log_softmax(target_logits, dim=-1)
     predicted_log_probabilities = torch.log_softmax(logits.float(), dim=-1)
-    divergence = (
-        target_probabilities
-        * (target_log_probabilities - predicted_log_probabilities)
-    ).sum(dim=-1).mean()
+    finite_target_logs = torch.where(
+        target_probabilities > 0.0,
+        target_log_probabilities,
+        torch.zeros_like(target_log_probabilities),
+    )
+    terms = target_probabilities * (
+        finite_target_logs - predicted_log_probabilities
+    )
+    divergence = terms.sum(dim=-1).mean()
     # KL is mathematically non-negative, but an almost perfect distribution can
     # accumulate a tiny negative value (around 1e-21) in finite precision.
     # Clamping restores the invariant without affecting any meaningful loss.
     return divergence.clamp_min(0.0)
+
+
+def surface_geodesic_heatmap_kl(
+    logits: torch.Tensor,
+    geodesic_distances_mm: torch.Tensor,
+    sigma_mm: float,
+) -> torch.Tensor:
+    """KL to a Gaussian defined by mesh-geodesic, not chord, distance."""
+    if logits.ndim != 3 or logits.shape[1] != 85:
+        raise ValueError("heatmap logits must have shape (B, 85, N)")
+    if geodesic_distances_mm.shape != logits.shape:
+        raise ValueError(
+            "geodesic heatmap distances must match logits with shape (B, 85, N)"
+        )
+    sigma_mm = float(sigma_mm)
+    if not math.isfinite(sigma_mm) or sigma_mm <= 0.0:
+        raise ValueError("surface heatmap sigma must be positive and finite")
+    distances = geodesic_distances_mm.float()
+    if torch.isnan(distances).any() or (distances < 0.0).any():
+        raise ValueError("geodesic distances must be non-negative and not NaN")
+    if not torch.isfinite(distances).any(dim=-1).all():
+        raise ValueError("every landmark requires at least one finite geodesic candidate")
+    target_logits = -(distances.square()) / (2.0 * sigma_mm * sigma_mm)
+    target_probabilities = torch.softmax(target_logits, dim=-1)
+    target_log_probabilities = torch.log_softmax(target_logits, dim=-1)
+    predicted_log_probabilities = torch.log_softmax(logits.float(), dim=-1)
+    finite_target_logs = torch.where(
+        target_probabilities > 0.0,
+        target_log_probabilities,
+        torch.zeros_like(target_log_probabilities),
+    )
+    terms = target_probabilities * (
+        finite_target_logs - predicted_log_probabilities
+    )
+    divergence = terms.sum(dim=-1).mean()
+    return divergence.clamp_min(0.0)
+
+
+def surface_vote_offset_loss(
+    vote_offsets: torch.Tensor,
+    surface_points: torch.Tensor,
+    target: torch.Tensor,
+    scale_mm,
+    geodesic_distances_mm: torch.Tensor,
+    radius_mm: float,
+    sigma_mm: float,
+) -> torch.Tensor:
+    """Gaussian-weighted candidate-to-landmark voting error in millimetres."""
+    expected = (*geodesic_distances_mm.shape, 3)
+    if vote_offsets.shape != expected:
+        raise ValueError(f"surface vote offsets must have shape {expected}")
+    if surface_points.ndim != 3 or surface_points.shape[-1] != 3:
+        raise ValueError("surface vote points must have shape (B, N, 3)")
+    if target.ndim != 3 or target.shape[1:] != (85, 3):
+        raise ValueError("surface vote targets must have shape (B, 85, 3)")
+    radius_mm = float(radius_mm)
+    sigma_mm = float(sigma_mm)
+    if not math.isfinite(radius_mm) or radius_mm <= 0.0:
+        raise ValueError("surface vote radius must be positive and finite")
+    if not math.isfinite(sigma_mm) or sigma_mm <= 0.0:
+        raise ValueError("surface vote sigma must be positive and finite")
+
+    scale = torch.as_tensor(scale_mm, dtype=torch.float32, device=target.device)
+    if scale.ndim == 0:
+        scale = scale.expand(target.shape[0])
+    scale = scale.reshape(target.shape[0], -1)
+    if scale.shape[1] != 1:
+        raise ValueError("surface vote scale must contain one value per batch item")
+    target_offsets = target.float()[:, :, None, :] - surface_points.float()[:, None, :, :]
+    error_mm = torch.linalg.norm(
+        (vote_offsets.float() - target_offsets) * scale[:, None, None, :],
+        dim=-1,
+    )
+    distances = geodesic_distances_mm.float()
+    mask = torch.isfinite(distances) & (distances <= radius_mm)
+    weights = torch.where(
+        mask,
+        torch.exp(-distances.square() / (2.0 * sigma_mm * sigma_mm)),
+        torch.zeros_like(distances),
+    )
+    denominator = weights.sum(dim=-1)
+    if not (denominator > 0.0).all():
+        raise ValueError(
+            "surface vote radius contains no sampled candidate for at least one landmark"
+        )
+    per_landmark = (weights * error_mm).sum(dim=-1) / denominator
+    return per_landmark.mean()
 
 
 def proposal_landmark_loss(
@@ -118,6 +210,10 @@ def proposal_landmark_loss(
     heatmap_surface_points: Optional[torch.Tensor] = None,
     heatmap_weight: float = 0.0,
     heatmap_sigma_mm: float = 2.0,
+    heatmap_geodesic_distances_mm: Optional[torch.Tensor] = None,
+    vote_offsets: Optional[torch.Tensor] = None,
+    vote_weight: float = 0.0,
+    vote_radius_mm: float = 6.0,
 ) -> Mapping[str, torch.Tensor]:
     base = mean_distance_mm(prediction, target, scale_mm)
     anchor = anchor_distance_mm(prediction, target, scale_mm) if anchor_weight else base.new_zeros(())
@@ -133,21 +229,49 @@ def proposal_landmark_loss(
             raise ValueError(
                 "heatmap_weight requires heatmap logits and sampled surface points"
             )
-        heatmap = surface_heatmap_kl(
-            heatmap_logits,
+        if heatmap_geodesic_distances_mm is None:
+            heatmap = surface_heatmap_kl(
+                heatmap_logits,
+                heatmap_surface_points,
+                target,
+                scale_mm,
+                heatmap_sigma_mm,
+            )
+        else:
+            heatmap = surface_geodesic_heatmap_kl(
+                heatmap_logits,
+                heatmap_geodesic_distances_mm,
+                heatmap_sigma_mm,
+            )
+    else:
+        heatmap = base.new_zeros(())
+    if vote_weight:
+        if (
+            vote_offsets is None
+            or heatmap_surface_points is None
+            or heatmap_geodesic_distances_mm is None
+        ):
+            raise ValueError(
+                "vote_weight requires vote offsets, surface points, and geodesic distances"
+            )
+        vote = surface_vote_offset_loss(
+            vote_offsets,
             heatmap_surface_points,
             target,
             scale_mm,
+            heatmap_geodesic_distances_mm,
+            vote_radius_mm,
             heatmap_sigma_mm,
         )
     else:
-        heatmap = base.new_zeros(())
+        vote = base.new_zeros(())
     total = (
         base
         + anchor_weight * anchor
         + spacing_weight * spacing
         + surface_weight * surface
         + heatmap_weight * heatmap
+        + vote_weight * vote
     )
     return {
         "total": total,
@@ -156,6 +280,7 @@ def proposal_landmark_loss(
         "spacing": spacing,
         "surface": surface,
         "heatmap": heatmap,
+        "vote": vote,
     }
 
 

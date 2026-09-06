@@ -373,6 +373,10 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         heatmap_feature_dim: int = 128,
         heatmap_topk: int = 64,
         heatmap_coordinate_temperature: float = 1.0,
+        surface_voting: bool = False,
+        vote_cap_normalized: float = 0.0,
+        vote_fusion_iterations: int = 3,
+        vote_fusion_epsilon_normalized: float = 0.0,
         refinement_k: int = 0,
         refinement_cap_normalized: float = 0.0,
         refinement_anchor: str = "raw",
@@ -424,6 +428,29 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         self.four_heads = bool(four_heads)
         self.heatmap_topk = heatmap_topk
         self.heatmap_coordinate_temperature = heatmap_coordinate_temperature
+        self.surface_voting = bool(surface_voting)
+        self.vote_cap_normalized = float(vote_cap_normalized)
+        self.vote_fusion_iterations = int(vote_fusion_iterations)
+        self.vote_fusion_epsilon_normalized = float(
+            vote_fusion_epsilon_normalized
+        )
+        if self.surface_voting and (
+            not math.isfinite(self.vote_cap_normalized)
+            or self.vote_cap_normalized <= 0.0
+        ):
+            raise ValueError(
+                "surface voting requires a positive finite vote cap"
+            )
+        if not self.surface_voting and self.vote_cap_normalized != 0.0:
+            raise ValueError("vote cap is only valid when surface voting is enabled")
+        if self.surface_voting and (
+            self.vote_fusion_iterations <= 0
+            or not math.isfinite(self.vote_fusion_epsilon_normalized)
+            or self.vote_fusion_epsilon_normalized <= 0.0
+        ):
+            raise ValueError(
+                "surface voting requires positive robust-fusion settings"
+            )
         self.refinement_mode = refinement_mode
 
         # Decode the 64-point semantic level back to all original 16,384
@@ -464,6 +491,20 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         for queries in self.query_embeddings:
             nn.init.trunc_normal_(queries, std=0.02)
         self.logit_scale = heatmap_feature_dim ** -0.5
+        if self.surface_voting:
+            self.vote_query_projections = nn.ModuleList(
+                [
+                    nn.Linear(heatmap_feature_dim, heatmap_feature_dim)
+                    for _ in range(3)
+                ]
+            )
+            # Zero offsets start from the established surface candidates while
+            # retaining gradients into the new vote heads.
+            for projection in self.vote_query_projections:
+                nn.init.zeros_(projection.weight)
+                nn.init.zeros_(projection.bias)
+        else:
+            self.vote_query_projections = None
         if not refinement_k:
             self.refiner = None
         elif refinement_mode == "geometry-offset":
@@ -507,10 +548,36 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
             * self.logit_scale
         )
 
+    def _vote_offsets(
+        self, point_features: torch.Tensor, query_features: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Predict bounded candidate-to-landmark offsets in local coordinates."""
+        if self.vote_query_projections is None:
+            return None
+        projected = torch.stack(
+            [projection(query_features) for projection in self.vote_query_projections],
+            dim=-2,
+        )
+        if projected.ndim == 3:
+            raw = torch.einsum("bnd,lcd->blnc", point_features, projected)
+        elif projected.ndim == 4:
+            raw = torch.einsum("bnd,blcd->blnc", point_features, projected)
+        else:
+            raise ValueError("landmark query features have an invalid rank")
+        raw = raw * self.logit_scale
+        magnitude = torch.linalg.norm(raw, dim=-1, keepdim=True)
+        bounded_scale = torch.where(
+            magnitude > 1e-6,
+            torch.tanh(magnitude) / magnitude.clamp_min(1e-6),
+            torch.ones_like(magnitude),
+        )
+        return raw * bounded_scale * self.vote_cap_normalized
+
     def decode_surface_coordinates(
         self,
         logits: torch.Tensor,
         xyz: torch.Tensor,
+        vote_offsets: torch.Tensor | None = None,
         topk: int | None = None,
         temperature: float | None = None,
     ) -> torch.Tensor:
@@ -530,10 +597,35 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         count = min(selected_topk, int(xyz.shape[1]))
         values, indices = logits.topk(count, dim=-1, largest=True, sorted=True)
         candidates = index_points(xyz, indices)
+        if vote_offsets is not None:
+            if vote_offsets.shape != (*logits.shape, 3):
+                raise ValueError(
+                    "surface vote offsets must have shape (B, 85, N, 3)"
+                )
+            candidates = candidates + torch.gather(
+                vote_offsets,
+                2,
+                indices.unsqueeze(-1).expand(-1, -1, -1, 3),
+            )
         weights = torch.softmax(
             values.float() / selected_temperature, dim=-1
         ).to(candidates.dtype)
-        return (candidates * weights.unsqueeze(-1)).sum(dim=2).float()
+        estimate = (candidates * weights.unsqueeze(-1)).sum(dim=2)
+        if vote_offsets is not None:
+            for _ in range(self.vote_fusion_iterations):
+                residual = torch.linalg.norm(
+                    candidates - estimate.unsqueeze(2), dim=-1
+                )
+                robust_weights = weights / residual.clamp_min(
+                    self.vote_fusion_epsilon_normalized
+                )
+                robust_weights = robust_weights / robust_weights.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-12)
+                estimate = (
+                    candidates * robust_weights.unsqueeze(-1)
+                ).sum(dim=2)
+        return estimate.float()
 
     def apply_refinement(
         self,
@@ -561,8 +653,9 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         point_features = self._decode_point_features(levels)
         query_features = self._query_features()
         logits = self._logits(point_features, query_features)
+        vote_offsets = self._vote_offsets(point_features, query_features)
         xyz = levels["xyz"][0]
-        coarse = self.decode_surface_coordinates(logits, xyz)
+        coarse = self.decode_surface_coordinates(logits, xyz, vote_offsets)
         final, refinement_predictions = self.apply_refinement(
             coarse,
             points,
@@ -580,6 +673,8 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         }
         if refinement_predictions is not None:
             details["refinement_stage_predictions"] = refinement_predictions
+        if vote_offsets is not None:
+            details["surface_vote_offsets"] = vote_offsets
         return details
 
     def forward(self, points: torch.Tensor) -> torch.Tensor:
@@ -785,15 +880,21 @@ class BilateralPointNeXtSurfaceHeatmapRegressor(nn.Module):
 
         flat_logits = logits.reshape(batch * ears, 85, point_count)
         flat_xyz = xyz.reshape(batch * ears, point_count, 3)
+        flat_queries = query_features.reshape(
+            batch * ears, 85, self.feature_dim
+        )
+        vote_offsets = self.ear_model._vote_offsets(
+            flat_point_features, flat_queries
+        )
         coarse_flat = self.ear_model.decode_surface_coordinates(
-            flat_logits, flat_xyz
+            flat_logits, flat_xyz, vote_offsets
         )
         final_flat, refinement_predictions = self.ear_model.apply_refinement(
             coarse_flat,
             flat_points,
             flat_point_features,
             flat_logits,
-            query_features.reshape(batch * ears, 85, self.feature_dim),
+            flat_queries,
         )
         details = {
             "coarse": coarse_flat.reshape(batch, ears, 85, 3),
@@ -809,6 +910,10 @@ class BilateralPointNeXtSurfaceHeatmapRegressor(nn.Module):
                 refinement_predictions.reshape(
                     batch, ears, *refinement_predictions.shape[1:]
                 )
+            )
+        if vote_offsets is not None:
+            details["surface_vote_offsets"] = vote_offsets.reshape(
+                batch, ears, 85, point_count, 3
             )
         return details
 

@@ -8,7 +8,7 @@ import numpy as np
 import trimesh
 
 from .canonical import WorldCropBox, canonicalize_point_features
-from .preprocessing import sample_mesh_surface
+from .preprocessing import sample_mesh_surface, sample_mesh_surface_with_metadata
 
 
 def _empty_mesh() -> trimesh.Trimesh:
@@ -80,7 +80,10 @@ def sample_canonical_crop(
     seed: int,
     fallback_box: Optional[WorldCropBox] = None,
     thresholds: Optional[dict] = None,
-) -> Tuple[np.ndarray, trimesh.Trimesh, dict]:
+    return_sampling_metadata: bool = False,
+) -> Tuple[np.ndarray, trimesh.Trimesh, dict] | Tuple[
+    np.ndarray, trimesh.Trimesh, dict, dict
+]:
     world_box = canonical_box.for_ear(ear)
     crop = clip_mesh_to_box(mesh, world_box)
     stats = crop_geometry_stats(crop)
@@ -93,8 +96,20 @@ def sample_canonical_crop(
         used_backup = True
     if not stats["valid"]:
         raise ValueError("ear crop is empty or has no valid triangular surface")
-    features = sample_mesh_surface(crop, num_points=num_points, seed=seed)
+    if return_sampling_metadata:
+        sampled = sample_mesh_surface_with_metadata(
+            crop, num_points=num_points, seed=seed
+        )
+        features = sampled.features
+    else:
+        features = sample_mesh_surface(crop, num_points=num_points, seed=seed)
     features = canonicalize_point_features(features, ear)
     stats = dict(stats)
     stats["used_backup"] = used_backup
-    return features.astype(np.float32), crop, stats
+    result = (features.astype(np.float32), crop, stats)
+    if not return_sampling_metadata:
+        return result
+    return (*result, {
+        "face_indices": sampled.face_indices,
+        "barycentric": sampled.barycentric,
+    })
