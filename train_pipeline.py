@@ -313,6 +313,11 @@ def landmark_loss_config(args) -> dict:
     vote_weight = float(getattr(args, "vote_weight", 0.0))
     vote_radius_mm = float(getattr(args, "vote_radius_mm", 6.0))
     vote_cap_mm = float(getattr(args, "vote_cap_mm", 6.0))
+    if decoder == "surface-curve" and heatmap_distance != "geodesic":
+        raise ValueError(
+            "--landmark-decoder surface-curve requires "
+            "--heatmap-distance geodesic"
+        )
     if not surface_decoder and heatmap_distance != "euclidean":
         raise ValueError(
             "--heatmap-distance geodesic requires a surface heatmap/curve decoder"
@@ -336,11 +341,6 @@ def landmark_loss_config(args) -> dict:
     curve_weight = float(getattr(args, "curve_weight", 0.0))
     curve_arc_weight = float(getattr(args, "curve_arc_weight", 0.0))
     if decoder == "surface-curve":
-        if heatmap_distance != "geodesic":
-            raise ValueError(
-                "--landmark-decoder surface-curve requires "
-                "--heatmap-distance geodesic"
-            )
         if curve_weight <= 0.0 or curve_arc_weight <= 0.0:
             raise ValueError(
                 "surface-curve training requires positive --curve-weight and "
