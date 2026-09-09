@@ -1655,6 +1655,55 @@ def command_evaluate_pca_prior(args):
     evaluate_prior(values)
 
 
+def command_evaluate_cascade_gate(args):
+    """Screen an inference-only confidence gate on one held-out fold."""
+    from src.shape_prior.evaluate_cascade_gate import main as evaluate_gate
+
+    values = [
+        "--baseline-checkpoint-path",
+        args.baseline_checkpoint_path,
+        "--cascade-checkpoint-path",
+        args.cascade_checkpoint_path,
+        "--prior-path",
+        args.prior_path,
+        "--prior-manifest",
+        args.prior_manifest,
+        "--mesh-dir",
+        args.mesh_dir,
+        "--landmarks-dir",
+        args.landmarks_dir,
+        "--folds-json",
+        args.folds_json,
+        "--predictions-json",
+        args.predictions_json,
+        "--calibration-json",
+        args.calibration_json,
+        "--components",
+        str(args.components),
+        "--beta",
+        str(args.beta),
+        "--gate-features",
+        *args.gate_features,
+        "--gate-scopes",
+        *args.gate_scopes,
+        "--gate-quantiles",
+        *(str(value) for value in args.gate_quantiles),
+        "--gate-blends",
+        *(str(value) for value in args.gate_blends),
+        "--projection-shortlist",
+        str(args.projection_shortlist),
+        "--projection-workers",
+        str(args.projection_workers),
+        "--output",
+        args.output,
+        "--device",
+        args.device,
+    ]
+    if args.run_seed is not None:
+        values.extend(["--run-seed", str(args.run_seed)])
+    evaluate_gate(values)
+
+
 def command_summarize_pca_prior(args):
     from src.shape_prior.summarize_prior import main as summarize_prior
 
@@ -2121,6 +2170,20 @@ def unit_float(value: str) -> float:
     parsed = float(value)
     if not np.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
         raise argparse.ArgumentTypeError("value must be finite and in [0, 1]")
+    return parsed
+
+
+def open_unit_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or not 0.0 < parsed < 1.0:
+        raise argparse.ArgumentTypeError("value must be finite and in (0, 1)")
+    return parsed
+
+
+def positive_unit_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or not 0.0 < parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be finite and in (0, 1]")
     return parsed
 
 
@@ -2690,6 +2753,74 @@ def build_parser():
         "--curve-path-backtrack-weight", type=nonnegative_float, default=8.0
     )
     pca_evaluate.set_defaults(function=command_evaluate_pca_prior)
+
+    cascade_gate = subparsers.add_parser(
+        "evaluate-cascade-gate",
+        help=(
+            "screen a confidence gate between matching baseline and landmark-token "
+            "cascade checkpoints"
+        ),
+    )
+    add_data_arguments(cascade_gate)
+    cascade_gate.add_argument("--baseline-checkpoint-path", required=True)
+    cascade_gate.add_argument("--cascade-checkpoint-path", required=True)
+    cascade_gate.add_argument("--prior-path", required=True)
+    cascade_gate.add_argument("--prior-manifest", required=True)
+    cascade_gate.add_argument("--folds-json", required=True)
+    cascade_gate.add_argument("--predictions-json", required=True)
+    cascade_gate.add_argument("--calibration-json", required=True)
+    cascade_gate.add_argument("--components", type=positive_integer, default=32)
+    cascade_gate.add_argument("--beta", type=unit_float, default=0.5)
+    cascade_gate.add_argument("--run-seed", type=int)
+    cascade_gate.add_argument(
+        "--gate-features",
+        nargs="+",
+        choices=(
+            "entropy",
+            "inverse_peak_probability",
+            "inverse_peak_margin",
+            "spatial_spread_mm",
+            "refinement_shift_mm",
+            "pca_correction_mm",
+            "model_disagreement_mm",
+        ),
+        default=[
+            "entropy",
+            "inverse_peak_probability",
+            "inverse_peak_margin",
+            "spatial_spread_mm",
+            "refinement_shift_mm",
+            "pca_correction_mm",
+            "model_disagreement_mm",
+        ],
+    )
+    cascade_gate.add_argument(
+        "--gate-scopes",
+        nargs="+",
+        choices=("ear", "landmark"),
+        default=["ear", "landmark"],
+    )
+    cascade_gate.add_argument(
+        "--gate-quantiles",
+        nargs="+",
+        type=open_unit_float,
+        default=[0.50, 0.65, 0.80, 0.90],
+    )
+    cascade_gate.add_argument(
+        "--gate-blends",
+        nargs="+",
+        type=positive_unit_float,
+        default=[0.25, 0.50, 0.75, 1.0],
+    )
+    cascade_gate.add_argument(
+        "--projection-shortlist", type=positive_integer, default=24
+    )
+    cascade_gate.add_argument(
+        "--projection-workers", type=positive_integer, default=10
+    )
+    cascade_gate.add_argument("--output", required=True)
+    cascade_gate.add_argument("--device", default="auto")
+    cascade_gate.set_defaults(function=command_evaluate_cascade_gate)
 
     pca_summary = subparsers.add_parser("summarize-pca-prior")
     pca_summary.add_argument("--report-root", required=True)

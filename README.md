@@ -337,6 +337,51 @@ Do not run the two-stage cascade yet. Continue only if the one-stage final
 PCA-projected MD improves the matching D256 Fold-0 report by about 0.02 mm and
 does not materially worsen P95 or maximum ear error.
 
+### Confidence-gated cascade salvage screen
+
+The one-stage cascade can be screened as a conditional correction without
+retraining or changing either checkpoint. The evaluator always retains the
+established D256 output as the default. It derives gate thresholds from
+inference-only uncertainty distributions over the 160 outer-training subjects;
+training landmark errors are never used for threshold calibration. It then
+screens ear-level and landmark-level gates on the 41 held-out Fold-0 subjects.
+
+This is intentionally a research evaluator. It loads both checkpoints and does
+not modify the current estimator or submission package. The full grid is ranked
+by PCA MD, and only the best 24 configurations plus the two ungated endpoints
+receive the expensive exact triangle projection:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm evaluate-cascade-gate \
+  --baseline-checkpoint-path runs/pointnext_surface_heatmap_d256/fold0_seed42/best_landmarks.pt \
+  --cascade-checkpoint-path runs/landmark_token_cascade/stage1/fold0_seed42/best_landmarks.pt \
+  --prior-path artifacts/pca_projection/fold0/prior.npz \
+  --prior-manifest artifacts/pca_projection/fold0/manifest.json \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --components 32 \
+  --beta 0.5 \
+  --gate-features entropy inverse_peak_probability inverse_peak_margin spatial_spread_mm refinement_shift_mm pca_correction_mm model_disagreement_mm \
+  --gate-scopes ear landmark \
+  --gate-quantiles 0.50 0.65 0.80 0.90 \
+  --gate-blends 0.25 0.50 0.75 1.0 \
+  --projection-shortlist 24 \
+  --projection-workers 10 \
+  --run-seed 42 \
+  --device auto \
+  --output runs/pca_projection/landmark_token_cascade/confidence_gate/fold0_seed42.json
+```
+
+The report includes exact baseline and cascade endpoints, uncertainty/error and
+uncertainty/cascade-gain correlations, every unprojected gate result, the exact
+projected shortlist, and per-ear selected results. A grid-screen winner must be
+fixed before confirmation. Confirm another fold/seed by passing exactly one
+feature, scope, quantile, and blend from the Fold-0 `selected` block; selecting
+a new configuration independently on every validation fold is not valid.
+
 ### Geodesic heatmap and surface-vector voting screen
 
 Prepare the Fold-0 cache once. The command is resumable and reuses only entries
