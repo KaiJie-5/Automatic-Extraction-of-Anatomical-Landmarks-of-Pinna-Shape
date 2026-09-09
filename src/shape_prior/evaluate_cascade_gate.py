@@ -777,13 +777,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"Projected gate configuration {index}/{len(projected_names)}: {name}"
             )
 
-    selected_name = min(
-        projected_names,
-        key=lambda name: (
-            configurations[name]["pca_projected"]["pooled_md_mm"],
-            configurations[name]["pca_projected"]["ear_distribution_mm"]["p95"],
-            name,
-        ),
+    fixed_confirmation = len(grid_names) == 1
+    selected_name = (
+        grid_names[0]
+        if fixed_confirmation
+        else min(
+            projected_names,
+            key=lambda name: (
+                configurations[name]["pca_projected"]["pooled_md_mm"],
+                configurations[name]["pca_projected"]["ear_distribution_mm"]["p95"],
+                name,
+            ),
+        )
     )
     baseline_projected = projected_error_cache["baseline"]
     cascade_projected = projected_error_cache["cascade"]
@@ -818,11 +823,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "selected_improvement_mm": float(baseline_ear[index] - selected_ear[index]),
         }
 
-    selection_mode = (
-        "fixed_confirmation"
-        if len(grid_names) == 1
-        else "fold0_grid_screen"
-    )
+    selection_mode = "fixed_confirmation" if fixed_confirmation else "fold0_grid_screen"
     report = {
         "schema_version": 1,
         "component": "fold_confidence_gated_landmark_cascade_evaluation",
