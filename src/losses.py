@@ -337,6 +337,11 @@ def proposal_landmark_loss(
     curve_arc_weight: float = 0.0,
     curve_sigma_mm: float = 3.0,
     curve_arc_radius_mm: float = 4.0,
+    cascade_aux_predictions: Optional[torch.Tensor] = None,
+    cascade_aux_logits: Optional[torch.Tensor] = None,
+    cascade_coordinate_weight: float = 0.0,
+    cascade_heatmap_weight: float = 0.0,
+    cascade_heatmap_sigma_mm: float = 2.0,
 ) -> Mapping[str, torch.Tensor]:
     base = mean_distance_mm(prediction, target, scale_mm)
     anchor = anchor_distance_mm(prediction, target, scale_mm) if anchor_weight else base.new_zeros(())
@@ -419,6 +424,60 @@ def proposal_landmark_loss(
         )
     else:
         curve_arc = base.new_zeros(())
+    if cascade_coordinate_weight:
+        if (
+            cascade_aux_predictions is None
+            or cascade_aux_predictions.ndim != 4
+            or cascade_aux_predictions.shape[0] != target.shape[0]
+            or tuple(cascade_aux_predictions.shape[2:]) != (85, 3)
+        ):
+            raise ValueError(
+                "cascade coordinate supervision requires shape (B, stages, 85, 3)"
+            )
+        cascade_coordinate = torch.stack(
+            [
+                mean_distance_mm(stage, target, scale_mm)
+                for stage in cascade_aux_predictions.unbind(dim=1)
+            ]
+        ).mean()
+    else:
+        cascade_coordinate = base.new_zeros(())
+    if cascade_heatmap_weight:
+        if (
+            cascade_aux_logits is None
+            or cascade_aux_logits.ndim != 4
+            or cascade_aux_logits.shape[0] != target.shape[0]
+            or cascade_aux_logits.shape[2] != 85
+            or heatmap_surface_points is None
+            or cascade_aux_logits.shape[3] != heatmap_surface_points.shape[1]
+        ):
+            raise ValueError(
+                "cascade heatmap supervision requires logits shaped "
+                "(B, stages, 85, N) and matching surface points"
+            )
+        cascade_heatmaps = []
+        for stage_logits in cascade_aux_logits.unbind(dim=1):
+            if heatmap_geodesic_distances_mm is None:
+                cascade_heatmaps.append(
+                    surface_heatmap_kl(
+                        stage_logits,
+                        heatmap_surface_points,
+                        target,
+                        scale_mm,
+                        cascade_heatmap_sigma_mm,
+                    )
+                )
+            else:
+                cascade_heatmaps.append(
+                    surface_geodesic_heatmap_kl(
+                        stage_logits,
+                        heatmap_geodesic_distances_mm,
+                        cascade_heatmap_sigma_mm,
+                    )
+                )
+        cascade_heatmap = torch.stack(cascade_heatmaps).mean()
+    else:
+        cascade_heatmap = base.new_zeros(())
     total = (
         base
         + anchor_weight * anchor
@@ -428,6 +487,8 @@ def proposal_landmark_loss(
         + vote_weight * vote
         + curve_weight * curve
         + curve_arc_weight * curve_arc
+        + cascade_coordinate_weight * cascade_coordinate
+        + cascade_heatmap_weight * cascade_heatmap
     )
     return {
         "total": total,
@@ -439,6 +500,8 @@ def proposal_landmark_loss(
         "vote": vote,
         "curve": curve,
         "curve_arc": curve_arc,
+        "cascade_coordinate": cascade_coordinate,
+        "cascade_heatmap": cascade_heatmap,
     }
 
 

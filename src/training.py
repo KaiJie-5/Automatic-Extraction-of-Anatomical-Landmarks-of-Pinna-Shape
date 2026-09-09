@@ -239,6 +239,10 @@ def probe_batch_size(
                         curve_arc_coordinates = details.get(
                             "curve_arc_coordinates"
                         )
+                        cascade_aux_predictions = details.get(
+                            "cascade_aux_predictions"
+                        )
+                        cascade_aux_logits = details.get("cascade_aux_logits")
                     else:
                         output = model(face_features, neighbors) if "face_features" in sample else model(points)
                         heatmap_logits = None
@@ -246,6 +250,8 @@ def probe_batch_size(
                         vote_offsets = None
                         curve_logits = None
                         curve_arc_coordinates = None
+                        cascade_aux_predictions = None
+                        cascade_aux_logits = None
                     (
                         output,
                         target,
@@ -295,6 +301,11 @@ def probe_batch_size(
                         curve_arc_weight=float(landmark_loss_weights.get("curve_arc", 0.0)),
                         curve_sigma_mm=float(landmark_loss_weights.get("curve_sigma_mm", 3.0)),
                         curve_arc_radius_mm=float(landmark_loss_weights.get("curve_arc_radius_mm", 4.0)),
+                        cascade_aux_predictions=cascade_aux_predictions,
+                        cascade_aux_logits=cascade_aux_logits,
+                        cascade_coordinate_weight=float(landmark_loss_weights.get("cascade_coordinate", 0.0)),
+                        cascade_heatmap_weight=float(landmark_loss_weights.get("cascade_heatmap", 0.0)),
+                        cascade_heatmap_sigma_mm=float(landmark_loss_weights.get("cascade_heatmap_sigma_mm", 2.0)),
                     )["total"]
                 probe_loss.backward()
             model.zero_grad(set_to_none=True)
@@ -831,6 +842,8 @@ def train_landmarks(
             "vote": 0.0,
             "curve": 0.0,
             "curve_arc": 0.0,
+            "cascade_coordinate": 0.0,
+            "cascade_heatmap": 0.0,
         }
         count = 0
         for step, batch in enumerate(loader, 1):
@@ -868,6 +881,10 @@ def train_landmarks(
                         curve_arc_coordinates = details.get(
                             "curve_arc_coordinates"
                         )
+                        cascade_aux_predictions = details.get(
+                            "cascade_aux_predictions"
+                        )
+                        cascade_aux_logits = details.get("cascade_aux_logits")
                     else:
                         prediction = model(face_features, neighbors) if "face_features" in batch else model(points)
                         heatmap_logits = None
@@ -875,6 +892,8 @@ def train_landmarks(
                         vote_offsets = None
                         curve_logits = None
                         curve_arc_coordinates = None
+                        cascade_aux_predictions = None
+                        cascade_aux_logits = None
                     (
                         prediction,
                         target,
@@ -923,6 +942,11 @@ def train_landmarks(
                         curve_arc_weight=float(loss_weights.get("curve_arc", 0.0)),
                         curve_sigma_mm=float(loss_weights.get("curve_sigma_mm", 3.0)),
                         curve_arc_radius_mm=float(loss_weights.get("curve_arc_radius_mm", 4.0)),
+                        cascade_aux_predictions=cascade_aux_predictions,
+                        cascade_aux_logits=cascade_aux_logits,
+                        cascade_coordinate_weight=float(loss_weights.get("cascade_coordinate", 0.0)),
+                        cascade_heatmap_weight=float(loss_weights.get("cascade_heatmap", 0.0)),
+                        cascade_heatmap_sigma_mm=float(loss_weights.get("cascade_heatmap_sigma_mm", 2.0)),
                     )
                 if training:
                     scaler.scale(losses["total"] / accumulation).backward()

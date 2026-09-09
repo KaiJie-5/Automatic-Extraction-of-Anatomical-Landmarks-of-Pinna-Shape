@@ -199,6 +199,16 @@ baseline:
   two-stage experiment; the saved model configuration reconstructs it for
   evaluation and resume. The default remains `geometry-offset`, preserving old
   checkpoints exactly.
+- `--cascade-stages 1` adds a within-ear landmark-token cascade before the
+  established K=32 geometry refiner. Each stage pools decoded D256 surface
+  features using the preceding heatmap and a soft spatial radius, exchanges
+  information among all 85 landmark tokens with contour-aware self-attention,
+  and predicts a residual heatmap over the complete sampled surface. It never
+  hard-crops candidates. The residual starts at zero, so a warm-started model
+  initially reproduces the established heatmap output exactly. Intermediate
+  coordinate and heatmap supervision are mandatory. Cascade, bilateral,
+  feature-attention-refiner, continuous-curve, and surface-voting modes remain
+  separate controlled experiments.
 - `prepare-geodesic-targets` projects each annotation to its exact crop
   triangle and precomputes topology-respecting shortest-path fields from
   virtual triangle sources. The generated manifest is bound to the fold,
@@ -239,6 +249,93 @@ three of five fold means improve.
 These decoder/refiner controls are research experiments. Screen each on outer
 fold 0/seed 42, always compare the final PCA-then-projected result to the matching
 1.333987 mm reference, and do not combine individually unpromoted changes.
+
+### Within-ear landmark-token cascade screen
+
+This candidate changes only the heatmap-query refinement. It retains the
+Fold-0 locator predictions, crop calibration, PointNeXt-S C32 backbone, D256
+surface decoder, 16,384 points, four heads, spacing loss 0.01, K=32 geometry
+refinement, fold-safe PCA prior, and exact triangle projection. The optional
+initializer fails before training unless the supplied non-cascade checkpoint
+matches the requested fold, artifacts, model, point count, and baseline losses.
+
+Train the one-stage Fold-0/seed-42 screen from the established D256 checkpoint:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm fit-landmarks \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --outer-fold 0 \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --initialize-from-checkpoint runs/pointnext_surface_heatmap_d256/fold0_seed42/best_landmarks.pt \
+  --output-dir runs/landmark_token_cascade/stage1/fold0_seed42 \
+  --backbone pointnext \
+  --pointnext-variant s \
+  --landmark-decoder surface-heatmap \
+  --heatmap-feature-dim 256 \
+  --heatmap-topk 64 \
+  --heatmap-coordinate-temperature 1 \
+  --heatmap-weight 0.1 \
+  --heatmap-sigma-mm 2 \
+  --heatmap-distance euclidean \
+  --cascade-stages 1 \
+  --cascade-attention-heads 8 \
+  --cascade-radius-mm 8 \
+  --cascade-radius-decay 0.5 \
+  --cascade-dropout 0 \
+  --cascade-coordinate-weight 0.25 \
+  --cascade-heatmap-weight 0.05 \
+  --cascade-heatmap-sigma-mm 2 \
+  --no-surface-voting \
+  --four-heads \
+  --no-augment \
+  --refinement-k 32 \
+  --refinement-anchor raw \
+  --refinement-mode geometry-offset \
+  --anchor-weight 0 \
+  --spacing-weight 0.01 \
+  --surface-weight 0 \
+  --num-points 16384 \
+  --learning-rate 0.0003 \
+  --encoder-learning-rate 0.0001 \
+  --weight-decay 0.0001 \
+  --warmup-epochs 5 \
+  --minimum-learning-rate 0.000001 \
+  --gradient-clip-norm 1 \
+  --effective-batch-size 32 \
+  --batch-size 0 \
+  --seed 42 \
+  --epochs 200 \
+  --patience 30 \
+  --workers 10 \
+  --amp
+```
+
+Evaluate the unchanged deployment order of independent PCA followed by exact
+triangle projection:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm evaluate-pca-prior \
+  --checkpoint-path runs/landmark_token_cascade/stage1/fold0_seed42/best_landmarks.pt \
+  --prior-path artifacts/pca_projection/fold0/prior.npz \
+  --prior-manifest artifacts/pca_projection/fold0/manifest.json \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --components 32 \
+  --beta 0.5 \
+  --run-seed 42 \
+  --device auto \
+  --output runs/pca_projection/landmark_token_cascade/stage1/fold0_seed42.json
+```
+
+Do not run the two-stage cascade yet. Continue only if the one-stage final
+PCA-projected MD improves the matching D256 Fold-0 report by about 0.02 mm and
+does not materially worsen P95 or maximum ear error.
 
 ### Geodesic heatmap and surface-vector voting screen
 

@@ -35,7 +35,8 @@
     "surface_heatmap_decoder_width",
     "feature_aware_surface_refinement",
     "geodesic_heatmap_candidate_diagnostic",
-    "geodesic_heatmap_surface_vector_voting"
+    "geodesic_heatmap_surface_vector_voting",
+    "landmark_token_heatmap_cascade"
   ],
   "auxiliary_weight_grid": [0.01, 0.05, 0.1],
   "local_refinement_k": [32, 64],
@@ -105,6 +106,22 @@
       "vote_weight": 0.1,
       "vote_fusion": "three_iteration_weighted_geometric_median",
       "vote_fusion_epsilon_mm": 0.25,
+      "postprocess": ["independent_pca_32_beta_0.5", "exact_surface_projection"]
+    },
+    "landmark_token_heatmap_cascade": {
+      "screening_fold": 0,
+      "screening_seed": 42,
+      "initialization": "matching_non_cascade_d256_best_checkpoint",
+      "fixed_backbone": "pointnext_s_c32",
+      "fixed_heatmap_feature_dim": 256,
+      "fixed_refinement_k": 32,
+      "cascade_stages": 1,
+      "landmark_attention_heads": 8,
+      "soft_surface_radius_mm": 8.0,
+      "hard_surface_crop": false,
+      "intermediate_coordinate_weight": 0.25,
+      "intermediate_heatmap_weight": 0.05,
+      "intermediate_heatmap_sigma_mm": 2.0,
       "postprocess": ["independent_pca_32_beta_0.5", "exact_surface_projection"]
     }
   },

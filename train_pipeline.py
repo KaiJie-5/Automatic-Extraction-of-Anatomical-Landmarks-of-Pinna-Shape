@@ -139,6 +139,7 @@ def landmark_model_config(
     decoder = str(getattr(args, "landmark_decoder", "coordinate-regression"))
     surface_decoder = decoder in {"surface-heatmap", "surface-curve"}
     bilateral_mode = str(getattr(args, "bilateral_mode", "none"))
+    cascade_stages = int(getattr(args, "cascade_stages", 0))
     if bilateral_mode != "none" and (
         args.backbone != "pointnext" or decoder != "surface-heatmap"
     ):
@@ -154,6 +155,28 @@ def landmark_model_config(
         raise ValueError(
             "--bilateral-attention-heads must divide --heatmap-feature-dim"
         )
+    if cascade_stages:
+        if args.backbone != "pointnext" or decoder != "surface-heatmap":
+            raise ValueError(
+                "--cascade-stages requires --backbone pointnext and "
+                "--landmark-decoder surface-heatmap"
+            )
+        if bilateral_mode != "none":
+            raise ValueError(
+                "landmark-token cascade and --bilateral-mode are separate experiments"
+            )
+        if str(args.refinement_mode) != "geometry-offset":
+            raise ValueError(
+                "landmark-token cascade requires --refinement-mode geometry-offset"
+            )
+        if bool(getattr(args, "surface_voting", False)):
+            raise ValueError(
+                "landmark-token cascade and --surface-voting are separate experiments"
+            )
+        if int(args.heatmap_feature_dim) % int(args.cascade_attention_heads):
+            raise ValueError(
+                "--cascade-attention-heads must divide --heatmap-feature-dim"
+            )
     if surface_decoder and args.backbone != "pointnext":
         raise ValueError(
             "--landmark-decoder surface-heatmap/surface-curve requires "
@@ -243,6 +266,15 @@ def landmark_model_config(
             "refinement_stages": int(args.refinement_stages),
             "refinement_hidden_dim": int(args.refinement_hidden_dim),
             "refinement_temperature": float(args.refinement_temperature),
+            "cascade_stages": cascade_stages,
+            "cascade_attention_heads": int(args.cascade_attention_heads),
+            "cascade_radius_normalized": (
+                float(args.cascade_radius_mm) / local_scale
+                if cascade_stages
+                else 0.0
+            ),
+            "cascade_radius_decay": float(args.cascade_radius_decay),
+            "cascade_dropout": float(args.cascade_dropout),
         }
         if decoder == "surface-curve":
             if curve_landmark_fractions is None:
@@ -310,6 +342,23 @@ def landmark_loss_config(args) -> dict:
     heatmap_distance = str(getattr(args, "heatmap_distance", "euclidean"))
     geodesic_cache_dir = getattr(args, "geodesic_cache_dir", None)
     surface_voting = bool(getattr(args, "surface_voting", False))
+    cascade_stages = int(getattr(args, "cascade_stages", 0))
+    cascade_coordinate_weight = float(
+        getattr(args, "cascade_coordinate_weight", 0.0)
+    )
+    cascade_heatmap_weight = float(
+        getattr(args, "cascade_heatmap_weight", 0.0)
+    )
+    if cascade_stages:
+        if cascade_coordinate_weight <= 0.0 or cascade_heatmap_weight <= 0.0:
+            raise ValueError(
+                "landmark-token cascade requires positive "
+                "--cascade-coordinate-weight and --cascade-heatmap-weight"
+            )
+    elif cascade_coordinate_weight != 0.0 or cascade_heatmap_weight != 0.0:
+        raise ValueError(
+            "cascade auxiliary weights require --cascade-stages"
+        )
     vote_weight = float(getattr(args, "vote_weight", 0.0))
     vote_radius_mm = float(getattr(args, "vote_radius_mm", 6.0))
     vote_cap_mm = float(getattr(args, "vote_cap_mm", 6.0))
@@ -369,6 +418,11 @@ def landmark_loss_config(args) -> dict:
         "curve_sigma_mm": float(getattr(args, "curve_sigma_mm", 3.0)),
         "curve_arc_radius_mm": float(
             getattr(args, "curve_arc_radius_mm", 4.0)
+        ),
+        "cascade_coordinate": cascade_coordinate_weight,
+        "cascade_heatmap": cascade_heatmap_weight,
+        "cascade_heatmap_sigma_mm": float(
+            getattr(args, "cascade_heatmap_sigma_mm", 2.0)
         ),
     }
 
@@ -833,6 +887,139 @@ def command_prepare_geodesic_targets(args):
     )
 
 
+_CASCADE_MODEL_CONFIG_KEYS = {
+    "cascade_stages",
+    "cascade_attention_heads",
+    "cascade_radius_normalized",
+    "cascade_radius_decay",
+    "cascade_dropout",
+}
+
+
+def _initialize_cascade_from_checkpoint(
+    model,
+    checkpoint_path: str,
+    model_config: Mapping[str, object],
+    data_config: Mapping[str, object],
+    loss_weights: Mapping[str, object],
+) -> dict:
+    """Load only a structurally and fold-identical non-cascade baseline."""
+
+    if int(model_config.get("cascade_stages", 0)) <= 0:
+        raise ValueError(
+            "--initialize-from-checkpoint is only valid with --cascade-stages"
+        )
+    path = Path(checkpoint_path)
+    checkpoint = torch.load(path, map_location="cpu")
+    if (
+        checkpoint.get("component_schema_version") != 1
+        or checkpoint.get("component") != "landmarks"
+    ):
+        raise ValueError(
+            "cascade initialization requires a component-schema-1 landmark checkpoint"
+        )
+    source_config = dict(checkpoint.get("model_config", {}))
+    if int(source_config.get("cascade_stages", 0)) != 0:
+        raise ValueError(
+            "cascade initialization source must be the non-cascade baseline"
+        )
+    target_base = {
+        key: value
+        for key, value in model_config.items()
+        if key not in _CASCADE_MODEL_CONFIG_KEYS
+    }
+    source_base = {
+        key: value
+        for key, value in source_config.items()
+        if key not in _CASCADE_MODEL_CONFIG_KEYS
+    }
+    def same_serialized_value(left, right) -> bool:
+        return json.dumps(
+            left, sort_keys=True, default=_json_default
+        ) == json.dumps(right, sort_keys=True, default=_json_default)
+
+    config_mismatches = [
+        key
+        for key, value in source_base.items()
+        if key not in target_base
+        or not same_serialized_value(target_base[key], value)
+    ]
+    if config_mismatches:
+        raise ValueError(
+            "cascade initialization model does not match the requested baseline: "
+            + ", ".join(sorted(config_mismatches))
+        )
+
+    source_data = dict(checkpoint.get("data_config", {}))
+    for key in ("outer_fold", "train_ids", "validation_ids", "num_points"):
+        if source_data.get(key) != data_config.get(key):
+            raise ValueError(
+                f"cascade initialization {key} does not match the current fold"
+            )
+    source_checksums = source_data.get("artifact_checksums")
+    if not isinstance(source_checksums, Mapping):
+        raise ValueError(
+            "cascade initialization checkpoint lacks artifact checksums"
+        )
+    if dict(source_checksums) != dict(data_config["artifact_checksums"]):
+        raise ValueError(
+            "cascade initialization folds/predictions/calibration checksums differ"
+        )
+    source_losses = source_data.get("loss_weights")
+    if not isinstance(source_losses, Mapping):
+        raise ValueError(
+            "cascade initialization checkpoint lacks its baseline loss configuration"
+        )
+    baseline_loss_keys = (
+        "anchor",
+        "spacing",
+        "surface",
+        "heatmap",
+        "heatmap_sigma_mm",
+        "heatmap_distance",
+    )
+    backward_loss_defaults = {"heatmap_distance": "euclidean"}
+    loss_mismatches = [
+        key
+        for key in baseline_loss_keys
+        if source_losses.get(key, backward_loss_defaults.get(key))
+        != loss_weights.get(key)
+    ]
+    if loss_mismatches:
+        raise ValueError(
+            "cascade initialization baseline losses differ: "
+            + ", ".join(loss_mismatches)
+        )
+
+    incompatible = model.load_state_dict(
+        checkpoint["model_state_dict"], strict=False
+    )
+    unexpected = list(incompatible.unexpected_keys)
+    missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith("cascade_layers.")
+    ]
+    if unexpected or missing:
+        raise ValueError(
+            "cascade initialization state dictionary is incompatible; "
+            f"unexpected={unexpected}, missing_non_cascade={missing}"
+        )
+    source_best = checkpoint.get("metrics", {}).get("best_md_mm")
+    return {
+        "source_checkpoint": str(path),
+        "source_checkpoint_sha256": file_sha256(path),
+        "source_epoch": int(checkpoint.get("epoch", 0)),
+        "source_best_md_mm": (
+            float(source_best) if source_best is not None else None
+        ),
+        "loaded_non_cascade_state_key_count": len(
+            checkpoint["model_state_dict"]
+        ),
+        "new_cascade_state_keys": list(incompatible.missing_keys),
+    }
+
+
 def command_fit_landmarks(args):
     seed_everything(args.seed)
     device = resolve_device(args.device)
@@ -900,6 +1087,14 @@ def command_fit_landmarks(args):
             ),
             "method": geodesic_manifest["method"],
         }
+    if args.initialize_from_checkpoint:
+        data_config["initialization"] = _initialize_cascade_from_checkpoint(
+            model,
+            args.initialize_from_checkpoint,
+            model_config,
+            data_config,
+            loss_weights,
+        )
     metrics = train_landmarks(
         model, train_data, validation_data, args.output_dir, model_config, data_config,
         loss_weights, device,
@@ -2053,6 +2248,58 @@ def add_landmark_model_arguments(parser):
         help="Gaussian target standard deviation in original millimetres",
     )
     parser.add_argument(
+        "--cascade-stages",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help=(
+            "full-surface landmark-token residual heatmap stages; zero "
+            "preserves the established decoder exactly"
+        ),
+    )
+    parser.add_argument(
+        "--cascade-attention-heads",
+        type=positive_integer,
+        default=8,
+        help="within-ear landmark-token self-attention heads",
+    )
+    parser.add_argument(
+        "--cascade-radius-mm",
+        type=positive_float,
+        default=8.0,
+        help="first-stage soft spatial-attention radius in original millimetres",
+    )
+    parser.add_argument(
+        "--cascade-radius-decay",
+        type=unit_float,
+        default=0.5,
+        help="multiplicative soft-radius reduction for each later cascade stage",
+    )
+    parser.add_argument(
+        "--cascade-dropout",
+        type=unit_float,
+        default=0.0,
+        help="landmark-token attention/MLP dropout",
+    )
+    parser.add_argument(
+        "--cascade-coordinate-weight",
+        type=nonnegative_float,
+        default=0.0,
+        help="intermediate coordinate-MD supervision weight",
+    )
+    parser.add_argument(
+        "--cascade-heatmap-weight",
+        type=nonnegative_float,
+        default=0.0,
+        help="intermediate surface-heatmap supervision weight",
+    )
+    parser.add_argument(
+        "--cascade-heatmap-sigma-mm",
+        type=positive_float,
+        default=2.0,
+        help="Gaussian width for pre-cascade heatmap supervision",
+    )
+    parser.add_argument(
         "--heatmap-distance",
         choices=("euclidean", "geodesic"),
         default="euclidean",
@@ -2305,6 +2552,13 @@ def build_parser():
     landmarks.add_argument("--predictions-json", required=True)
     landmarks.add_argument("--calibration-json", required=True)
     landmarks.add_argument("--output-dir", required=True)
+    landmarks.add_argument(
+        "--initialize-from-checkpoint",
+        help=(
+            "optional matching non-cascade best_landmarks.pt used to initialize "
+            "the established backbone/decoder/refiner weights"
+        ),
+    )
     landmarks.set_defaults(function=command_fit_landmarks)
 
     final = subparsers.add_parser("fit-final")

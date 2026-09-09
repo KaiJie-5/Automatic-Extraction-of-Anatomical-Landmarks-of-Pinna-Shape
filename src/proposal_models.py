@@ -300,6 +300,184 @@ class FeatureAwareSurfaceRefiner(nn.Module):
         return current, torch.stack(predictions, dim=1)
 
 
+def _landmark_cascade_metadata() -> torch.Tensor:
+    """Return fixed contour identity, position, and section-anchor metadata."""
+
+    metadata = torch.zeros(85, 6, dtype=torch.float32)
+    section_anchors = {
+        0, 6, 22, 24, 25, 33, 42, 46, 50, 54, 55, 64, 74, 75, 84
+    }
+    start = 0
+    for contour, length in enumerate(CONTOUR_LENGTHS):
+        stop = start + int(length)
+        metadata[start:stop, contour] = 1.0
+        if length > 1:
+            metadata[start:stop, 4] = torch.linspace(0.0, 1.0, int(length))
+        start = stop
+    metadata[list(sorted(section_anchors)), 5] = 1.0
+    return metadata
+
+
+def _landmark_cascade_attention_bias() -> torch.Tensor:
+    """Softly favour same-contour neighbours without forbidding global context."""
+
+    metadata = _landmark_cascade_metadata()
+    contour = metadata[:, :4].argmax(dim=1)
+    position = metadata[:, 4]
+    same_contour = contour[:, None] == contour[None, :]
+    within_contour = -2.0 * torch.abs(position[:, None] - position[None, :])
+    bias = torch.full((85, 85), -2.5, dtype=torch.float32)
+    bias = torch.where(same_contour, within_contour, bias)
+    bias.fill_diagonal_(0.0)
+    return bias
+
+
+class SurfaceHeatmapLandmarkCascadeStage(nn.Module):
+    """One full-surface, landmark-token residual heatmap refinement stage.
+
+    The previous heatmap and coordinate define a soft spatial prior, never a
+    hard crop, so a poor coarse hypothesis cannot remove the correct surface
+    region. Landmark self-attention communicates contour context before a
+    zero-initialized residual updates all 85 surface heatmaps.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        attention_heads: int,
+        radius_normalized: float,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        feature_dim = int(feature_dim)
+        attention_heads = int(attention_heads)
+        radius_normalized = float(radius_normalized)
+        dropout = float(dropout)
+        if feature_dim <= 0 or attention_heads <= 0:
+            raise ValueError("cascade feature width and attention heads must be positive")
+        if feature_dim % attention_heads:
+            raise ValueError("cascade attention heads must divide heatmap_feature_dim")
+        if not math.isfinite(radius_normalized) or radius_normalized <= 0.0:
+            raise ValueError("cascade radius must be positive and finite")
+        if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
+            raise ValueError("cascade dropout must be finite and in [0, 1)")
+
+        self.radius_normalized = radius_normalized
+        self.logit_scale = feature_dim ** -0.5
+        self.coordinate_projection = nn.Linear(3, feature_dim)
+        self.uncertainty_projection = nn.Linear(2, feature_dim)
+        self.metadata_projection = nn.Linear(6, feature_dim)
+        self.surface_context_projection = nn.Linear(feature_dim, feature_dim)
+        self.cross_norm = nn.LayerNorm(feature_dim)
+        self.cross_feed_forward = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feature_dim * 4, feature_dim),
+        )
+        self.cross_output_norm = nn.LayerNorm(feature_dim)
+        self.landmark_attention = nn.MultiheadAttention(
+            feature_dim,
+            attention_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.landmark_attention_norm = nn.LayerNorm(feature_dim)
+        self.landmark_feed_forward = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feature_dim * 4, feature_dim),
+        )
+        self.landmark_output_norm = nn.LayerNorm(feature_dim)
+        self.residual_query_projection = nn.Linear(feature_dim, feature_dim)
+        # This makes Stage 0 and the cascaded model exactly equal before the
+        # first update instead of introducing a random initial displacement.
+        nn.init.zeros_(self.residual_query_projection.weight)
+        nn.init.zeros_(self.residual_query_projection.bias)
+        self.register_buffer(
+            "landmark_metadata",
+            _landmark_cascade_metadata(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "landmark_attention_bias",
+            _landmark_cascade_attention_bias(),
+            persistent=False,
+        )
+
+    @staticmethod
+    def _uncertainty(logits: torch.Tensor) -> torch.Tensor:
+        log_probabilities = torch.log_softmax(logits.float(), dim=-1)
+        probabilities = torch.exp(log_probabilities)
+        confidence = probabilities.amax(dim=-1)
+        denominator = max(math.log(max(int(logits.shape[-1]), 2)), 1.0)
+        entropy = -(probabilities * log_probabilities).sum(dim=-1) / denominator
+        return torch.stack([confidence, entropy], dim=-1)
+
+    def forward(
+        self,
+        previous_logits: torch.Tensor,
+        current_coordinates: torch.Tensor,
+        xyz: torch.Tensor,
+        point_features: torch.Tensor,
+        query_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if query_state.ndim == 2:
+            query_state = query_state.unsqueeze(0).expand(
+                previous_logits.shape[0], -1, -1
+            )
+        if query_state.ndim != 3 or query_state.shape[1] != 85:
+            raise ValueError("cascade landmark tokens must have shape (B, 85, D)")
+
+        # Every surface candidate remains available. The Gaussian term only
+        # biases attention towards the current hypothesis.
+        squared_distance = torch.cdist(
+            current_coordinates.float(), xyz.float()
+        ).square()
+        spatial_bias = -squared_distance / (
+            2.0 * self.radius_normalized * self.radius_normalized
+        )
+        surface_attention = torch.softmax(
+            previous_logits.float() + spatial_bias, dim=-1
+        )
+        surface_context = torch.einsum(
+            "bln,bnd->bld", surface_attention, point_features.float()
+        )
+        metadata = self.landmark_metadata.to(
+            device=query_state.device, dtype=query_state.dtype
+        ).unsqueeze(0)
+        combined = (
+            query_state
+            + self.coordinate_projection(current_coordinates.to(query_state.dtype))
+            + self.uncertainty_projection(
+                self._uncertainty(previous_logits).to(query_state.dtype)
+            )
+            + self.metadata_projection(metadata)
+            + self.surface_context_projection(surface_context.to(query_state.dtype))
+        )
+        hidden = self.cross_norm(combined)
+        hidden = self.cross_output_norm(hidden + self.cross_feed_forward(hidden))
+        attended, _ = self.landmark_attention(
+            hidden,
+            hidden,
+            hidden,
+            attn_mask=self.landmark_attention_bias.to(
+                device=hidden.device, dtype=hidden.dtype
+            ),
+            need_weights=False,
+        )
+        hidden = self.landmark_attention_norm(hidden + attended)
+        next_query = self.landmark_output_norm(
+            hidden + self.landmark_feed_forward(hidden)
+        )
+        residual_query = self.residual_query_projection(next_query)
+        residual_logits = torch.einsum(
+            "bnd,bld->bln", point_features, residual_query
+        ) * self.logit_scale
+        return previous_logits.float() + residual_logits.float(), next_query
+
+
 def _three_neighbour_interpolate(
     fine_xyz: torch.Tensor,
     coarse_xyz: torch.Tensor,
@@ -390,6 +568,11 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         refinement_stages: int = 1,
         refinement_hidden_dim: int = 128,
         refinement_temperature: float = 1.0,
+        cascade_stages: int = 0,
+        cascade_attention_heads: int = 8,
+        cascade_radius_normalized: float = 0.0,
+        cascade_radius_decay: float = 0.5,
+        cascade_dropout: float = 0.0,
     ):
         super().__init__()
         heatmap_feature_dim = int(heatmap_feature_dim)
@@ -459,6 +642,41 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
             )
         self.refinement_mode = refinement_mode
         self.curve_enabled = bool(curve_enabled)
+        cascade_stages = int(cascade_stages)
+        cascade_attention_heads = int(cascade_attention_heads)
+        cascade_radius_normalized = float(cascade_radius_normalized)
+        cascade_radius_decay = float(cascade_radius_decay)
+        cascade_dropout = float(cascade_dropout)
+        if cascade_stages not in {0, 1, 2}:
+            raise ValueError("surface heatmap cascade supports zero, one, or two stages")
+        if cascade_stages and self.curve_enabled:
+            raise ValueError(
+                "landmark-token cascade and continuous curve decoding are separate experiments"
+            )
+        if cascade_stages and refinement_mode != "geometry-offset":
+            raise ValueError(
+                "landmark-token cascade requires geometry-offset final refinement"
+            )
+        if cascade_stages and (
+            cascade_attention_heads <= 0
+            or heatmap_feature_dim % cascade_attention_heads
+        ):
+            raise ValueError(
+                "cascade attention heads must divide heatmap_feature_dim"
+            )
+        if cascade_stages and (
+            not math.isfinite(cascade_radius_normalized)
+            or cascade_radius_normalized <= 0.0
+        ):
+            raise ValueError("landmark-token cascade requires a positive radius")
+        if (
+            not math.isfinite(cascade_radius_decay)
+            or not 0.0 < cascade_radius_decay <= 1.0
+        ):
+            raise ValueError("cascade radius decay must be in (0, 1]")
+        if not math.isfinite(cascade_dropout) or not 0.0 <= cascade_dropout < 1.0:
+            raise ValueError("cascade dropout must be finite and in [0, 1)")
+        self.cascade_stage_count = cascade_stages
         self.curve_logit_weight = float(curve_logit_weight)
         self.curve_arc_logit_weight = float(curve_arc_logit_weight)
         self.curve_arc_temperature = float(curve_arc_temperature)
@@ -547,6 +765,17 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         for queries in self.query_embeddings:
             nn.init.trunc_normal_(queries, std=0.02)
         self.logit_scale = heatmap_feature_dim ** -0.5
+        self.cascade_layers = nn.ModuleList(
+            [
+                SurfaceHeatmapLandmarkCascadeStage(
+                    heatmap_feature_dim,
+                    cascade_attention_heads,
+                    cascade_radius_normalized * (cascade_radius_decay ** index),
+                    cascade_dropout,
+                )
+                for index in range(cascade_stages)
+            ]
+        )
         if self.surface_voting:
             self.vote_query_projections = nn.ModuleList(
                 [
@@ -754,15 +983,35 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
         logits = self._apply_curve_structure(
             unary_logits, curve_logits, curve_arc_coordinates
         )
-        vote_offsets = self._vote_offsets(point_features, query_features)
         xyz = levels["xyz"][0]
-        coarse = self.decode_surface_coordinates(logits, xyz, vote_offsets)
+        initial_prediction = self.decode_surface_coordinates(logits, xyz)
+        cascade_predictions = []
+        cascade_logits = []
+        current = initial_prediction
+        current_query = query_features
+        for cascade_layer in self.cascade_layers:
+            cascade_logits.append(logits)
+            cascade_predictions.append(current)
+            logits, current_query = cascade_layer(
+                logits,
+                current,
+                xyz,
+                point_features,
+                current_query,
+            )
+            current = self.decode_surface_coordinates(logits, xyz)
+        vote_offsets = self._vote_offsets(point_features, current_query)
+        coarse = (
+            self.decode_surface_coordinates(logits, xyz, vote_offsets)
+            if vote_offsets is not None
+            else current
+        )
         final, refinement_predictions = self.apply_refinement(
             coarse,
             points,
             point_features,
             logits,
-            query_features,
+            current_query,
         )
         details = {
             "coarse": coarse,
@@ -771,8 +1020,17 @@ class PointNeXtSurfaceHeatmapRegressor(nn.Module):
             "unary_heatmap_logits": unary_logits,
             "surface_candidates": xyz,
             "decoded_point_features": point_features,
-            "landmark_query_features": query_features,
+            "landmark_query_features": current_query,
         }
+        if cascade_predictions:
+            details["cascade_initial_prediction"] = initial_prediction
+            details["cascade_aux_predictions"] = torch.stack(
+                cascade_predictions, dim=1
+            )
+            details["cascade_aux_logits"] = torch.stack(cascade_logits, dim=1)
+            details["cascade_stage_predictions"] = torch.stack(
+                cascade_predictions[1:] + [coarse], dim=1
+            )
         if refinement_predictions is not None:
             details["refinement_stage_predictions"] = refinement_predictions
         if vote_offsets is not None:
@@ -1130,6 +1388,10 @@ def build_landmark_model(config: Mapping[str, object]) -> nn.Module:
             if decoder == "surface_curve":
                 raise ValueError(
                     "continuous curve decoding does not support bilateral neural modes"
+                )
+            if int(values.get("cascade_stages", 0)):
+                raise ValueError(
+                    "landmark-token cascade and bilateral neural modes are separate experiments"
                 )
             return BilateralPointNeXtSurfaceHeatmapRegressor(
                 bilateral_mode=bilateral_mode,
