@@ -3,6 +3,7 @@ import pytest
 
 from src.shape_prior.evaluate_cascade_gate import (
     GATE_FEATURES,
+    _base_model_config,
     calibrate_gate_threshold,
     gate_alpha,
 )
@@ -48,6 +49,27 @@ def test_gate_rejects_invalid_shapes_scopes_and_blends():
         gate_alpha(np.ones((2, 85)), 0.5, "ear", 0.0)
     with pytest.raises(ValueError, match="shape"):
         gate_alpha(np.ones((2, 85)), np.ones(84), "landmark", 0.5)
+
+
+def test_legacy_baseline_defaults_match_explicit_cascade_defaults():
+    legacy = {
+        "backbone": "pointnext",
+        "decoder": "surface_heatmap",
+        "heatmap_feature_dim": 256,
+    }
+    cascade = {
+        **legacy,
+        "surface_voting": False,
+        "vote_cap_normalized": 0.0,
+        "vote_fusion_iterations": 3,
+        "vote_fusion_epsilon_normalized": 0.0,
+        "cascade_stages": 1,
+        "cascade_attention_heads": 8,
+        "cascade_radius_normalized": 0.2,
+        "cascade_radius_decay": 0.5,
+        "cascade_dropout": 0.0,
+    }
+    assert _base_model_config(legacy) == _base_model_config(cascade)
 
 
 def test_pipeline_parser_exposes_fixed_and_screening_gate_controls():

@@ -45,6 +45,15 @@ CASCADE_CONFIG_KEYS = {
     "cascade_radius_decay",
     "cascade_dropout",
 }
+# These options were added after the established D256 checkpoint was trained.
+# Omitting them and saving their constructor defaults reconstruct exactly the
+# same module/state dictionary, so normalize them before semantic comparison.
+BACKWARD_COMPATIBLE_MODEL_DEFAULTS = {
+    "surface_voting": False,
+    "vote_cap_normalized": 0.0,
+    "vote_fusion_iterations": 3,
+    "vote_fusion_epsilon_normalized": 0.0,
+}
 GATE_FEATURES = (
     "entropy",
     "inverse_peak_probability",
@@ -136,11 +145,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _base_model_config(config: Mapping[str, object]) -> dict:
-    return {
+    normalized = {
         key: value
         for key, value in dict(config).items()
         if key not in CASCADE_CONFIG_KEYS
     }
+    for key, value in BACKWARD_COMPATIBLE_MODEL_DEFAULTS.items():
+        normalized.setdefault(key, value)
+    return normalized
 
 
 def _validate_model_pair(
