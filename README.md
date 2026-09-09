@@ -250,6 +250,97 @@ These decoder/refiner controls are research experiments. Screen each on outer
 fold 0/seed 42, always compare the final PCA-then-projected result to the matching
 1.333987 mm reference, and do not combine individually unpromoted changes.
 
+### Intrinsic/differential surface-geometry screen
+
+This opt-in ablation preserves the PointNeXt-S C32/D256 heatmap pipeline and
+adds eight deterministic channels to each sampled crop point: normal variation
+at 1, 2, and 4 mm; bounded mean-curvature magnitude, signed Gaussian
+curvature, absolute shape index and curvedness from a local normal
+shape-operator fit; and crop-centre distance. The features are computed after
+right-ear canonicalization from the exact sampled validation/inference points.
+They are checkpointed as a strict preprocessing schema. Existing checkpoints
+and commands retain the original six XYZ/normal channels.
+
+Run the controlled Fold-0/seed-42 screen:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm fit-landmarks \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --outer-fold 0 \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --output-dir runs/pointnext_surface_geometry/fold0_seed42 \
+  --backbone pointnext \
+  --pointnext-variant s \
+  --pointnext-width 32 \
+  --landmark-decoder surface-heatmap \
+  --heatmap-feature-dim 256 \
+  --heatmap-topk 64 \
+  --heatmap-coordinate-temperature 1 \
+  --heatmap-weight 0.1 \
+  --heatmap-sigma-mm 2 \
+  --heatmap-distance euclidean \
+  --surface-geometry-features \
+  --surface-geometry-radii-mm 1 2 4 \
+  --surface-geometry-neighbours 64 \
+  --surface-curvature-radius-mm 2 \
+  --no-surface-voting \
+  --cascade-stages 0 \
+  --bilateral-mode none \
+  --four-heads \
+  --no-augment \
+  --refinement-k 32 \
+  --refinement-anchor raw \
+  --refinement-mode geometry-offset \
+  --refinement-stages 1 \
+  --anchor-weight 0 \
+  --spacing-weight 0.01 \
+  --surface-weight 0 \
+  --num-points 16384 \
+  --batch-size 0 \
+  --effective-batch-size 32 \
+  --learning-rate 0.001 \
+  --encoder-learning-rate 0.001 \
+  --weight-decay 0.0001 \
+  --warmup-epochs 0 \
+  --minimum-learning-rate 0 \
+  --gradient-clip-norm 0 \
+  --epochs 200 \
+  --patience 30 \
+  --workers 10 \
+  --seed 42 \
+  --amp
+```
+
+Evaluate it using the already fitted fold-safe independent PCA prior and exact
+triangle projection:
+
+```bash
+sbatch submit_job_train_pointnet2.slurm evaluate-pca-prior \
+  --checkpoint-path runs/pointnext_surface_geometry/fold0_seed42/best_landmarks.pt \
+  --prior-path artifacts/pca_projection/fold0/prior.npz \
+  --prior-manifest artifacts/pca_projection/fold0/manifest.json \
+  --mesh-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/mesh \
+  --landmarks-dir /iridisfs/home/kjl1a21/Automatic-Extraction-of-Anatomical-Landmarks-of-Pinna-Shape/data/landmarks \
+  --folds-json artifacts/folds.json \
+  --predictions-json artifacts/calibration_v2/fold0_crop_calibration_predictions.json \
+  --calibration-json artifacts/calibration_v2/fold0_crop_calibration.json \
+  --components 32 \
+  --beta 0.5 \
+  --run-seed 42 \
+  --device auto \
+  --output runs/pca_projection/pointnext_surface_geometry/fold0_seed42.json
+```
+
+Compare `pca_projected_mean_md_mm`, the P95 and maximum in
+`pca_projected_distribution_mm`, and all four values in
+`pca_projected_per_part_md_mm` with the matching D256 Fold-0 reference
+(`1.316753 mm`). Do not combine this ablation with augmentation, geodesic
+voting, bilateral learning, or the landmark-token cascade during its first
+screen.
+
 ### Within-ear landmark-token cascade screen
 
 This candidate changes only the heatmap-query refinement. It retains the

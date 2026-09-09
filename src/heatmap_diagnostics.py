@@ -26,6 +26,7 @@ from .shape_prior.evaluate_prior import (
 from .shape_prior.fitting import file_sha256, load_center_predictions, read_json
 from .shape_prior.pca import PCAShapePrior
 from .surface import project_points_to_mesh
+from .surface_geometry_features import surface_geometry_from_model_config
 
 
 CONTOURS = (
@@ -252,6 +253,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 calibration,
                 num_points,
                 run_seed + 100_000 + item * 1009,
+                surface_geometry_config=surface_geometry_from_model_config(
+                    model_config
+                ),
             )
             points = torch.from_numpy(
                 prepared.point_features.astype(np.float32)

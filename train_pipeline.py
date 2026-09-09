@@ -55,6 +55,7 @@ from src.pointtransformerv3_model import (
 from src.precision import autocast_context
 from src.proposal_models import build_fold_landmark_model, build_locator
 from src.splits import folds_from_audit, save_folds
+from src.surface_geometry_features import make_surface_geometry_config
 from src.training import (
     predict_locator,
     resolve_device,
@@ -140,6 +141,30 @@ def landmark_model_config(
     surface_decoder = decoder in {"surface-heatmap", "surface-curve"}
     bilateral_mode = str(getattr(args, "bilateral_mode", "none"))
     cascade_stages = int(getattr(args, "cascade_stages", 0))
+    surface_geometry = surface_geometry_config_from_args(args)
+    if surface_geometry["enabled"]:
+        if args.backbone != "pointnext" or decoder != "surface-heatmap":
+            raise ValueError(
+                "--surface-geometry-features requires --backbone pointnext "
+                "and --landmark-decoder surface-heatmap"
+            )
+        if bilateral_mode != "none" or cascade_stages:
+            raise ValueError(
+                "surface geometry features are a geometry-only experiment and "
+                "cannot be combined with bilateral or cascade modes"
+            )
+        if bool(getattr(args, "surface_voting", False)):
+            raise ValueError(
+                "surface geometry features and --surface-voting are separate experiments"
+            )
+        if bool(getattr(args, "augment", False)):
+            raise ValueError(
+                "surface geometry features require --no-augment for the controlled experiment"
+            )
+        if str(getattr(args, "heatmap_distance", "euclidean")) != "euclidean":
+            raise ValueError(
+                "surface geometry features currently require Euclidean heatmap supervision"
+            )
     if bilateral_mode != "none" and (
         args.backbone != "pointnext" or decoder != "surface-heatmap"
     ):
@@ -208,6 +233,8 @@ def landmark_model_config(
             width=getattr(args, "pointnext_width", None),
             variant=str(getattr(args, "pointnext_variant", "s")),
         )
+        if surface_geometry["enabled"]:
+            encoder["input_channels"] = int(surface_geometry["output_channels"])
     elif args.backbone == "pointtransformerv3":
         if not getattr(args, "amp", True):
             raise ValueError(
@@ -276,6 +303,8 @@ def landmark_model_config(
             "cascade_radius_decay": float(args.cascade_radius_decay),
             "cascade_dropout": float(args.cascade_dropout),
         }
+        if surface_geometry["enabled"]:
+            config["surface_geometry"] = surface_geometry
         if decoder == "surface-curve":
             if curve_landmark_fractions is None:
                 raise ValueError(
@@ -431,6 +460,17 @@ def make_landmark_model(config: Mapping[str, object]):
     return build_fold_landmark_model(config)
 
 
+def surface_geometry_config_from_args(args) -> dict:
+    return make_surface_geometry_config(
+        enabled=bool(getattr(args, "surface_geometry_features", False)),
+        radii_mm=getattr(args, "surface_geometry_radii_mm", (1.0, 2.0, 4.0)),
+        neighbours=int(getattr(args, "surface_geometry_neighbours", 64)),
+        curvature_radius_mm=float(
+            getattr(args, "surface_curvature_radius_mm", 2.0)
+        ),
+    )
+
+
 def make_landmark_dataset(args, predictions, calibration, subject_ids, seed, training):
     dense_points = 32768 if args.surface_weight else 0
     common = dict(
@@ -453,6 +493,7 @@ def make_landmark_dataset(args, predictions, calibration, subject_ids, seed, tra
             str(getattr(args, "landmark_decoder", "coordinate-regression"))
             == "surface-curve"
         ),
+        surface_geometry_config=surface_geometry_config_from_args(args),
     )
     if args.backbone == "meshnet":
         gate = read_json(args.meshnet_gate_json)
@@ -1079,6 +1120,8 @@ def command_fit_landmarks(args):
         "loss_weights": loss_weights,
         "amp_dtype": model_config.get("amp_dtype", "auto"),
     }
+    if "surface_geometry" in model_config:
+        data_config["surface_geometry"] = model_config["surface_geometry"]
     if geodesic_manifest is not None:
         data_config["geodesic_cache"] = {
             "path": str(args.geodesic_cache_dir),
@@ -2268,6 +2311,36 @@ def add_landmark_model_arguments(parser):
             "PointNeXt depth preset: s=[1,1,1,1,1], b=[1,2,3,2,2], "
             "l=[1,3,5,3,3], xl=[1,4,7,4,4]; ignored by other backbones"
         ),
+    )
+    parser.add_argument(
+        "--surface-geometry-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "append deterministic multi-scale normal variation, bounded "
+            "curvature/shape, and crop-centre distance channels"
+        ),
+    )
+    parser.add_argument(
+        "--surface-geometry-radii-mm",
+        type=positive_float,
+        nargs=3,
+        default=(1.0, 2.0, 4.0),
+        metavar=("R1", "R2", "R3"),
+        help="three strictly increasing physical radii for normal variation",
+    )
+    parser.add_argument(
+        "--surface-geometry-neighbours",
+        type=int,
+        choices=(32, 64, 128),
+        default=64,
+        help="deterministic sampled-surface neighbours used by geometry features",
+    )
+    parser.add_argument(
+        "--surface-curvature-radius-mm",
+        type=positive_float,
+        default=2.0,
+        help="physical radius used for the local normal shape-operator fit",
     )
     parser.add_argument(
         "--landmark-decoder",

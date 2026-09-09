@@ -12,12 +12,26 @@ from .curve import contour_ids, validate_landmark_arc_fractions
 from .pointnet2_model import PointNet2FeatureEncoder, PointNet2LandmarkRegressor
 from .pointnet2_utils import index_points, square_distance
 from .pointnext_model import PointNeXtEncoder
+from .surface_geometry_features import validate_surface_geometry_config
 
 
 CONTOUR_LENGTHS = (25, 30, 20, 10)
 REFINEMENT_ANCHOR_MODES = ("raw", "nearest-surface-sample")
 HEATMAP_REFINEMENT_MODES = ("geometry-offset", "feature-attention")
 BILATERAL_MODES = ("none", "shared-latent", "landmark-cross-attention")
+
+
+def _point_cloud_bnc(point_cloud: torch.Tensor) -> torch.Tensor:
+    """Return point features as (B, N, C), including optional extra channels."""
+
+    if point_cloud.ndim != 3:
+        raise ValueError("point cloud must be a rank-three tensor")
+    known_channels = {6, 14}
+    if point_cloud.shape[-1] in known_channels:
+        return point_cloud
+    if point_cloud.shape[1] in known_channels:
+        return point_cloud.transpose(1, 2)
+    raise ValueError("point cloud must contain at least XYZ and normal channels")
 
 
 def _make_encoder(backbone: str, config: Mapping[str, object]):
@@ -98,8 +112,7 @@ class LocalLandmarkRefiner(nn.Module):
         return index_points(xyz, nearest_indices)
 
     def forward(self, coarse: torch.Tensor, point_cloud: torch.Tensor) -> torch.Tensor:
-        if point_cloud.shape[-1] != 6:
-            point_cloud = point_cloud.transpose(1, 2)
+        point_cloud = _point_cloud_bnc(point_cloud)
         xyz = point_cloud[..., :3].float()
         normals = point_cloud[..., 3:6].float()
         coarse_float = coarse.float()
@@ -264,8 +277,7 @@ class FeatureAwareSurfaceRefiner(nn.Module):
         heatmap_logits: torch.Tensor,
         query_features: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if point_cloud.shape[-1] != 6:
-            point_cloud = point_cloud.transpose(1, 2)
+        point_cloud = _point_cloud_bnc(point_cloud)
         xyz = point_cloud[..., :3].float()
         normals = point_cloud[..., 3:6].float()
         if query_features.ndim == 2:
@@ -1369,6 +1381,21 @@ def build_landmark_model(config: Mapping[str, object]) -> nn.Module:
     # can reproduce PTv3's required FP16 autocast, but it is not a constructor
     # argument of the landmark network itself.
     values.pop("amp_dtype", None)
+    surface_geometry = values.pop("surface_geometry", None)
+    geometry_config = None
+    if surface_geometry is not None:
+        geometry_config = validate_surface_geometry_config(surface_geometry)
+        encoder_config = values.get("encoder_config")
+        if not isinstance(encoder_config, Mapping):
+            raise ValueError(
+                "surface geometry checkpoints require an encoder configuration"
+            )
+        if int(encoder_config.get("input_channels", 0)) != int(
+            geometry_config["output_channels"]
+        ):
+            raise ValueError(
+                "surface geometry output channels do not match encoder input channels"
+            )
     decoder = str(values.pop("decoder", "coordinate_regression"))
     bilateral_mode = str(values.pop("bilateral_mode", "none"))
     bilateral_attention_heads = int(
@@ -1378,10 +1405,40 @@ def build_landmark_model(config: Mapping[str, object]) -> nn.Module:
         values.pop("bilateral_attention_layers", 1)
     )
     bilateral_dropout = float(values.pop("bilateral_dropout", 0.0))
+    if (
+        geometry_config is not None
+        and geometry_config["enabled"]
+        and decoder != "surface_heatmap"
+    ):
+        raise ValueError(
+            "surface geometry features require decoder='surface_heatmap'"
+        )
     if decoder in {"surface_heatmap", "surface_curve"}:
         backbone = str(values.pop("backbone", ""))
         if backbone != "pointnext":
             raise ValueError("surface heatmap/curve decoder requires PointNeXt")
+        encoder_config = values.get("encoder_config", {})
+        if not isinstance(encoder_config, Mapping):
+            raise ValueError("surface decoder requires an encoder configuration")
+        expected_input_channels = (
+            int(geometry_config["output_channels"])
+            if geometry_config is not None and geometry_config["enabled"]
+            else 6
+        )
+        if int(encoder_config.get("input_channels", 6)) != expected_input_channels:
+            raise ValueError(
+                "PointNeXt surface-decoder input channels do not match its "
+                "saved preprocessing configuration"
+            )
+        if geometry_config is not None and geometry_config["enabled"]:
+            if decoder != "surface_heatmap":
+                raise ValueError(
+                    "surface geometry features require the surface heatmap decoder"
+                )
+            if bilateral_mode != "none" or int(values.get("cascade_stages", 0)):
+                raise ValueError(
+                    "surface geometry checkpoints cannot combine bilateral or cascade modes"
+                )
         if decoder == "surface_curve":
             values["curve_enabled"] = True
         if bilateral_mode != "none":
@@ -1415,6 +1472,8 @@ def build_fold_landmark_model(config: Mapping[str, object]) -> nn.Module:
     values = dict(config)
     values.pop("amp_dtype", None)
     if values.get("backbone") == "meshnet":
+        if values.get("surface_geometry"):
+            raise ValueError("surface geometry features are unavailable for MeshNet")
         from .meshnet import MeshNetLandmarkRegressor
 
         values.pop("backbone")

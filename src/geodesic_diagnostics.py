@@ -24,6 +24,7 @@ from .precision import checkpoint_autocast_context
 from .proposal_models import PointNeXtSurfaceHeatmapRegressor
 from .shape_prior.evaluate_prior import _load_model, _validate_context
 from .shape_prior.fitting import load_center_predictions, read_json
+from .surface_geometry_features import surface_geometry_from_model_config
 
 
 def _positive_int(value: str) -> int:
@@ -205,6 +206,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 num_points,
                 run_seed + 100_000 + item * 1009,
                 include_sampling_metadata=True,
+                surface_geometry_config=surface_geometry_from_model_config(
+                    model_config
+                ),
             )
             cache = load_geodesic_cache_entry(
                 cache_path(args.geodesic_cache_dir, subject_id, ear),

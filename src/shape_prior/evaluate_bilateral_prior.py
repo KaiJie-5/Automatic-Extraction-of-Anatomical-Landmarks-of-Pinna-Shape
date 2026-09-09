@@ -11,6 +11,7 @@ import numpy as np
 from ..dataset import Dataset
 from ..pipeline_dataset import EAR_NAMES, prediction_key, prepare_ear_geometry
 from ..surface import project_points_to_mesh
+from ..surface_geometry_features import surface_geometry_from_model_config
 from .bilateral_pca import (
     CONTOUR_RANGES,
     BilateralMeanAsymmetryPCAPrior,
@@ -360,6 +361,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 calibration,
                 num_points,
                 run_seed + 100_000 + item * 1009,
+                surface_geometry_config=surface_geometry_from_model_config(
+                    model_config
+                ),
             )
         if bilateral_mode != "none":
             raw_by_ear = _predict_bilateral_local(

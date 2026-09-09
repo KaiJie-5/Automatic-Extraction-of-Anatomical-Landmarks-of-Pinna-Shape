@@ -19,6 +19,7 @@ from ..pipeline_dataset import EAR_NAMES, prediction_key, prepare_ear_geometry
 from ..pointtransformerv3_model import validate_pointtransformerv3_checkpoint_config
 from ..precision import checkpoint_autocast_context
 from ..proposal_models import build_fold_landmark_model
+from ..surface_geometry_features import surface_geometry_from_model_config
 from ..surface import project_points_to_mesh
 from .fitting import file_sha256, load_center_predictions, read_json
 from .pca import PCAShapePrior
@@ -378,6 +379,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 calibration,
                 num_points,
                 run_seed + 100_000 + item * 1009,
+                surface_geometry_config=surface_geometry_from_model_config(
+                    model_config
+                ),
             )
         if bilateral_mode != "none":
             raw_by_ear = _predict_bilateral_local(

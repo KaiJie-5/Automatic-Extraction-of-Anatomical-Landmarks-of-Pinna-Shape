@@ -25,6 +25,10 @@ from .shape_prior import (
 )
 from .curve import contour_anchor_manifest, decode_connected_curve_paths
 from .surface import project_points_to_mesh
+from .surface_geometry_features import (
+    append_surface_geometry_features,
+    surface_geometry_from_model_config,
+)
 from .preprocessing import (
     compute_mesh_normalization,
     normalize_point_features,
@@ -55,6 +59,7 @@ class LandmarkExtractor:
         self.bilateral_pca_shape_prior = None
         self.bilateral_pca_contour_gate = ()
         self.curve_path_decoder = None
+        self.surface_geometry_config = None
 
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
@@ -263,6 +268,9 @@ class LandmarkExtractor:
         self.locator = build_locator(checkpoint["locator"]["model_config"]).to(self.device)
         landmark_config = dict(checkpoint["landmark"]["model_config"])
         self.landmark_model_config = dict(landmark_config)
+        self.surface_geometry_config = surface_geometry_from_model_config(
+            self.landmark_model_config
+        )
         self.landmark_backbone = landmark_config.get("backbone", "pointnet2")
         self.bilateral_mode = str(
             landmark_config.get("bilateral_mode", "none")
@@ -388,7 +396,11 @@ class LandmarkExtractor:
                     torch.from_numpy(neighbors).unsqueeze(0).to(self.device),
                 ).squeeze(0).float().cpu().numpy()
             else:
-                model_input = local_transform.normalize_features(local_features)
+                model_input = append_surface_geometry_features(
+                    local_transform.normalize_features(local_features),
+                    local_transform.scale,
+                    self.surface_geometry_config,
+                )
                 input_tensor = torch.from_numpy(model_input).unsqueeze(0).to(self.device)
                 if self.curve_path_decoder is None:
                     local_prediction = (
@@ -503,7 +515,11 @@ class LandmarkExtractor:
                     ear,
                     local_transform,
                     crop_mesh,
-                    local_transform.normalize_features(local_features),
+                    append_surface_geometry_features(
+                        local_transform.normalize_features(local_features),
+                        local_transform.scale,
+                        self.surface_geometry_config,
+                    ),
                 )
             )
 

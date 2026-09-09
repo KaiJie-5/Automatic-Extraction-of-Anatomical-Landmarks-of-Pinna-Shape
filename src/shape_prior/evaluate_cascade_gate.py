@@ -24,6 +24,7 @@ from ..pipeline_dataset import EAR_NAMES, prediction_key, prepare_ear_geometry
 from ..pointnet2_utils import index_points
 from ..precision import checkpoint_autocast_context
 from ..surface import project_points_to_mesh
+from ..surface_geometry_features import surface_geometry_from_model_config
 from .evaluate_prior import (
     CONTOURS,
     _device,
@@ -469,6 +470,9 @@ def _collect_records(
                 calibration,
                 num_points,
                 run_seed + seed_offset + item * 1009,
+                surface_geometry_config=surface_geometry_from_model_config(
+                    baseline_config
+                ),
             )
             record = _predict_pair(
                 baseline_model,

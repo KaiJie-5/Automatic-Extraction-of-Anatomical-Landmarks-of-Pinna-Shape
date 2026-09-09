@@ -21,6 +21,10 @@ from .dataset import Dataset as MeshLandmarkDataset
 from .geometry import sample_canonical_crop
 from .meshnet import meshnet_inputs_with_mesh
 from .preprocessing import sample_mesh_surface
+from .surface_geometry_features import (
+    append_surface_geometry_features,
+    validate_surface_geometry_config,
+)
 
 
 EAR_NAMES = ("left", "right")
@@ -53,6 +57,7 @@ def prepare_ear_geometry(
     num_points: int,
     seed: int,
     include_sampling_metadata: bool = False,
+    surface_geometry_config: Optional[Mapping[str, object]] = None,
 ) -> PreparedEarGeometry:
     """Prepare one proposal ear exactly as landmark validation/inference expects."""
     if ear not in EAR_NAMES:
@@ -76,6 +81,11 @@ def prepare_ear_geometry(
     transform = LocalEarTransform(canonical_center, float(calibration["local_scale"]))
     canonical_landmarks = canonicalize_xyz(landmarks, ear).astype(np.float32)
     point_features = transform.normalize_features(sampled).astype(np.float32)
+    point_features = append_surface_geometry_features(
+        point_features,
+        transform.scale,
+        surface_geometry_config,
+    )
     target = transform.normalize_xyz(canonical_landmarks).astype(np.float32)
     return PreparedEarGeometry(
         point_features=point_features,
@@ -200,6 +210,7 @@ class EarLandmarkDataset(EpochResampledDataset):
         augment: bool = False,
         geodesic_cache_dir: Optional[str] = None,
         include_curve_targets: bool = False,
+        surface_geometry_config: Optional[Mapping[str, object]] = None,
     ):
         super().__init__(seed, dynamic_sampling)
         self.base = MeshLandmarkDataset(mesh_dir, landmarks_dir)
@@ -215,6 +226,13 @@ class EarLandmarkDataset(EpochResampledDataset):
         self.augment = bool(augment)
         self.geodesic_cache_dir = geodesic_cache_dir
         self.include_curve_targets = bool(include_curve_targets)
+        self.surface_geometry_config = validate_surface_geometry_config(
+            surface_geometry_config
+        )
+        if self.augment and self.surface_geometry_config["enabled"]:
+            raise ValueError(
+                "surface geometry features require augmentation to be disabled"
+            )
         if self.include_curve_targets and self.geodesic_cache_dir is None:
             raise ValueError("continuous curve targets require a geodesic cache")
         missing = [
@@ -238,6 +256,7 @@ class EarLandmarkDataset(EpochResampledDataset):
             mesh, landmarks, ear, center, self.calibration, self.num_points,
             self.sample_seed(item),
             include_sampling_metadata=self.geodesic_cache_dir is not None,
+            surface_geometry_config=self.surface_geometry_config,
         )
         features = prepared.point_features.copy()
         target = prepared.target.copy()
@@ -319,6 +338,7 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         augment: bool = False,
         geodesic_cache_dir: Optional[str] = None,
         include_curve_targets: bool = False,
+        surface_geometry_config: Optional[Mapping[str, object]] = None,
     ):
         super().__init__(seed, dynamic_sampling)
         self.ears_per_item = 2
@@ -335,6 +355,13 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
         self.augment = bool(augment)
         self.geodesic_cache_dir = geodesic_cache_dir
         self.include_curve_targets = bool(include_curve_targets)
+        self.surface_geometry_config = validate_surface_geometry_config(
+            surface_geometry_config
+        )
+        if self.augment and self.surface_geometry_config["enabled"]:
+            raise ValueError(
+                "surface geometry features require augmentation to be disabled"
+            )
         if self.include_curve_targets and self.geodesic_cache_dir is None:
             raise ValueError("continuous curve targets require a geodesic cache")
         missing = [
@@ -379,6 +406,7 @@ class BilateralEarLandmarkDataset(EpochResampledDataset):
                 self.num_points,
                 self.sample_seed(ear_item),
                 include_sampling_metadata=self.geodesic_cache_dir is not None,
+                surface_geometry_config=self.surface_geometry_config,
             )
             features = prepared.point_features.copy()
             target = prepared.target.copy()
@@ -471,6 +499,10 @@ class EarMeshLandmarkDataset(EarLandmarkDataset):
     def __init__(self, *args, target_faces: int, **kwargs):
         super().__init__(*args, **kwargs)
         self.target_faces = int(target_faces)
+        if self.surface_geometry_config["enabled"]:
+            raise ValueError(
+                "sampled surface geometry features are unavailable for MeshNet"
+            )
         if self.augment:
             raise ValueError("MeshNet screening uses fixed standardized geometry without point jitter")
 

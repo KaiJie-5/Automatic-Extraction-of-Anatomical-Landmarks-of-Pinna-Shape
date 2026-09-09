@@ -30,6 +30,7 @@ from src.precision import checkpoint_autocast_context
 from src.pointtransformerv3_model import validate_pointtransformerv3_checkpoint_config
 from src.proposal_models import build_fold_landmark_model
 from src.surface import project_points_to_mesh
+from src.surface_geometry_features import surface_geometry_from_model_config
 
 
 PROJECT_ROOT = Path(
@@ -388,6 +389,9 @@ def prepare_trace(
                     context.calibration,
                     sample_count,
                     pair_seed,
+                    surface_geometry_config=surface_geometry_from_model_config(
+                        context.model_config
+                    ),
                 )
             )
         prepared = prepared_pair[ear_index]
@@ -416,6 +420,9 @@ def prepare_trace(
             context.calibration,
             sample_count,
             sample_seed,
+            surface_geometry_config=surface_geometry_from_model_config(
+                context.model_config
+            ),
         )
     if not bilateral and context.backbone == "meshnet":
         features, neighbors_np, simplified_mesh = meshnet_inputs_with_mesh(
