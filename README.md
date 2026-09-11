@@ -341,6 +341,87 @@ Compare `pca_projected_mean_md_mm`, the P95 and maximum in
 voting, bilateral learning, or the landmark-token cascade during its first
 screen.
 
+### Geometry confirmation and held-out directional error diagnostics
+
+After copying the latest code to Iridis, submit the unchanged Fold-0 geometry
+screen for seeds 43 and 44 with:
+
+```bash
+bash submit_geometry_confirmation.sh
+```
+
+This submits two fresh training jobs with the exact seed-42 geometry settings
+above (only the seeds and output paths differ). Each training job has a dependent
+`evaluate-pca-prior` job, which starts only after successful training. Existing
+training checkpoints are protected from overwrite. Final reports are
+`runs/pca_projection/pointnext_surface_geometry/fold0_seed43.json` and
+`fold0_seed44.json`.
+
+Independently, export the existing D256 model's held-out coordinates and error
+decomposition across all five folds and three seeds:
+
+```bash
+bash submit_d256_error_diagnostics.sh
+```
+
+This submits 15 inference-only `analyze-landmark-errors` jobs. Fold 0/seed 42
+runs first; the other 14 start only after it succeeds, including its reference
+reproduction check. It uses each
+checkpoint's saved decoder settings, original held-out sampling, matching fold
+prior (32 components, beta 0.5), and exact crop-surface projection. It does not
+fit a model, search decoding parameters, or apply the bilateral concha correction.
+Every job writes `runs/landmark_error_diagnostics/d256/foldN_seedS.json` and a
+matching `.npz` coordinate archive. The JSON includes per-ear, per-contour,
+per-index, and inner-helix 55–64/65–74 summaries at these stages:
+
+- `coarse`: saved heatmap decoder output before local refinement.
+- `raw`: final neural output after the existing refiner.
+- `pca`: independent-PCA blend before projection.
+- `projected`: raw neural output projected to the crop surface.
+- `pca_projected`: PCA followed by projection, matching the reference reports.
+
+All exported point coordinates are in the original challenge world frame, in mm.
+The basis and signed error components use the mirrored-left canonical frame so
+their signs are consistent between ears. The normal comes from the exact closest
+crop triangle to the ground-truth landmark. The tangent is the adjacent forward
+unit-chord bisector projected into that triangle's tangent plane; contour
+endpoints use one-sided chords. The perpendicular direction is `normal x tangent`.
+Ground-truth geometry defines diagnostic frames only and never changes predictions.
+
+Frames with degenerate geometry or a ground-truth-to-crop-surface distance over
+0.5 mm are explicitly flagged. Their basis/components are NaN in the archive and
+excluded from directional summaries; ordinary MD still includes all landmarks.
+The validity mask and projection distances are exported. Squared-error fractions
+partition squared distance, not the official mean Euclidean distance. These local
+directions are not geodesic distances or a categorical wrong-surface-sheet test.
+
+Each submission checks the existing matching D256 PCA report's checkpoint/prior
+hashes, fold, seed, settings, and subject pairs. After inference it compares both
+the pooled MD and every per-ear MD with that report, with a 0.0001 mm tolerance.
+If reproduction fails, the job exits nonzero **after saving both outputs**; inspect
+`reference_reproduction` before interpreting the results. The report also records
+input artifact, held-out mesh/annotation, and coordinate-archive hashes.
+
+Read an archive without pickle:
+
+```python
+import numpy as np
+
+with np.load("runs/landmark_error_diagnostics/d256/fold0_seed42.npz",
+             allow_pickle=False) as data:
+    predictions = data["pca_projected_world_mm"]       # ears x 85 x 3
+    ground_truth = data["ground_truth_world_mm"]       # ears x 85 x 3
+    signed = data["pca_projected_signed_components_mm"]
+    valid = data["frame_valid"]                        # ears x 85
+    # signed[..., 0/1/2]: along contour / across contour / surface normal
+    subject_ids, ears = data["subject_ids"], data["ears"]
+```
+
+The two submission scripts can run independently. Keep geometry settings locked;
+seeds 43/44 test initialization stability on the same subjects. Decide whether to
+evaluate geometry on folds 1–4 after reviewing these results. The directional
+diagnostics use existing D256 checkpoints on all folds and need no new training.
+
 ### Within-ear landmark-token cascade screen
 
 This candidate changes only the heatmap-query refinement. It retains the

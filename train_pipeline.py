@@ -1599,6 +1599,23 @@ def command_analyze_heatmap_decoder(args):
     analyze_heatmap(values)
 
 
+def command_analyze_landmark_errors(args):
+    """Export fixed-model held-out coordinates and directional errors."""
+    from src.landmark_error_diagnostics import main as analyze_errors
+
+    values = []
+    for name in (
+        "checkpoint_path", "prior_path", "prior_manifest", "mesh_dir", "landmarks_dir",
+        "folds_json", "predictions_json", "calibration_json", "components", "beta",
+        "run_seed", "projection_workers", "frame_max_surface_distance_mm",
+        "reference_report", "reference_tolerance_mm", "device", "output",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            values.extend(["--" + name.replace("_", "-"), str(value)])
+    analyze_errors(values)
+
+
 def command_analyze_geodesic_candidates(args):
     """Measure whether the existing heatmap retrieves correct surface candidates."""
     from src.geodesic_diagnostics import main as analyze_geodesic
@@ -2764,6 +2781,23 @@ def build_parser():
     heatmap_diagnostic.add_argument("--device", default="auto")
     heatmap_diagnostic.add_argument("--output", required=True)
     heatmap_diagnostic.set_defaults(function=command_analyze_heatmap_decoder)
+
+    error_diagnostic = subparsers.add_parser("analyze-landmark-errors")
+    add_data_arguments(error_diagnostic)
+    for name in (
+        "checkpoint-path", "prior-path", "prior-manifest", "folds-json",
+        "predictions-json", "calibration-json", "output",
+    ):
+        error_diagnostic.add_argument(f"--{name}", required=True)
+    error_diagnostic.add_argument("--components", type=positive_integer, default=32)
+    error_diagnostic.add_argument("--beta", type=unit_float, default=0.5)
+    error_diagnostic.add_argument("--run-seed", type=int)
+    error_diagnostic.add_argument("--projection-workers", type=positive_integer, default=10)
+    error_diagnostic.add_argument("--frame-max-surface-distance-mm", type=positive_float, default=0.5)
+    error_diagnostic.add_argument("--reference-report")
+    error_diagnostic.add_argument("--reference-tolerance-mm", type=positive_float, default=1e-4)
+    error_diagnostic.add_argument("--device", default="auto")
+    error_diagnostic.set_defaults(function=command_analyze_landmark_errors)
 
     geodesic_diagnostic = subparsers.add_parser("analyze-geodesic-candidates")
     add_data_arguments(geodesic_diagnostic)
