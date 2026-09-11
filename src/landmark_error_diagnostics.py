@@ -231,7 +231,7 @@ def main(argv: Sequence[str] | None = None):
             for offset, ear in enumerate(EAR_NAMES):
                 target = left if ear == "left" else right
                 input_hashes[subject][f"{ear}_annotation_sha256"] = file_sha256(
-                    Path(args.landmarks_dir) / f"{subject}_{ear}_landmarks.csv"
+                    Path(args.landmarks_dir) / f"{subject}_{ear}_ear_landmarks.csv"
                 )
                 sample_seed = seed + 100_000 + (position * 2 + offset) * 1009
                 prepared = prepare_ear_geometry(
